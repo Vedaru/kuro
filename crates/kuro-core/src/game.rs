@@ -246,6 +246,13 @@ impl GameManager {
                 continue;
             }
             let _ = tx.send(ProgressEvent::GroupStart { name: group.name.clone() });
+            let _ = tx
+                .send(ProgressEvent::FileProgress {
+                    name: group.name.clone(),
+                    bytes: 0,
+                    total: group.size,
+                })
+                .await;
             let url = ApiClient::krpdiff_url(&cdn, patch_cfg, &group.name);
             let staged = state::staged_patch_path(&self.game_folder, &group.name);
             let tmp = staged.with_extension("krpdiff.tmp");
@@ -271,6 +278,13 @@ impl GameManager {
                 continue;
             }
             let _ = tx.send(ProgressEvent::GroupStart { name: item.name.clone() });
+            let _ = tx
+                .send(ProgressEvent::FileProgress {
+                    name: item.name.clone(),
+                    bytes: 0,
+                    total: item.size,
+                })
+                .await;
             let res = res_by_dest
                 .get(item.name.as_str())
                 .ok_or_else(|| Error::MissingField("resource entry"))?;
@@ -788,6 +802,13 @@ impl GameManager {
                 let _ = tx
                     .send(ProgressEvent::GroupStart {
                         name: item.dest.clone(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(ProgressEvent::FileProgress {
+                        name: item.dest.clone(),
+                        bytes: 0,
+                        total: item.size,
                     })
                     .await;
             }
