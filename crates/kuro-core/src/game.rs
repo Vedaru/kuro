@@ -515,9 +515,14 @@ impl GameManager {
         };
         state::write_local_config(&game_folder, &cfg)?;
 
-        let mgr = Self::open(game_folder).await?;
+        let mgr = Self::open(game_folder.clone()).await?;
         let sync = mgr.sync_with_progress(tx).await?;
-        Ok(InstallReport { version, sync })
+        let game_exe = find_game_exe(&game_folder);
+        Ok(InstallReport {
+            version,
+            sync,
+            game_exe,
+        })
     }
 
     /// Switch server channel by swapping only the channel-specific files and
@@ -876,6 +881,33 @@ pub struct CheckoutReport {
 pub struct InstallReport {
     pub version: String,
     pub sync: SyncReport,
+    /// Relative path of the game executable inside the install (for launching
+    /// via Steam/Proton). None if no `.exe` was found.
+    pub game_exe: Option<String>,
+}
+
+/// Locate the game executable inside an installed game folder.
+pub fn find_game_exe(folder: &Path) -> Option<String> {
+    let candidates = [
+        "Client/Binaries/Win64/Client-Win64-Shipping.exe",
+        "Client/Binaries/Win64/PGR.exe",
+        "PGR.exe",
+    ];
+    for c in candidates {
+        if folder.join(c).is_file() {
+            return Some(c.to_string());
+        }
+    }
+    // fallback: any .exe directly in the root
+    if let Ok(rd) = std::fs::read_dir(folder) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".exe") && e.path().is_file() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 fn is_krpdiff(dest: &str) -> bool {

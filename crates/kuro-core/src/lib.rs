@@ -20,3 +20,4 @@ pub use game::{
 };
 pub use kuro_api::{Error, Game, Result, Server};
 pub use steam::{default_game_dir, detect_steam, SteamInfo};
+pub use game::find_game_exe;

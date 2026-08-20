@@ -485,15 +485,16 @@ fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game
             }
         });
         let result = match GameManager::install_with_progress(game, server, PathBuf::from(path), Some(ptx)).await {
-            Ok(r) => Ok(format!(
-                "installed {} v{} (checked={} ok={} repaired={} failed={})",
-                game,
-                r.version,
-                r.sync.checked,
-                r.sync.ok,
-                r.sync.repaired,
-                r.sync.failed.len()
-            )),
+            Ok(r) => {
+                let exe = r
+                    .game_exe
+                    .map(|e| format!("; exe: {e}"))
+                    .unwrap_or_default();
+                Ok(format!(
+                    "installed {} v{} (game files{})",
+                    game, r.version, exe
+                ))
+            }
             Err(e) => Err(e.to_string()),
         };
         let _ = tx.send(UiEvent::TaskDone(result)).await;
@@ -683,6 +684,8 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw("  install a new game (also available via 'i'):"),
             Line::raw("    kuro install wuwa cn ~/Games/WutheringWaves"),
             Line::raw("    kuro install pgr global ~/PGR"),
+            Line::raw("  installs the GAME files only (no launcher — on Linux you"),
+            Line::raw("  launch the game .exe via Steam + GE-Proton afterwards)"),
             Line::raw("  then run: kuro <folder1> <folder2> ...   (Tab switches)"),
             Line::raw(""),
             Line::raw("  press h / ? / Esc to close"),
@@ -737,8 +740,9 @@ fn ui(f: &mut Frame, state: &UiState) {
             Style::default().fg(Color::Cyan),
         ));
         modal_lines.push(Line::raw(""));
-        modal_lines.push(Line::raw("  downloads the full client from the official CDN"));
-        modal_lines.push(Line::raw("  (wuwa ~85 GB, pgr ~64 GB fresh install; resumable, md5-verified)"));
+        modal_lines.push(Line::raw("  installs the GAME files (launcher NOT included)"));
+        modal_lines.push(Line::raw("  wuwa ~85 GB / pgr ~64 GB; resumable, md5-verified"));
+        modal_lines.push(Line::raw("  afterwards: launch the game .exe via Steam + GE-Proton"));
         let area = centered_rect(75, 55, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
