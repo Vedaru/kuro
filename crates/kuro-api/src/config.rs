@@ -145,6 +145,20 @@ pub mod pgr_meta {
     }
 }
 
+/// Official launcher-installer gateway (`.../pc_app.json` -> {primary,
+/// secondary, version}) for a game+server, if known.
+pub fn launcher_gateway_url(game: Game, server: Server) -> Option<&'static str> {
+    match (game, server) {
+        (Game::Pgr, Server::Global) => {
+            Some("https://download.kurogames.net/pns/official/global/en/pc_app.json")
+        }
+        (Game::Pgr, Server::Cn) => {
+            Some("https://download.kurogames.com/pns/official/cn/zh-Hans/pc_app.json")
+        }
+        _ => None, // WuWa launcher URLs not publicly mapped yet
+    }
+}
+
 pub fn server_entry(game: Game, server: Server) -> Option<&'static ServerEntry> {
     servers(game)
         .iter()

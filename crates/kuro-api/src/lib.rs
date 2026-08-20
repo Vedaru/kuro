@@ -9,9 +9,11 @@ pub mod error;
 pub mod types;
 
 pub use client::ApiClient;
-pub use config::{game_server_by_app_id, server_entry, servers, Game, Server, ServerEntry};
+pub use config::{
+    game_server_by_app_id, launcher_gateway_url, server_entry, servers, Game, Server, ServerEntry,
+};
 pub use error::{Error, Result};
 pub use types::{
-    ChunkInfo, CdnNode, DefaultSection, FileRef, GroupInfo, LauncherConfig, LauncherIndex,
-    LocalConfig, PatchConfig, PatchIndex, PredownloadSection, ResourceItem,
+    ChunkInfo, CdnNode, DefaultSection, FileRef, GroupInfo, LauncherConfig, LauncherGateway,
+    LauncherIndex, LocalConfig, PatchConfig, PatchIndex, PredownloadSection, ResourceItem,
 };

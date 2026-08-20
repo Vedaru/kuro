@@ -525,6 +525,71 @@ impl GameManager {
         })
     }
 
+    /// Download the official launcher installer into `folder` (the Windows
+    /// start client — useful if you want it under wine, or just to have it).
+    pub async fn install_launcher(
+        game: Game,
+        server: Server,
+        folder: PathBuf,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<LauncherReport> {
+        let gateway_url = kuro_api::launcher_gateway_url(game, server).ok_or_else(|| {
+            Error::Patch(format!(
+                "launcher download not available for {game}/{server} yet"
+            ))
+        })?;
+        let http = reqwest::Client::builder()
+            .user_agent("kuro/0.1 (+https://github.com/vedaru/kuro)")
+            .build()?;
+        let gw: kuro_api::LauncherGateway = http
+            .get(gateway_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let url = gw
+            .primary
+            .or(gw.secondary)
+            .ok_or(Error::MissingField("launcher download url"))?;
+        let version = gw.version.unwrap_or_else(|| "?".to_string());
+
+        let file_name = url
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("launcher_installer.exe")
+            .to_string();
+        std::fs::create_dir_all(&folder)?;
+        let dest = folder.join(&file_name);
+        let tmp = dest.with_extension("tmp");
+
+        let resp = http.get(&url).send().await?.error_for_status()?;
+        if let Some(tx) = &tx {
+            let total = resp.content_length().unwrap_or(0);
+            let _ = tx.send(ProgressEvent::SetTotal { bytes: total }).await;
+            let _ = tx.send(ProgressEvent::GroupStart { name: file_name.clone() }).await;
+        }
+        let bytes = resp.bytes().await?;
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &dest)?;
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(ProgressEvent::GroupDone {
+                    name: file_name.clone(),
+                    bytes: bytes.len() as u64,
+                })
+                .await;
+            let _ = tx.send(ProgressEvent::Done).await;
+        }
+
+        Ok(LauncherReport {
+            version,
+            file: file_name,
+            path: dest,
+        })
+    }
+
     /// Switch server channel by swapping only the channel-specific files and
     /// updating the appId (CN <-> Bilibili). Global is a different package —
     /// not supported for fast-switch (mirrors ww-manager).
@@ -884,6 +949,14 @@ pub struct InstallReport {
     /// Relative path of the game executable inside the install (for launching
     /// via Steam/Proton). None if no `.exe` was found.
     pub game_exe: Option<String>,
+}
+
+/// Result of a launcher-installer download.
+#[derive(Debug, Clone)]
+pub struct LauncherReport {
+    pub version: String,
+    pub file: String,
+    pub path: PathBuf,
 }
 
 /// Locate the game executable inside an installed game folder.

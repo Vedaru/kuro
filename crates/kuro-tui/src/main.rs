@@ -59,6 +59,8 @@ struct UiState {
 struct InstallDraft {
     game: Game,
     server: Server,
+    /// True = download the official launcher installer; false = game files.
+    launcher: bool,
     /// Install target folder (editable).
     target: String,
     /// True while typing the target path.
@@ -70,6 +72,7 @@ impl InstallDraft {
         Self {
             game: Game::WuWa,
             server: Server::Cn,
+            launcher: false,
             target,
             edit_target: false,
         }
@@ -86,7 +89,9 @@ fn push_log(state: &mut UiState, msg: impl Into<String>) {
 
 /// Turn known raw errors into friendly, human-readable messages.
 fn friendly_error(raw: &str) -> String {
-    if raw.contains("no channel files could be swapped") || raw.contains("checkout:") {
+    if raw.contains("launcher download not available") {
+        "no official launcher download registered for this game/server yet — game files work fine".to_string()
+    } else if raw.contains("no channel files could be swapped") || raw.contains("checkout:") {
         "checkout isn't possible for this server — its channel files aren't in the manifest; your install is unchanged".to_string()
     } else if raw.contains("patchConfig entry") {
         "already on the latest version — nothing to do".to_string()
@@ -251,7 +256,7 @@ async fn run(
                     }
                     continue;
                 }
-                let mut start_install: Option<(Game, Server, String)> = None;
+                let mut start_install: Option<(Game, Server, String, bool)> = None;
                 if let Some(draft) = state.install.as_mut() {
                     if draft.edit_target {
                         // typing the target path
@@ -271,6 +276,8 @@ async fn run(
                         KeyCode::Char('c') => draft.server = Server::Cn,
                         KeyCode::Char('b') => draft.server = Server::Bilibili,
                         KeyCode::Char('g') => draft.server = Server::Global,
+                        KeyCode::Char('l') => draft.launcher = true,
+                        KeyCode::Char('f') => draft.launcher = false,
                         KeyCode::Char('s') => {
                             if let Some(steam) = &state.steam {
                                 draft.target =
@@ -279,8 +286,12 @@ async fn run(
                         }
                         KeyCode::Char('t') => draft.edit_target = true,
                         KeyCode::Enter => {
-                            start_install =
-                                Some((draft.game, draft.server, draft.target.clone()));
+                            start_install = Some((
+                                draft.game,
+                                draft.server,
+                                draft.target.clone(),
+                                draft.launcher,
+                            ));
                         }
                         KeyCode::Esc => state.install = None,
                         _ => {}
@@ -290,19 +301,32 @@ async fn run(
                         continue;
                     }
                 }
-                if let Some((game, server, target)) = start_install {
+                if let Some((game, server, target, launcher)) = start_install {
                     state.install = None;
                     if !state.busy {
                         state.busy = true;
                         state.task = Some(TaskUi {
-                            kind: "install".into(),
+                            kind: if launcher {
+                                "launcher".into()
+                            } else {
+                                "install".into()
+                            },
                             ..Default::default()
                         });
                         push_log(
                             &mut state,
-                            format!("installing {game}/{server} into {target}"),
+                            format!(
+                                "installing {} {} ({}) into {target}",
+                                game,
+                                server,
+                                if launcher { "launcher" } else { "game files" }
+                            ),
                         );
-                        spawn_install(&tx, &target, game, server);
+                        if launcher {
+                            spawn_install_launcher(&tx, &target, game, server);
+                        } else {
+                            spawn_install(&tx, &target, game, server);
+                        }
                     }
                 }
 
@@ -501,6 +525,36 @@ fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game
     });
 }
 
+fn spawn_install_launcher(
+    tx: &tokio::sync::mpsc::Sender<UiEvent>,
+    path: &str,
+    game: Game,
+    server: Server,
+) {
+    let tx = tx.clone();
+    let path = path.to_string();
+    tokio::spawn(async move {
+        let (ptx, mut prx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = prx.recv().await {
+                let _ = tx2.send(UiEvent::Progress(ev)).await;
+            }
+        });
+        let result = match GameManager::install_launcher(game, server, PathBuf::from(path), Some(ptx))
+            .await
+        {
+            Ok(r) => Ok(format!(
+                "launcher {game} {server} v{} -> {}",
+                r.version,
+                r.path.display()
+            )),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(UiEvent::TaskDone(result)).await;
+    });
+}
+
 enum TaskKind {
     Apply,
     Sync,
@@ -677,6 +731,7 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw("    c        checkout server (CN<->B)  i   install a new game"),
             Line::raw("    s        (in install) Steam default target"),
             Line::raw("    t        (in install) edit target path"),
+            Line::raw("    f/l      (in install) game files / launcher"),
             Line::raw("    Tab      switch game (multi-folder)"),
             Line::raw("    PgUp/PgDn scroll log               h/?  this help"),
             Line::raw("    q        quit"),
@@ -717,6 +772,10 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw(format!(
                 "  server:  [c]n / [b]ilibili / [g]lobal  -> {}",
                 draft.server
+            )),
+            Line::raw(format!(
+                "  what:    [f] game files / [l]auncher  -> {}",
+                if draft.launcher { "launcher" } else { "game files" }
             )),
             Line::raw(""),
         ];
