@@ -113,7 +113,6 @@ async fn apply_merges_verifies_swaps_and_cleans() {
         version: "0.9.0".to_string(),
         index_file: String::new(),
         base_url: String::new(),
-        size: 0,
     };
 
     let mgr = GameManager::open(game.clone()).await.unwrap();
@@ -174,7 +173,6 @@ async fn apply_without_predownload_errors_cleanly() {
                 version: "0.9.0".to_string(),
                 index_file: String::new(),
                 base_url: String::new(),
-                size: 0,
             },
             "1.0.0",
         )

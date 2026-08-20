@@ -17,11 +17,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct LauncherIndex {
     pub default: DefaultSection,
-    /// Present only while a predownload window is open.
-    #[serde(default)]
-    pub predownload: Option<PredownloadSection>,
-    #[serde(default)]
-    pub predownload_switch: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,29 +27,15 @@ pub struct DefaultSection {
     pub cdn_list: Vec<CdnNode>,
     pub config: LauncherConfig,
     #[serde(default)]
-    pub resources_base_path: String,
-    #[serde(default)]
     pub version: String,
-}
-
-/// Mirrors the `predownload` section when a pre-download window is open.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PredownloadSection {
-    #[serde(default)]
-    pub config: LauncherConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CdnNode {
-    /// NOTE: Kuro uses UPPERCASE keys here (`P`, `K1`, `K2`) — not camelCase.
+    /// NOTE: Kuro uses UPPERCASE keys here (`P`) — not camelCase.
     #[serde(rename = "P")]
     pub p: u64,
-    #[serde(rename = "K1", default)]
-    pub k1: u64,
-    #[serde(rename = "K2", default)]
-    pub k2: u64,
     pub url: String,
 }
 
@@ -66,13 +47,7 @@ pub struct LauncherConfig {
     #[serde(default)]
     pub index_file: String,
     #[serde(default)]
-    pub index_file_md5: String,
-    #[serde(default)]
     pub base_url: String,
-    #[serde(default)]
-    pub size: u64,
-    #[serde(default)]
-    pub patch_type: String,
     /// One entry per *source* version; the entry whose `version` matches the
     /// locally installed version describes the incremental update.
     #[serde(default)]
@@ -88,8 +63,6 @@ pub struct PatchConfig {
     pub index_file: String,
     /// Base path under which the krpdiff files for this transition live.
     pub base_url: String,
-    #[serde(default)]
-    pub size: u64,
 }
 
 /// The patch manifest for one source version (krpdiff groups + fallbacks).

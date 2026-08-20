@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -28,7 +28,6 @@ enum UiEvent {
 #[derive(Default)]
 struct TaskUi {
     kind: String,
-    total: usize,
     done: usize,
     /// Items announced but not yet finished (GroupStart - GroupDone).
     queued: usize,
@@ -58,7 +57,6 @@ enum Focus {
 
 #[derive(Default)]
 struct UiState {
-    status: Option<Result<GameStatus, String>>,
     logs: Vec<String>,
     task: Option<TaskUi>,
     busy: bool,
@@ -724,11 +722,7 @@ fn ui(f: &mut Frame, state: &UiState) {
     if n > 1 {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(
-                std::iter::repeat(Constraint::Ratio(1, n as u32))
-                    .take(n)
-                    .collect::<Vec<_>>(),
-            )
+            .constraints(std::iter::repeat_n(Constraint::Ratio(1, n as u32), n).collect::<Vec<_>>())
             .split(chunks[0]);
         for (i, col) in cols.iter().enumerate() {
             let path = &state.paths[i];
@@ -755,7 +749,7 @@ fn ui(f: &mut Frame, state: &UiState) {
             );
         }
     } else {
-        let s = state.statuses.get(0).and_then(|x| x.as_ref());
+        let s = state.statuses.first().and_then(|x| x.as_ref());
         f.render_widget(
             Paragraph::new(status_box_lines(s, state.busy))
                 .wrap(Wrap { trim: true })

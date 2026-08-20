@@ -69,7 +69,7 @@ pub fn md5_file(path: &Path) -> kuro_api::Result<String> {
         }
         ctx.consume(&buf[..n]);
     }
-    Ok(format!("{:x}", ctx.compute()))
+    Ok(format!("{:x}", ctx.finalize()))
 }
 
 /// EXPERIMENTAL: create a KrDiff-format patch (`old_tree + diff -> new_tree`).

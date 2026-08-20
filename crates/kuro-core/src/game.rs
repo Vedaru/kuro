@@ -210,13 +210,15 @@ impl GameManager {
         plan: &PredownloadPlan,
         tx: tokio::sync::mpsc::Sender<ProgressEvent>,
     ) -> Result<()> {
-        let _ = tx.send(ProgressEvent::Log(format!(
-            "predownload {} → {} ({} groups, {:.1} GiB)",
-            plan.from_version,
-            plan.to_version,
-            plan.patch_groups.len(),
-            plan.total_bytes as f64 / (1 << 30) as f64
-        )));
+        let _ = tx
+            .send(ProgressEvent::Log(format!(
+                "predownload {} → {} ({} groups, {:.1} GiB)",
+                plan.from_version,
+                plan.to_version,
+                plan.patch_groups.len(),
+                plan.total_bytes as f64 / (1 << 30) as f64
+            )))
+            .await;
         let index = self.api.fetch_index(self.server_entry().api_url).await?;
         let cdn = self.api.pick_cdn(&index)?.url.clone();
 
@@ -248,7 +250,11 @@ impl GameManager {
             if group.local_ready {
                 continue;
             }
-            let _ = tx.send(ProgressEvent::GroupStart { name: group.name.clone() });
+            let _ = tx
+                .send(ProgressEvent::GroupStart {
+                    name: group.name.clone(),
+                })
+                .await;
             let _ = tx
                 .send(ProgressEvent::FileProgress {
                     name: group.name.clone(),
@@ -270,17 +276,23 @@ impl GameManager {
             )
             .await?;
             std::fs::rename(&tmp, &staged)?;
-            let _ = tx.send(ProgressEvent::GroupDone {
-                name: group.name.clone(),
-                bytes: group.size,
-            });
+            let _ = tx
+                .send(ProgressEvent::GroupDone {
+                    name: group.name.clone(),
+                    bytes: group.size,
+                })
+                .await;
         }
 
         for item in &plan.full_files {
             if item.local_ready {
                 continue;
             }
-            let _ = tx.send(ProgressEvent::GroupStart { name: item.name.clone() });
+            let _ = tx
+                .send(ProgressEvent::GroupStart {
+                    name: item.name.clone(),
+                })
+                .await;
             let _ = tx
                 .send(ProgressEvent::FileProgress {
                     name: item.name.clone(),
@@ -321,13 +333,15 @@ impl GameManager {
                 .await?;
             }
             std::fs::rename(&tmp, &staged)?;
-            let _ = tx.send(ProgressEvent::GroupDone {
-                name: item.name.clone(),
-                bytes: item.size,
-            });
+            let _ = tx
+                .send(ProgressEvent::GroupDone {
+                    name: item.name.clone(),
+                    bytes: item.size,
+                })
+                .await;
         }
 
-        let _ = tx.send(ProgressEvent::Done);
+        let _ = tx.send(ProgressEvent::Done).await;
         Ok(())
     }
 
@@ -738,7 +752,7 @@ impl GameManager {
                 .par_iter()
                 .map(|item| {
                     let n = checked.fetch_add(1, Ordering::SeqCst) + 1;
-                    if n % 256 == 0 {
+                    if n.is_multiple_of(256) {
                         if let Some(tx) = &verify_tx {
                             let _ = tx.try_send(ProgressEvent::FileProgress {
                                 name: "verify".to_string(),

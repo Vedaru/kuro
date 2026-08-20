@@ -25,9 +25,6 @@ pub enum Error {
     #[error("unknown appId `{0}` — cannot map to a known game/server")]
     UnknownAppId(String),
 
-    #[error("server mismatch: patch staged for {expected}, game is {actual}")]
-    ServerMismatch { expected: String, actual: String },
-
     #[error("checksum mismatch for {path}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         path: String,

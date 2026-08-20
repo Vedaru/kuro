@@ -138,19 +138,21 @@ pub async fn download_chunked(
         }));
     }
     for h in handles {
+        // `??`: unwrap the JoinError, then the chunk task's own Result —
+        // a failed chunk download must not be silently swallowed.
         h.await.map_err(|e| Error::Patch(format!("chunk task join: {e}")))?;
         if let Some(tx) = progress {
             let _ = tx
                 .send(ProgressEvent::FileProgress {
                     name: name.to_string(),
                     bytes: done_counter.load(Ordering::Relaxed),
-                    total: expected_size.unwrap(),
+                    total: expected_size.expect("chunked download size"),
                 })
                 .await;
         }
     }
 
-    verify_file(dest, Some(expected_size.unwrap()), expected_md5).await
+    verify_file(dest, Some(expected_size.expect("chunked download size")), expected_md5).await
 }
 
 /// Size (+ optional MD5) check of a finished file.

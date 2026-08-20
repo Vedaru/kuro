@@ -13,5 +13,5 @@ pub use config::{game_server_by_app_id, server_entry, servers, Game, Server, Ser
 pub use error::{Error, Result};
 pub use types::{
     ChunkInfo, CdnNode, DefaultSection, FileRef, GroupInfo, LauncherConfig, LauncherIndex,
-    LocalConfig, PatchConfig, PatchIndex, PredownloadSection, ResourceItem,
+    LocalConfig, PatchConfig, PatchIndex, ResourceItem,
 };
