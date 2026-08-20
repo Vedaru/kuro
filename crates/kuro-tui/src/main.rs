@@ -19,7 +19,8 @@ use kuro_core::{default_game_dir, detect_steam, Game, GameManager, GameStatus, P
 const DEFAULT_GAME_DIR: &str = "/home/vedaru/.local/share/Steam/steamapps/common/Wuthering Waves";
 
 enum UiEvent {
-    Status(Result<GameStatus, String>),
+    /// Status result for one game (index into `UiState::statuses`).
+    Status(usize, Result<GameStatus, String>),
     Progress(ProgressEvent),
     TaskDone(Result<String, String>),
 }
@@ -29,6 +30,8 @@ struct TaskUi {
     kind: String,
     total: usize,
     done: usize,
+    /// Items announced but not yet finished (GroupStart - GroupDone).
+    queued: usize,
     finished: Option<Result<String, String>>,
     total_bytes: u64,
     done_bytes: u64,
@@ -43,15 +46,27 @@ struct FileState {
     total: u64,
 }
 
+/// Which section the Tab-focus is on; highlighted border + section-scoped keys
+/// (PgUp/PgDn scroll the log only when it is focused).
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    #[default]
+    Status,
+    Task,
+    Log,
+}
+
 #[derive(Default)]
 struct UiState {
     status: Option<Result<GameStatus, String>>,
     logs: Vec<String>,
     task: Option<TaskUi>,
     busy: bool,
-    /// Game folders in the manager; Tab cycles between them.
+    /// Game folders in the manager; ←/→ switches between them.
     paths: Vec<String>,
     active: usize,
+    /// Focused section (Tab cycles; PgUp/PgDn only scroll the log when focused).
+    focus: Focus,
     /// Log panel scroll offset (lines from the newest).
     log_scroll: usize,
     /// Open install modal (game + server selection).
@@ -94,6 +109,14 @@ fn push_log(state: &mut UiState, msg: impl Into<String>) {
     }
 }
 
+/// Human-friendly game name for logs.
+fn pretty_game(game: Game) -> &'static str {
+    match game {
+        Game::WuWa => "Wuthering Waves",
+        Game::Pgr => "Punishing: Gray Raven",
+    }
+}
+
 /// Turn known raw errors into friendly, human-readable messages.
 fn friendly_error(raw: &str) -> String {
     if raw.contains("no channel files could be swapped") || raw.contains("checkout:") {
@@ -103,13 +126,13 @@ fn friendly_error(raw: &str) -> String {
     } else if raw.contains("run predownload first") || raw.contains("incremental_download") {
         "no downloaded update found — press 'd' first to download it".to_string()
     } else if raw.contains("NoLocalConfig") || raw.contains("launcher config not found") {
-        "no game detected in this folder (launcherDownloadConfig.json missing)".to_string()
+        "no game found in this folder (launcherDownloadConfig.json missing)".to_string()
     } else if raw.contains("global fast-switch") {
         "the global server can't be fast-switched — use 's' to sync instead".to_string()
     } else if raw.contains("already up to date") {
         "already up to date".to_string()
     } else {
-        format!("oops: {raw}")
+        raw.to_string()
     }
 }
 
@@ -133,24 +156,27 @@ async fn main() -> std::io::Result<()> {
         _ => {}
     }
 
-    // TUI: one or more game folders (default: WuWa)
+    // TUI: one or more game folders (default: auto-detect installed games)
     let mut paths = args;
+    if paths.is_empty() {
+        paths = auto_detect_games();
+    }
     if paths.is_empty() {
         paths.push(DEFAULT_GAME_DIR.to_string());
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UiEvent>(64);
 
-    // initial status for the first game
-    {
+    // initial status for every game
+    for (idx, path) in paths.iter().enumerate() {
         let tx = tx.clone();
-        let path = paths[0].clone();
+        let path = path.clone();
         tokio::spawn(async move {
             let result = match GameManager::open(PathBuf::from(path)).await {
                 Ok(m) => m.status().await.map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             };
-            let _ = tx.send(UiEvent::Status(result)).await;
+            let _ = tx.send(UiEvent::Status(idx, result)).await;
         });
     }
 
@@ -312,7 +338,7 @@ async fn run(
                         });
                         push_log(
                             &mut state,
-                            format!("installing {game}/{server} into {target}"),
+                            format!("installing {} ({}) into {target}", pretty_game(game), server),
                         );
                         spawn_install(&tx, &target, game, server);
                     }
@@ -328,23 +354,17 @@ async fn run(
                         }
                     }
                     KeyCode::Tab => {
-                        if state.paths.len() > 1 && !state.busy {
-                            state.active = (state.active + 1) % state.paths.len();
-                            if state.active < state.statuses.len() {
-                                state.statuses[state.active] = None;
-                            }
-                            let msg = format!(
-                                "switched to game {} ({})",
-                                state.active + 1,
-                                state.paths[state.active]
-                            );
-                            push_log(&mut state, msg);
-                            spawn_status(&tx, &state.paths[state.active]);
-                        }
+                        state.focus = match state.focus {
+                            Focus::Status => Focus::Task,
+                            Focus::Task => Focus::Log,
+                            Focus::Log => Focus::Status,
+                        };
                     }
+                    KeyCode::Left => switch_game(&mut state, &tx, -1),
+                    KeyCode::Right => switch_game(&mut state, &tx, 1),
                     KeyCode::Char('r') => {
                         if !state.busy {
-                            spawn_status(&tx, &path);
+                            spawn_status(&tx, &path, state.active);
                         }
                     }
                     KeyCode::Char('d') => {
@@ -354,6 +374,7 @@ async fn run(
                                 kind: "predownload".into(),
                                 ..Default::default()
                             });
+                            state.focus = Focus::Task;
                             spawn_predownload(&tx, &path);
                         }
                     }
@@ -364,6 +385,7 @@ async fn run(
                                 kind: "apply".into(),
                                 ..Default::default()
                             });
+                            state.focus = Focus::Task;
                             spawn_simple(&tx, &path, TaskKind::Apply);
                         }
                     }
@@ -374,6 +396,7 @@ async fn run(
                                 kind: "sync".into(),
                                 ..Default::default()
                             });
+                            state.focus = Focus::Task;
                             spawn_simple(&tx, &path, TaskKind::Sync);
                         }
                     }
@@ -384,11 +407,30 @@ async fn run(
                                 kind: "checkout".into(),
                                 ..Default::default()
                             });
+                            state.focus = Focus::Task;
                             spawn_simple(&tx, &path, TaskKind::Checkout);
                         }
                     }
-                    KeyCode::PageUp => state.log_scroll += 10,
-                    KeyCode::PageDown => state.log_scroll = state.log_scroll.saturating_sub(10),
+                    KeyCode::Up => {
+                        if state.focus == Focus::Log {
+                            state.log_scroll += 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if state.focus == Focus::Log {
+                            state.log_scroll = state.log_scroll.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if state.focus == Focus::Log {
+                            state.log_scroll += 10;
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if state.focus == Focus::Log {
+                            state.log_scroll = state.log_scroll.saturating_sub(10);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -396,10 +438,27 @@ async fn run(
 
         while let Ok(ev) = rx.try_recv() {
             match ev {
-                UiEvent::Status(s) => {
-                    push_log(&mut state, format!("status refreshed: {s:?}"));
-                    if state.active < state.statuses.len() {
-                        state.statuses[state.active] = Some(s);
+                UiEvent::Status(idx, s) => {
+                    let line = match &s {
+                        Ok(gs) => {
+                            let local = gs.local_version.as_deref().unwrap_or("not installed");
+                            let state = if gs.update_available {
+                                "update available"
+                            } else {
+                                "up to date"
+                            };
+                            format!(
+                                "status: {} ({}) — local {local}, remote {} · {state}",
+                                pretty_game(gs.game),
+                                gs.server,
+                                gs.remote_version
+                            )
+                        }
+                        Err(e) => format!("status error: {}", friendly_error(e)),
+                    };
+                    push_log(&mut state, line);
+                    if idx < state.statuses.len() {
+                        state.statuses[idx] = Some(s);
                     }
                 }
                 UiEvent::Progress(p) => match p {
@@ -410,15 +469,15 @@ async fn run(
                             t.files.clear(); // repair phase starts; drop the verify bar
                         }
                     }
-                    ProgressEvent::GroupStart { name } => {
+                    ProgressEvent::SetQueued { count } => {
                         if let Some(t) = state.task.as_mut() {
-                            t.files.push(FileState {
-                                name,
-                                ..Default::default()
-                            });
-                            if t.files.len() > 12 {
-                                t.files.remove(0);
-                            }
+                            t.queued = count;
+                        }
+                    }
+                    ProgressEvent::GroupStart { name: _ } => {
+                        if let Some(t) = state.task.as_mut() {
+                            // queued for download; a row appears once it starts
+                            t.queued += 1;
                         }
                     }
                     ProgressEvent::FileProgress { name, bytes, total } => {
@@ -437,6 +496,7 @@ async fn run(
                             t.files.retain(|f| f.name != name);
                             t.done += 1;
                             t.done_bytes += bytes;
+                            t.queued = t.queued.saturating_sub(1);
                         }
                     }
                     ProgressEvent::Done => {
@@ -448,8 +508,8 @@ async fn run(
                 },
                 UiEvent::TaskDone(r) => {
                     match &r {
-                        Ok(msg) => push_log(&mut state, format!("task ok: {msg}")),
-                        Err(e) => push_log(&mut state, format!("task failed: {}", friendly_error(e))),
+                        Ok(msg) => push_log(&mut state, msg.clone()),
+                        Err(e) => push_log(&mut state, format!("failed: {}", friendly_error(e))),
                     }
                     if let Some(t) = state.task.as_mut() {
                         t.finished = Some(r);
@@ -462,7 +522,7 @@ async fn run(
     Ok(())
 }
 
-fn spawn_status(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
+fn spawn_status(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, idx: usize) {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -470,8 +530,49 @@ fn spawn_status(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
             Ok(m) => m.status().await.map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         };
-        let _ = tx.send(UiEvent::Status(result)).await;
+        let _ = tx.send(UiEvent::Status(idx, result)).await;
     });
+}
+
+/// Switch the active game (←/→); wraps around, refreshes its status box.
+fn switch_game(state: &mut UiState, tx: &tokio::sync::mpsc::Sender<UiEvent>, delta: isize) {
+    if state.paths.len() < 2 || state.busy {
+        return;
+    }
+    let n = state.paths.len() as isize;
+    state.active = (state.active as isize + delta).rem_euclid(n) as usize;
+    if state.active < state.statuses.len() {
+        state.statuses[state.active] = None;
+    }
+    let name = state.paths[state.active]
+        .rsplit('/')
+        .next()
+        .unwrap_or("game");
+    push_log(state, format!("→ {name} (game {}/{})", state.active + 1, state.paths.len()));
+    spawn_status(tx, &state.paths[state.active], state.active);
+}
+
+/// Find installed Kuro games: the standard Steam folders (any library) whose
+/// launcher config marks them as real installs.
+fn auto_detect_games() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(steam) = detect_steam() else {
+        return out;
+    };
+    for game in [Game::WuWa, Game::Pgr] {
+        let name = match game {
+            Game::WuWa => "Wuthering Waves",
+            Game::Pgr => "Punishing Gray Raven",
+        };
+        for lib in &steam.libraries {
+            let dir = lib.join("common").join(name);
+            if dir.join("launcherDownloadConfig.json").is_file() {
+                out.push(dir.to_string_lossy().into_owned());
+                break; // one entry per game
+            }
+        }
+    }
+    out
 }
 
 fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
@@ -494,7 +595,7 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
                 Ok::<_, String>("already up to date — nothing to download".to_string())
             } else {
                 Ok::<_, String>(format!(
-                    "{} -> {} staged ({} groups, {} files, {:.1} GiB)",
+                    "predownload complete — {} → {} staged ({} groups, {} files, {:.1} GiB)",
                     plan.from_version,
                     plan.to_version,
                     plan.patch_groups.len(),
@@ -523,11 +624,12 @@ fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game
             Ok(r) => {
                 let exe = r
                     .game_exe
-                    .map(|e| format!("; exe: {e}"))
+                    .map(|e| format!(" — exe: {e}"))
                     .unwrap_or_default();
                 Ok(format!(
-                    "installed {} v{} (game files{})",
-                    game, r.version, exe
+                    "install complete — {} v{} (game files){exe}",
+                    pretty_game(game),
+                    r.version
                 ))
             }
             Err(e) => Err(e.to_string()),
@@ -561,7 +663,7 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                 TaskKind::Apply => {
                     let report = mgr.apply().await.map_err(|e| e.to_string())?;
                     Ok(format!(
-                        "apply: merged={} skipped={} fallback={} swapped={} deleted={}",
+                        "apply complete — merged {}, skipped {}, fallback {}, swapped {}, deleted {}",
                         report.merged,
                         report.skipped,
                         report.fallback,
@@ -574,13 +676,16 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                         .sync_with_progress(ptx.take())
                         .await
                         .map_err(|e| e.to_string())?;
+                    let failed = if report.failed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} failed", report.failed.len())
+                    };
                     Ok(format!(
-                        "sync: checked={} ok={} repaired={} ({:.1} GiB) failed={}",
-                        report.checked,
-                        report.ok,
+                        "sync complete — {} repaired ({:.1} GiB), {} ok{failed}",
                         report.repaired,
                         report.repaired_bytes as f64 / (1 << 30) as f64,
-                        report.failed.len()
+                        report.ok
                     ))
                 }
                 TaskKind::Checkout => {
@@ -591,7 +696,7 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                     };
                     let report = mgr.checkout(target).await.map_err(|e| e.to_string())?;
                     Ok(format!(
-                        "checkout: {} -> {} ({} files, v{})",
+                        "checkout complete — {} → {}, {} files swapped, now v{}",
                         report.from_server, report.to_server, report.swapped_files, report.new_version
                     ))
                 }
@@ -641,7 +746,11 @@ fn ui(f: &mut Frame, state: &UiState) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!("▶ {name}"))
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(if state.focus == Focus::Status {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    }))
             } else {
                 Block::default().borders(Borders::ALL).title(name)
             };
@@ -657,7 +766,16 @@ fn ui(f: &mut Frame, state: &UiState) {
         f.render_widget(
             Paragraph::new(status_box_lines(s, state.busy))
                 .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).title("status")),
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("status")
+                        .border_style(Style::default().fg(if state.focus == Focus::Status {
+                            Color::Yellow
+                        } else {
+                            Color::Reset
+                        })),
+                ),
             chunks[1],
         );
     }
@@ -668,12 +786,12 @@ fn ui(f: &mut Frame, state: &UiState) {
         Some(t) => {
             let mut v = vec![
                 Line::raw(format!("task: {}", t.kind)),
-                Line::raw(format!("files done: {}", t.done)),
+                Line::raw(format!("files done: {}   queued: {}", t.done, t.queued)),
             ];
             if t.total_bytes > 0 {
                 v.push(Line::raw(bar_line("overall", t.done_bytes, t.total_bytes, 34)));
             }
-            for f in t.files.iter().take(6) {
+            for f in t.files.iter().take(8) {
                 let name = shorten(&f.name, 42);
                 v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
             }
@@ -695,7 +813,16 @@ fn ui(f: &mut Frame, state: &UiState) {
     f.render_widget(
         Paragraph::new(task_lines)
             .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("task")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("task")
+                    .border_style(Style::default().fg(if state.focus == Focus::Task {
+                        Color::Yellow
+                    } else {
+                        Color::Reset
+                    })),
+            ),
         chunks[2],
     );
 
@@ -707,20 +834,29 @@ fn ui(f: &mut Frame, state: &UiState) {
     f.render_widget(
         Paragraph::new(log_lines)
             .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("log (PgUp/PgDn)")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("log (↑/↓ PgUp/PgDn)")
+                    .border_style(Style::default().fg(if state.focus == Focus::Log {
+                        Color::Yellow
+                    } else {
+                        Color::Reset
+                    })),
+            ),
         chunks[3],
     );
 
     let footer = format!(
-        "{} | r: refresh  d: predownload  a: apply  s: sync  c: checkout  i: install  h: help  q: quit{}",
+        "{} | r: refresh  s: sync  h: help  q: quit{}",
         if state.paths.len() > 1 {
             format!(
-                "Tab: switch game ({}/{})",
+                "Tab: focus  ←/→: game ({}/{})",
                 state.active + 1,
                 state.paths.len()
             )
         } else {
-            "single game".to_string()
+            "Tab: focus".to_string()
         },
         if state.busy { "   [busy]" } else { "" }
     );
@@ -737,8 +873,9 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw("    c        checkout server (CN<->B)  i   install a new game"),
             Line::raw("    s        (in install) Steam default target"),
             Line::raw("    t        (in install) edit target path"),
-            Line::raw("    Tab      switch game (multi-folder)"),
-            Line::raw("    PgUp/PgDn scroll log               h/?  this help"),
+            Line::raw("    Tab      cycle focus (status/task/log)"),
+            Line::raw("    ←/→      switch game (multi-folder)"),
+            Line::raw("    ↑/↓ PgUp/PgDn scroll log (log focused) h/?  this help"),
             Line::raw("    q        quit"),
             Line::raw(""),
             Line::raw("  install a new game (also available via 'i'):"),
@@ -746,7 +883,8 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw("    kuro install pgr global ~/PGR"),
             Line::raw("  installs the GAME files only (no launcher — on Linux you"),
             Line::raw("  launch the game .exe via Steam + GE-Proton afterwards)"),
-            Line::raw("  then run: kuro <folder1> <folder2> ...   (Tab switches)"),
+            Line::raw("  installed games are auto-detected in Steam libraries;"),
+            Line::raw("  or pass folders: kuro <folder1> <folder2> ...  (Tab switches)"),
             Line::raw(""),
             Line::raw("  press h / ? / Esc to close"),
         ];
@@ -850,13 +988,28 @@ fn bar_line(label: &str, done: u64, total: u64, bar_w: usize) -> String {
     let ratio = (done as f64 / total as f64).clamp(0.0, 1.0);
     let filled = (bar_w as f64 * ratio).round() as usize;
     format!(
-        "[{}{}] {:5.1}%  {:.2}/{:.2} GiB  {label}",
+        "[{}{}] {:5.1}%  {}/{}  {label}",
         "█".repeat(filled),
         "░".repeat(bar_w - filled),
         ratio * 100.0,
-        done as f64 / (1 << 30) as f64,
-        total as f64 / (1 << 30) as f64,
+        fmt_bytes(done),
+        fmt_bytes(total),
     )
+}
+
+/// Human size with adaptive units (KiB / MiB / GiB).
+fn fmt_bytes(b: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = b as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else {
+        format!("{:.0} KiB", b / KIB)
+    }
 }
 
 /// Keep the tail of long file paths (the part that matters).
