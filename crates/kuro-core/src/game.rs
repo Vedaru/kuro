@@ -466,9 +466,194 @@ impl GameManager {
         Ok(report)
     }
 
-    /// Full-tree MD5 verify/repair against the remote index.
-    pub async fn sync(&self) -> Result<()> {
-        Err(Error::Unimplemented("sync — next milestone"))
+    /// Switch server channel by swapping only the channel-specific files and
+    /// updating the appId (CN <-> Bilibili). Global is a different package —
+    /// not supported for fast-switch (mirrors ww-manager).
+    pub async fn checkout(&self, target: Server) -> Result<CheckoutReport> {
+        if matches!(target, Server::Global) {
+            return Err(Error::Unimplemented(
+                "global fast-switch is not supported (package differences) — full sync instead",
+            ));
+        }
+        self.checkout_inner(target, None).await
+    }
+
+    /// Checkout core, testable with `api_url` pointed at a local server.
+    pub async fn checkout_inner(
+        &self,
+        target: Server,
+        api_url: Option<&str>,
+    ) -> Result<CheckoutReport> {
+        let entry = server_entry(self.game, target).expect("registry covers all known servers");
+        let api_url = api_url.unwrap_or(entry.api_url);
+
+        let index = self.api.fetch_index(api_url).await?;
+        let cdn = self.api.pick_cdn(&index)?.url.clone();
+        let cfg = &index.default.config;
+        let to_version = cfg.version.clone();
+        let base = cfg.base_url.clone();
+
+        // full index → md5s for the diff files
+        let full_index: PatchIndex = self
+            .http
+            .get(format!(
+                "{}/{}",
+                cdn.trim_end_matches('/'),
+                cfg.index_file.trim_start_matches('/')
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let md5_by_dest: HashMap<String, String> = full_index
+            .resource
+            .iter()
+            .map(|r| (r.dest.clone(), r.md5.clone()))
+            .collect();
+
+        let mut swapped = 0;
+        for f in entry.diff_files {
+            let Some(expected_md5) = md5_by_dest.get(*f) else {
+                continue;
+            };
+            let url = ApiClient::resource_url(&cdn, &base, f);
+            let game_path = self.game_folder.join(f.trim_start_matches('/'));
+            std::fs::create_dir_all(game_path.parent().unwrap())?;
+            let tmp = game_path.with_extension("checkout.tmp");
+            download_single(&self.http, &url, &tmp, None, Some(expected_md5)).await?;
+            safe_replace(&tmp, &game_path)?;
+            swapped += 1;
+        }
+
+        let cfg = LocalConfig {
+            version: to_version.clone(),
+            app_id: entry.app_id.to_string(),
+            group: "default".to_string(),
+        };
+        state::write_local_config(&self.game_folder, &cfg)?;
+
+        Ok(CheckoutReport {
+            from_server: self.server,
+            to_server: target,
+            swapped_files: swapped,
+            new_version: to_version,
+        })
+    }
+    /// Full-tree MD5 verify/repair against the remote full-file index of the
+    /// current version. Missing or mismatched files are re-downloaded
+    /// (chunked parallel when the index has `chunkInfos`).
+    pub async fn sync(&self) -> Result<SyncReport> {
+        let index = self.api.fetch_index(self.server_entry().api_url).await?;
+        let cdn = self.api.pick_cdn(&index)?.url.clone();
+        let cfg = &index.default.config;
+        let url = format!(
+            "{}/{}",
+            cdn.trim_end_matches('/'),
+            cfg.index_file.trim_start_matches('/')
+        );
+        let full_index: PatchIndex = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        self.sync_inner(&full_index, &cdn, &cfg.base_url).await
+    }
+
+    /// Sync core, testable with a synthetic index + local HTTP server.
+    pub async fn sync_inner(
+        &self,
+        full_index: &PatchIndex,
+        cdn: &str,
+        base: &str,
+    ) -> Result<SyncReport> {
+        let items = full_index.resource.clone();
+
+        // verify phase — hash the whole tree in parallel off the async runtime
+        let game_folder = self.game_folder.clone();
+        let checks: Vec<(ResourceItem, bool)> = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            items
+                .par_iter()
+                .map(|item| {
+                    let p = game_folder.join(item.dest.trim_start_matches('/'));
+                    let size_ok = std::fs::metadata(&p)
+                        .map(|m| m.len() == item.size)
+                        .unwrap_or(false);
+                    let ok = size_ok
+                        && (item.md5.is_empty()
+                            || kuro_patch::md5_file(&p)
+                                .map(|a| a == item.md5)
+                                .unwrap_or(false));
+                    (item.clone(), ok)
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| Error::Patch(format!("verify task join: {e}")))?;
+
+        let mut report = SyncReport {
+            checked: checks.len(),
+            ..Default::default()
+        };
+        let mut to_fix: Vec<ResourceItem> = Vec::new();
+        for (item, ok) in checks {
+            if ok {
+                report.ok += 1;
+            } else {
+                to_fix.push(item);
+            }
+        }
+
+        // repair phase — parallel downloads, verified before swap
+        let sem = Arc::new(tokio::sync::Semaphore::new(CHUNK_CONCURRENCY));
+        let mut handles = Vec::with_capacity(to_fix.len());
+        for item in to_fix {
+            let sem = sem.clone();
+            let http = self.http.clone();
+            let game_folder = self.game_folder.clone();
+            let cdn = cdn.to_string();
+            let base = base.to_string();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
+                let url = ApiClient::resource_url(&cdn, &from, &item.dest);
+                let game_path = game_folder.join(item.dest.trim_start_matches('/'));
+                std::fs::create_dir_all(game_path.parent().unwrap())?;
+                let tmp = game_path.with_extension("sync.tmp");
+                if item.chunk_infos.is_empty() {
+                    download_single(&http, &url, &tmp, Some(item.size), Some(&item.md5)).await?;
+                } else {
+                    download_chunked(
+                        &http,
+                        &url,
+                        &tmp,
+                        &item.chunk_infos,
+                        Some(&item.md5),
+                        CHUNK_CONCURRENCY,
+                    )
+                    .await?;
+                }
+                safe_replace(&tmp, &game_path)?;
+                Ok::<_, Error>((item.dest, item.size))
+            }));
+        }
+        for h in handles {
+            let inner: std::result::Result<(String, u64), Error> = h
+                .await
+                .map_err(|e| Error::Patch(format!("repair join: {e}")))?;
+            match inner {
+                Ok((_dest, size)) => {
+                    report.repaired += 1;
+                    report.repaired_bytes += size;
+                }
+                Err(e) => report.failed.push(e.to_string()),
+            }
+        }
+        Ok(report)
     }
 }
 
@@ -568,6 +753,25 @@ pub struct ApplyReport {
     pub fallback: usize,
     pub swapped: usize,
     pub deleted: Vec<String>,
+}
+
+/// Result summary of a sync run.
+#[derive(Debug, Clone, Default)]
+pub struct SyncReport {
+    pub checked: usize,
+    pub ok: usize,
+    pub repaired: usize,
+    pub repaired_bytes: u64,
+    pub failed: Vec<String>,
+}
+
+/// Result summary of a server checkout.
+#[derive(Debug, Clone)]
+pub struct CheckoutReport {
+    pub from_server: Server,
+    pub to_server: Server,
+    pub swapped_files: usize,
+    pub new_version: String,
 }
 
 fn is_krpdiff(dest: &str) -> bool {

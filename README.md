@@ -23,11 +23,30 @@ Scaffolded workspace. What works today:
   resumable download (parallel chunked range GETs with per-chunk MD5),
   **apply pipeline** (parallel native KrDiff merges -> MD5 verify -> atomic
   `.bak` swaps -> `deleteFiles` -> version bump; full-file fallback on merge
-  failure), atomic `.bak`-swap primitives.
-- `kuro-tui` — minimal ratatui UI showing game/server/version status.
+  failure), **sync** (parallel full-tree MD5 verify + repair), **checkout**
+  (CN <-> Bilibili channel switch via diff-file swap + appId).
+- `kuro-tui` — ratatui UI with live status and task progress.
+  Keys: `r` refresh · `d` predownload · `a` apply · `s` sync ·
+  `c` checkout (CN<->bilibili) · `q` quit.
 
-Not yet: `sync` (full-tree verify), `checkout` (server switch), PGR server
-endpoints, TUI progress rendering for downloads.
+Not yet: PGR server endpoints (discovery procedure below), global checkout
+(package differences), per-group progress gauges (names shown for now),
+persistent MD5 cache for sync speedups.
+
+## Adding PGR (Punishing: Gray Raven) — endpoint discovery
+
+Kuro's titles share one launcher platform, but PGR's `index.json` URL isn't
+publicly documented. One-time discovery procedure:
+
+1. Install the official PGR launcher in a wine prefix
+2. Run it under `mitmproxy` (or check its `launcherDownloadConfig.json` /
+   `launcher_main.dll` strings) to capture the
+   `prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/GXXX/<appId>_<token>/index.json`
+   URL it calls
+3. Add the URL + appId to `kuro-api/src/config.rs` (`Game::Pgr` entry)
+
+Everything else (download / merge / apply / sync / checkout / TUI) is
+game-agnostic and just works once the entry exists.
 
 ## Crate layout
 

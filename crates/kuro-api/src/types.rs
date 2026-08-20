@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Top level of the launcher API entry point (e.g.
 /// `.../launcher/game/G152/10003_<token>/index.json`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LauncherIndex {
     pub default: DefaultSection,
@@ -24,7 +24,7 @@ pub struct LauncherIndex {
     pub predownload_switch: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DefaultSection {
     /// Weighted CDN nodes (`P` = weight, `url` = base).
@@ -38,14 +38,14 @@ pub struct DefaultSection {
 }
 
 /// Mirrors the `predownload` section when a pre-download window is open.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PredownloadSection {
     #[serde(default)]
     pub config: LauncherConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CdnNode {
     /// NOTE: Kuro uses UPPERCASE keys here (`P`, `K1`, `K2`) — not camelCase.
@@ -58,7 +58,7 @@ pub struct CdnNode {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LauncherConfig {
     #[serde(default)]
@@ -80,7 +80,7 @@ pub struct LauncherConfig {
 }
 
 /// A single `oldVersion -> newVersion` incremental patch description.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchConfig {
     pub version: String,
@@ -93,7 +93,7 @@ pub struct PatchConfig {
 }
 
 /// The patch manifest for one source version (krpdiff groups + fallbacks).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchIndex {
     /// Full-file fallbacks; entries whose `dest` ends in `.krpdiff` are the
@@ -108,7 +108,7 @@ pub struct PatchIndex {
     pub apply_types: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceItem {
     pub dest: String,
@@ -124,7 +124,7 @@ pub struct ResourceItem {
 
 /// One krpdiff group: source files (old versions) + destination files (new
 /// versions) that the merge produces.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupInfo {
     /// krpdiff filename (relative to `PatchConfig::base_url`).
@@ -135,7 +135,7 @@ pub struct GroupInfo {
     pub dst_files: Vec<FileRef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileRef {
     pub dest: String,
