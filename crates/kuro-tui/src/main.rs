@@ -634,14 +634,16 @@ fn ui(f: &mut Frame, state: &UiState) {
                 Block::default().borders(Borders::ALL).title(name)
             };
             f.render_widget(
-                Paragraph::new(status_box_lines(s)).wrap(Wrap { trim: true }).block(border),
+                Paragraph::new(status_box_lines(s, active && state.busy))
+                    .wrap(Wrap { trim: true })
+                    .block(border),
                 *col,
             );
         }
     } else {
         let s = state.statuses.get(0).and_then(|x| x.as_ref());
         f.render_widget(
-            Paragraph::new(status_box_lines(s))
+            Paragraph::new(status_box_lines(s, state.busy))
                 .wrap(Wrap { trim: true })
                 .block(Block::default().borders(Borders::ALL).title("status")),
             chunks[1],
@@ -800,22 +802,25 @@ fn ui(f: &mut Frame, state: &UiState) {
     }
 }
 
-/// Lines for a per-game status box.
-fn status_box_lines(s: Option<&Result<GameStatus, String>>) -> Vec<Line> {
+/// Lines for a per-game status box. `busy` marks the active game's box while
+/// a task is running, so "up to date" never lies about in-flight work.
+fn status_box_lines(s: Option<&Result<GameStatus, String>>, busy: bool) -> Vec<Line> {
     match s {
         Some(Ok(s)) => vec![
             Line::raw(format!("game:    {}", s.game)),
             Line::raw(format!("server:  {}", s.server)),
             Line::raw(format!("local:   {}", s.local_version.as_deref().unwrap_or("none"))),
             Line::raw(format!("remote:  {}", s.remote_version)),
-            Line::styled(
-                if s.update_available {
-                    "UPDATE AVAILABLE"
-                } else {
-                    "up to date"
-                },
-                Style::default().fg(if s.update_available { Color::Yellow } else { Color::Green }),
-            ),
+            if busy {
+                Line::styled(
+                    "updating…",
+                    Style::default().fg(Color::Yellow),
+                )
+            } else if s.update_available {
+                Line::styled("UPDATE AVAILABLE", Style::default().fg(Color::Yellow))
+            } else {
+                Line::styled("up to date", Style::default().fg(Color::Green))
+            },
         ],
         Some(Err(e)) => vec![Line::styled(
             format!("error: {e}"),
