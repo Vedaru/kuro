@@ -20,6 +20,8 @@ pub enum ProgressEvent {
     Log(String),
     GroupStart { name: String },
     GroupDone { name: String, bytes: u64 },
+    /// Total bytes of the operation, known once planning/verification is done.
+    SetTotal { bytes: u64 },
     Done,
 }
 
@@ -489,6 +491,16 @@ impl GameManager {
     /// write `launcherDownloadConfig.json` (remote version + appId), then
     /// sync the full client. Works for any Kuro game in the registry.
     pub async fn install(game: Game, server: Server, game_folder: PathBuf) -> Result<InstallReport> {
+        Self::install_with_progress(game, server, game_folder, None).await
+    }
+
+    /// Install with progress events (used by the TUI).
+    pub async fn install_with_progress(
+        game: Game,
+        server: Server,
+        game_folder: PathBuf,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<InstallReport> {
         let entry = server_entry(game, server)
             .ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
         let api = ApiClient::new()?;
@@ -504,7 +516,7 @@ impl GameManager {
         state::write_local_config(&game_folder, &cfg)?;
 
         let mgr = Self::open(game_folder).await?;
-        let sync = mgr.sync().await?;
+        let sync = mgr.sync_with_progress(tx).await?;
         Ok(InstallReport { version, sync })
     }
 
@@ -588,10 +600,15 @@ impl GameManager {
             new_version: to_version,
         })
     }
-    /// Full-tree MD5 verify/repair against the remote full-file index of the
-    /// current version. Missing or mismatched files are re-downloaded
-    /// (chunked parallel when the index has `chunkInfos`).
     pub async fn sync(&self) -> Result<SyncReport> {
+        self.sync_with_progress(None).await
+    }
+
+    /// Sync with optional progress events (used by install and the TUI).
+    pub async fn sync_with_progress(
+        &self,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<SyncReport> {
         let index = self.api.fetch_index(self.server_entry().api_url).await?;
         let cdn = self.api.pick_cdn(&index)?.url.clone();
         let cfg = &index.default.config;
@@ -608,7 +625,8 @@ impl GameManager {
             .error_for_status()?
             .json()
             .await?;
-        self.sync_inner(&full_index, &cdn, &cfg.base_url).await
+        self.sync_inner_with_progress(&full_index, &cdn, &cfg.base_url, tx)
+            .await
     }
 
     /// Sync core, testable with a synthetic index + local HTTP server.
@@ -617,6 +635,17 @@ impl GameManager {
         full_index: &PatchIndex,
         cdn: &str,
         base: &str,
+    ) -> Result<SyncReport> {
+        self.sync_inner_with_progress(full_index, cdn, base, None).await
+    }
+
+    /// Sync core with progress events.
+    pub async fn sync_inner_with_progress(
+        &self,
+        full_index: &PatchIndex,
+        cdn: &str,
+        base: &str,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<SyncReport> {
         let items = full_index.resource.clone();
 
@@ -656,10 +685,22 @@ impl GameManager {
             }
         }
 
+        let total: u64 = to_fix.iter().map(|i| i.size).sum();
+        if let Some(tx) = &tx {
+            let _ = tx.send(ProgressEvent::SetTotal { bytes: total }).await;
+        }
+
         // repair phase — parallel downloads, verified before swap
         let sem = Arc::new(tokio::sync::Semaphore::new(CHUNK_CONCURRENCY));
         let mut handles = Vec::with_capacity(to_fix.len());
         for item in to_fix {
+            if let Some(tx) = &tx {
+                let _ = tx
+                    .send(ProgressEvent::GroupStart {
+                        name: item.dest.clone(),
+                    })
+                    .await;
+            }
             let sem = sem.clone();
             let http = self.http.clone();
             let game_folder = self.game_folder.clone();
@@ -694,9 +735,17 @@ impl GameManager {
                 .await
                 .map_err(|e| Error::Patch(format!("repair join: {e}")))?;
             match inner {
-                Ok((_dest, size)) => {
+                Ok((dest, size)) => {
                     report.repaired += 1;
                     report.repaired_bytes += size;
+                    if let Some(tx) = &tx {
+                        let _ = tx
+                            .send(ProgressEvent::GroupDone {
+                                name: dest,
+                                bytes: size,
+                            })
+                            .await;
+                    }
                 }
                 Err(e) => report.failed.push(e.to_string()),
             }

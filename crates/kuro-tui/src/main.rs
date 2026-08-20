@@ -31,6 +31,8 @@ struct TaskUi {
     done: usize,
     current: Option<String>,
     finished: Option<Result<String, String>>,
+    total_bytes: u64,
+    done_bytes: u64,
 }
 
 #[derive(Default)]
@@ -386,15 +388,20 @@ async fn run(
                 }
                 UiEvent::Progress(p) => match p {
                     ProgressEvent::Log(m) => push_log(&mut state, m),
+                    ProgressEvent::SetTotal { bytes } => {
+                        if let Some(t) = state.task.as_mut() {
+                            t.total_bytes = bytes;
+                        }
+                    }
                     ProgressEvent::GroupStart { name } => {
                         if let Some(t) = state.task.as_mut() {
                             t.current = Some(name);
                         }
                     }
-                    ProgressEvent::GroupDone { name, bytes } => {
+                    ProgressEvent::GroupDone { bytes, .. } => {
                         if let Some(t) = state.task.as_mut() {
                             t.done += 1;
-                            push_log(&mut state, format!("done {name} ({bytes} bytes)"));
+                            t.done_bytes += bytes;
                         }
                     }
                     ProgressEvent::Done => {
@@ -446,6 +453,7 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
                     let _ = tx2.send(UiEvent::Progress(ev)).await;
                 }
             });
+            let _ = ptx.send(ProgressEvent::SetTotal { bytes: plan.total_bytes }).await;
             mgr.predownload(&plan, ptx).await.map_err(|e| e.to_string())?;
             if plan.total_bytes == 0 {
                 Ok::<_, String>("already up to date — nothing to download".to_string())
@@ -469,7 +477,14 @@ fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
-        let result = match GameManager::install(game, server, PathBuf::from(path)).await {
+        let (ptx, mut prx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = prx.recv().await {
+                let _ = tx2.send(UiEvent::Progress(ev)).await;
+            }
+        });
+        let result = match GameManager::install_with_progress(game, server, PathBuf::from(path), Some(ptx)).await {
             Ok(r) => Ok(format!(
                 "installed {} v{} (checked={} ok={} repaired={} failed={})",
                 game,
@@ -584,9 +599,23 @@ fn ui(f: &mut Frame, state: &UiState) {
         Some(t) => {
             let mut v = vec![
                 Line::raw(format!("task: {}", t.kind)),
-                Line::raw(format!("groups: {}/{}", t.done, t.total)),
+                Line::raw(format!("files done: {}", t.done)),
                 Line::raw(format!("current: {}", t.current.as_deref().unwrap_or("-"))),
             ];
+            if t.total_bytes > 0 {
+                let ratio = (t.done_bytes as f64 / t.total_bytes as f64).clamp(0.0, 1.0);
+                let bar_w = 22usize;
+                let filled = (bar_w as f64 * ratio).round() as usize;
+                let bar = format!(
+                    "[{}{}] {:5.1}%  {:.2}/{:.2} GiB",
+                    "█".repeat(filled),
+                    "░".repeat(bar_w - filled),
+                    ratio * 100.0,
+                    t.done_bytes as f64 / (1 << 30) as f64,
+                    t.total_bytes as f64 / (1 << 30) as f64,
+                );
+                v.push(Line::raw(bar));
+            }
             if let Some(f) = &t.finished {
                 v.push(Line::styled(
                     match f {
