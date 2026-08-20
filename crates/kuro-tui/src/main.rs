@@ -407,6 +407,7 @@ async fn run(
                     ProgressEvent::SetTotal { bytes } => {
                         if let Some(t) = state.task.as_mut() {
                             t.total_bytes = bytes;
+                            t.files.clear(); // repair phase starts; drop the verify bar
                         }
                     }
                     ProgressEvent::GroupStart { name } => {

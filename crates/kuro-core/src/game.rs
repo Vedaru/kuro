@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use kuro_api::config::ServerEntry;
@@ -702,14 +703,33 @@ impl GameManager {
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<SyncReport> {
         let items = full_index.resource.clone();
+        let total_files = items.len() as u64;
+
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(ProgressEvent::Log(format!("verifying {total_files} files…")))
+                .await;
+        }
 
         // verify phase — hash the whole tree in parallel off the async runtime
         let game_folder = self.game_folder.clone();
+        let verify_tx = tx.clone();
+        let checked = Arc::new(AtomicUsize::new(0));
         let checks: Vec<(ResourceItem, bool)> = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             items
                 .par_iter()
                 .map(|item| {
+                    let n = checked.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n % 256 == 0 {
+                        if let Some(tx) = &verify_tx {
+                            let _ = tx.try_send(ProgressEvent::FileProgress {
+                                name: "verify".to_string(),
+                                bytes: n as u64,
+                                total: total_files,
+                            });
+                        }
+                    }
                     let p = game_folder.join(item.dest.trim_start_matches('/'));
                     let size_ok = std::fs::metadata(&p)
                         .map(|m| m.len() == item.size)
@@ -741,6 +761,22 @@ impl GameManager {
 
         let total: u64 = to_fix.iter().map(|i| i.size).sum();
         if let Some(tx) = &tx {
+            if to_fix.is_empty() {
+                let _ = tx
+                    .send(ProgressEvent::Log(format!(
+                        "all {} files ok",
+                        report.checked
+                    )))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(ProgressEvent::Log(format!(
+                        "{} files need repair ({:.1} GiB)",
+                        to_fix.len(),
+                        total as f64 / (1 << 30) as f64
+                    )))
+                    .await;
+            }
             let _ = tx.send(ProgressEvent::SetTotal { bytes: total }).await;
         }
 
