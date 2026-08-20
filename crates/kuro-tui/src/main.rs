@@ -54,6 +54,25 @@ fn push_log(state: &mut UiState, msg: impl Into<String>) {
     }
 }
 
+/// Turn known raw errors into friendly, human-readable messages.
+fn friendly_error(raw: &str) -> String {
+    if raw.contains("no channel files could be swapped") || raw.contains("checkout:") {
+        "checkout isn't possible for this server — its channel files aren't in the manifest; your install is unchanged".to_string()
+    } else if raw.contains("patchConfig entry") {
+        "already on the latest version — nothing to do".to_string()
+    } else if raw.contains("run predownload first") || raw.contains("incremental_download") {
+        "no downloaded update found — press 'd' first to download it".to_string()
+    } else if raw.contains("NoLocalConfig") || raw.contains("launcher config not found") {
+        "no game detected in this folder (launcherDownloadConfig.json missing)".to_string()
+    } else if raw.contains("global fast-switch") {
+        "the global server can't be fast-switched — use 's' to sync instead".to_string()
+    } else if raw.contains("already up to date") {
+        "already up to date".to_string()
+    } else {
+        format!("oops: {raw}")
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -285,7 +304,7 @@ async fn run(
                 UiEvent::TaskDone(r) => {
                     match &r {
                         Ok(msg) => push_log(&mut state, format!("task ok: {msg}")),
-                        Err(e) => push_log(&mut state, format!("task failed: {e}")),
+                        Err(e) => push_log(&mut state, format!("task failed: {}", friendly_error(e))),
                     }
                     if let Some(t) = state.task.as_mut() {
                         t.finished = Some(r);
@@ -325,14 +344,18 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
                 }
             });
             mgr.predownload(&plan, ptx).await.map_err(|e| e.to_string())?;
-            Ok::<_, String>(format!(
-                "{} -> {} staged ({} groups, {} files, {:.1} GiB)",
-                plan.from_version,
-                plan.to_version,
-                plan.patch_groups.len(),
-                plan.full_files.len(),
-                plan.total_bytes as f64 / (1 << 30) as f64
-            ))
+            if plan.total_bytes == 0 {
+                Ok::<_, String>("already up to date — nothing to download".to_string())
+            } else {
+                Ok::<_, String>(format!(
+                    "{} -> {} staged ({} groups, {} files, {:.1} GiB)",
+                    plan.from_version,
+                    plan.to_version,
+                    plan.patch_groups.len(),
+                    plan.full_files.len(),
+                    plan.total_bytes as f64 / (1 << 30) as f64
+                ))
+            }
         }
         .await;
         let _ = tx.send(UiEvent::TaskDone(result)).await;
@@ -445,7 +468,7 @@ fn ui(f: &mut Frame, state: &UiState) {
                 v.push(Line::styled(
                     match f {
                         Ok(m) => format!("✔ {m}"),
-                        Err(e) => format!("✘ {e}"),
+                        Err(e) => format!("✘ {}", friendly_error(e)),
                     },
                     Style::default().fg(match f {
                         Ok(_) => Color::Green,
