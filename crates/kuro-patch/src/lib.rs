@@ -54,13 +54,22 @@ pub fn apply_krdiff(source_dir: &Path, krpdiff: &Path, out_dir: &Path) -> kuro_a
     Ok(())
 }
 
-/// MD5 of a file, hex-encoded lowercase.
+/// MD5 of a file, hex-encoded lowercase. Streams in 1 MiB chunks — reading a
+/// whole file into memory would OOM on WuWa's multi-GB paks (pakchunk70 is
+/// 26 GB alone).
 pub fn md5_file(path: &Path) -> kuro_api::Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(format!("{:x}", md5::compute(&buf)))
+    let mut ctx = md5::Context::new();
+    let mut buf = [0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        ctx.consume(&buf[..n]);
+    }
+    Ok(format!("{:x}", ctx.compute()))
 }
 
 /// EXPERIMENTAL: create a KrDiff-format patch (`old_tree + diff -> new_tree`).
