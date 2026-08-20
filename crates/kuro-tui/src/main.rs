@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{init, restore, Frame, Terminal};
 
@@ -708,23 +708,16 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
 }
 
 fn ui(f: &mut Frame, state: &UiState) {
-    // stacked sections: header / status / task / log / footer
+    // stacked sections: status / task / log / footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),      // header
             Constraint::Length(9),      // status: one box per game
             Constraint::Percentage(45), // task: overall + per-file bars
             Constraint::Min(4),         // log
             Constraint::Length(1),      // footer
         ])
         .split(f.area());
-
-    let title = Line::from(vec![
-        Span::styled("kuro", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" — Kuro Games installer & updater (native, no wine)"),
-    ]);
-    f.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), chunks[0]);
 
     // ---- status section: separate box per game ----
     let n = state.paths.len().max(1);
@@ -736,7 +729,7 @@ fn ui(f: &mut Frame, state: &UiState) {
                     .take(n)
                     .collect::<Vec<_>>(),
             )
-            .split(chunks[1]);
+            .split(chunks[0]);
         for (i, col) in cols.iter().enumerate() {
             let path = &state.paths[i];
             let active = i == state.active;
@@ -776,7 +769,7 @@ fn ui(f: &mut Frame, state: &UiState) {
                             Color::Reset
                         })),
                 ),
-            chunks[1],
+            chunks[0],
         );
     }
 
@@ -823,7 +816,7 @@ fn ui(f: &mut Frame, state: &UiState) {
                         Color::Reset
                     })),
             ),
-        chunks[2],
+        chunks[1],
     );
 
     // ---- log panel: wrap + scroll window (PgUp/PgDn) ----
@@ -844,7 +837,7 @@ fn ui(f: &mut Frame, state: &UiState) {
                         Color::Reset
                     })),
             ),
-        chunks[3],
+        chunks[2],
     );
 
     let footer = format!(
@@ -860,7 +853,7 @@ fn ui(f: &mut Frame, state: &UiState) {
         },
         if state.busy { "   [busy]" } else { "" }
     );
-    f.render_widget(Paragraph::new(Line::raw(footer)), chunks[4]);
+    f.render_widget(Paragraph::new(Line::raw(footer)), chunks[3]);
 
     // overlays: help / install modal
     if state.show_help {
