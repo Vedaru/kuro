@@ -13,5 +13,5 @@ pub mod download;
 pub mod game;
 pub mod state;
 
-pub use game::{GameManager, GameStatus, PendingGroup, ProgressEvent};
+pub use game::{ApplyReport, GameManager, GameStatus, PendingGroup, ProgressEvent};
 pub use kuro_api::{Error, Result};

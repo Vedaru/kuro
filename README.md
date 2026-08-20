@@ -21,11 +21,13 @@ Scaffolded workspace. What works today:
 - `kuro-core` — `GameManager`: auto-detect game/server from
   `launcherDownloadConfig.json`, live status, predownload planning +
   resumable download (parallel chunked range GETs with per-chunk MD5),
-  atomic `.bak`-swap primitives.
+  **apply pipeline** (parallel native KrDiff merges -> MD5 verify -> atomic
+  `.bak` swaps -> `deleteFiles` -> version bump; full-file fallback on merge
+  failure), atomic `.bak`-swap primitives.
 - `kuro-tui` — minimal ratatui UI showing game/server/version status.
 
-Not yet: `apply` (merge + swap pipeline), `sync`, `checkout` (server switch),
-PGR server endpoints, TUI progress rendering for downloads.
+Not yet: `sync` (full-tree verify), `checkout` (server switch), PGR server
+endpoints, TUI progress rendering for downloads.
 
 ## Crate layout
 

@@ -63,6 +63,23 @@ pub fn md5_file(path: &Path) -> kuro_api::Result<String> {
     Ok(format!("{:x}", md5::compute(&buf)))
 }
 
+/// EXPERIMENTAL: create a KrDiff-format patch (`old_tree + diff -> new_tree`).
+///
+/// The upstream crate's `create` mode is pathologically slow on large files
+/// and may not produce patches Kuro's own tooling accepts — it exists so the
+/// apply pipeline can be tested with realistic data. Not for production use.
+pub fn create_krdiff(old_dir: &Path, new_dir: &Path, out_diff: &Path) -> kuro_api::Result<()> {
+    let mut patcher = KrDiff::new(
+        old_dir.to_string_lossy().into_owned(),
+        out_diff.to_string_lossy().into_owned(),
+        new_dir.to_string_lossy().into_owned(),
+    );
+    if !patcher.create() {
+        return Err(Error::Patch("krdiff create failed".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

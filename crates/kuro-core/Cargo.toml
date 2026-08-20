@@ -16,3 +16,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "sync"] }
+
+[dev-dependencies]
+kuro-patch.workspace = true
+md5 = "0.8.1"
+serde_json = "1"

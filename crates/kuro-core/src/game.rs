@@ -1,13 +1,16 @@
 //! `GameManager` — the orchestrator: status / predownload / apply / sync.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kuro_api::config::ServerEntry;
 use kuro_api::{
-    game_server_by_app_id, server_entry, ApiClient, Error, Game, GroupInfo, ResourceItem, Server,
-    Result,
+    game_server_by_app_id, server_entry, ApiClient, Error, FileRef, Game, GroupInfo, LocalConfig,
+    PatchConfig, PatchIndex, ResourceItem, Server, Result,
 };
 
+use crate::atomic::{recover_backup, safe_replace};
 use crate::download::{download_chunked, download_single};
 use crate::state::{self, incremental_dir};
 
@@ -49,6 +52,8 @@ pub struct GameStatus {
 }
 
 const CHUNK_CONCURRENCY: usize = 8;
+/// Parallel krpdiff merges during apply (CPU-bound, native engine).
+const MERGE_CONCURRENCY: usize = 4;
 
 pub struct GameManager {
     pub game_folder: PathBuf,
@@ -266,23 +271,303 @@ impl GameManager {
     }
 
     /// Apply a downloaded incremental update: merge krpdiffs natively, verify,
-    /// then atomically swap into the game folder.
+    /// then atomically swap into the game folder. The game must not be running.
+    pub async fn apply(&self) -> Result<ApplyReport> {
+        let from_version = self
+            .local_version()?
+            .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
+
+        let index = self.api.fetch_index(self.server_entry().api_url).await?;
+        let remote = index.default.version.clone();
+        if remote == from_version {
+            return Ok(ApplyReport::default()); // nothing to do
+        }
+        let cdn = self.api.pick_cdn(&index)?.url.clone();
+        let patch_cfg = index
+            .default
+            .config
+            .patch_config
+            .iter()
+            .find(|p| p.version == from_version)
+            .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
+        let patch_index = self.api.fetch_patch_index(&cdn, patch_cfg).await?;
+
+        self.apply_inner(&patch_index, &cdn, patch_cfg, &remote).await
+    }
+
+    /// The apply pipeline, testable with a synthetic `PatchIndex`.
     ///
-    /// TODO(next milestone): port ww-manager's staging flow —
-    ///   1. for each group: `kuro_patch::apply_krdiff(game, krpdiff, out)` into a temp dir
-    ///   2. MD5-verify every output against `dstFiles`
-    ///   3. move outputs to `.incremental_download/staged/`
-    ///   4. `atomic::safe_replace` each into the game dir (with `.bak` recovery)
-    ///   5. handle `deleteFiles`, fall back to full-file download when a merge fails
-    ///   6. update `launcherDownloadConfig.json` to the target version
-    pub async fn apply(&self) -> Result<()> {
-        Err(Error::Unimplemented("apply — next milestone (see doc comment)"))
+    /// 1. merge phase: every krpdiff group -> staged outputs (native KrDiff,
+    ///    up to `MERGE_CONCURRENCY` in parallel; fallback = full-file download)
+    /// 2. migration phase: verified outputs swapped in atomically (`.bak`)
+    /// 3. delete phase: `deleteFiles` removed
+    /// 4. local version bumped, staging dir cleaned
+    ///
+    /// On any failure the game folder is left untouched; staging survives for
+    /// a retry.
+    pub async fn apply_inner(
+        &self,
+        patch_index: &PatchIndex,
+        cdn: &str,
+        patch_cfg: &PatchConfig,
+        to_version: &str,
+    ) -> Result<ApplyReport> {
+        let inc = incremental_dir(&self.game_folder);
+        if !inc.exists() {
+            return Err(Error::MissingField(
+                ".incremental_download — run predownload first",
+            ));
+        }
+
+        let res_by_dest: HashMap<String, ResourceItem> = patch_index
+            .resource
+            .iter()
+            .cloned()
+            .map(|r| (r.dest.clone(), r))
+            .collect();
+        let complete_dests: HashSet<String> = patch_index
+            .resource
+            .iter()
+            .filter(|r| !is_krpdiff(&r.dest))
+            .map(|r| r.dest.clone())
+            .collect();
+
+        // ---- merge phase ----
+        let mut groups: Vec<GroupInfo> = patch_index.group_infos.clone();
+        // biggest groups first (like ww-manager)
+        groups.sort_by_key(|g| std::cmp::Reverse(g.dst_files.iter().map(|d| d.size).sum::<u64>()));
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(MERGE_CONCURRENCY));
+        let mut handles = Vec::with_capacity(groups.len());
+        for (idx, group) in groups.into_iter().enumerate() {
+            let sem = sem.clone();
+            let game_folder = self.game_folder.clone();
+            let inc = inc.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                merge_one_group(&game_folder, &inc, &group, idx).await
+            }));
+        }
+
+        let mut outcomes: Vec<(String, GroupOutcome)> = Vec::with_capacity(handles.len());
+        let mut fallback_dests: Vec<FileRef> = Vec::new();
+        for h in handles {
+            let (name, outcome) = h
+                .await
+                .map_err(|e| Error::Patch(format!("merge task join: {e}")))??;
+            match &outcome {
+                GroupOutcome::Fallback(files) => fallback_dests.extend(files.iter().cloned()),
+                GroupOutcome::Merged | GroupOutcome::Skipped => {}
+            }
+            outcomes.push((name, outcome));
+        }
+
+        // ---- fallback downloads (full files, chunked when possible) ----
+        let mut seen: HashSet<String> = HashSet::new();
+        for dst in fallback_dests {
+            if !seen.insert(dst.dest.clone()) {
+                continue;
+            }
+            let res = res_by_dest.get(&dst.dest);
+            let (url, chunks, md5) = match res {
+                Some(r) if r.from_folder.is_some() => (
+                    ApiClient::resource_url(cdn, r.from_folder.as_deref().unwrap(), &dst.dest),
+                    r.chunk_infos.clone(),
+                    r.md5.clone(),
+                ),
+                _ => {
+                    // fall back to the patch's zip base
+                    (ApiClient::resource_url(cdn, &patch_cfg.base_url, &dst.dest), vec![], String::new())
+                }
+            };
+            let staged = state::staged_patch_path(&self.game_folder, &dst.dest);
+            std::fs::create_dir_all(staged.parent().unwrap())?;
+            let tmp = staged.with_extension("tmp");
+            if chunks.is_empty() {
+                download_single(&self.http, &url, &tmp, Some(dst.size), Some(&dst.md5)).await?;
+            } else {
+                download_chunked(&self.http, &url, &tmp, &chunks, Some(&md5), CHUNK_CONCURRENCY)
+                    .await?;
+            }
+            std::fs::rename(&tmp, &staged)?;
+        }
+
+        // ---- migration phase: verify everything is staged, then swap ----
+        let mut staged_outputs: Vec<(String, PathBuf)> = Vec::new();
+        for group in &patch_index.group_infos {
+            for dst in &group.dst_files {
+                if complete_dests.contains(&dst.dest) {
+                    continue; // handled in the complete-files pass
+                }
+                let staged = state::staged_patch_path(&self.game_folder, &dst.dest);
+                if !staged.exists() {
+                    return Err(Error::Patch(format!(
+                        "staged output missing for {} — rerun predownload/apply",
+                        dst.dest
+                    )));
+                }
+                staged_outputs.push((dst.dest.clone(), staged));
+            }
+        }
+
+        let mut report = ApplyReport {
+            merged: outcomes
+                .iter()
+                .filter(|(_, o)| matches!(o, GroupOutcome::Merged))
+                .count(),
+            skipped: outcomes
+                .iter()
+                .filter(|(_, o)| matches!(o, GroupOutcome::Skipped))
+                .count(),
+            ..Default::default()
+        };
+
+        for (dest, staged) in &staged_outputs {
+            let game_path = self.game_folder.join(dest.trim_start_matches('/'));
+            recover_backup(&game_path)?;
+            safe_replace(staged, &game_path)?;
+            report.swapped += 1;
+        }
+
+        // complete-file fallbacks (the big ones, e.g. the main exe)
+        for item in &patch_index.resource {
+            if is_krpdiff(&item.dest) {
+                continue;
+            }
+            let staged = state::staged_resource_path(&self.game_folder, &item.dest);
+            if !staged.exists() {
+                continue; // not downloaded (already current or not needed)
+            }
+            let game_path = self.game_folder.join(item.dest.trim_start_matches('/'));
+            std::fs::create_dir_all(game_path.parent().unwrap())?;
+            recover_backup(&game_path)?;
+            safe_replace(&staged, &game_path)?;
+            report.swapped += 1;
+        }
+
+        // ---- delete phase ----
+        for f in &patch_index.delete_files {
+            let game_path = self.game_folder.join(f.trim_start_matches('/'));
+            if game_path.exists() {
+                std::fs::remove_file(&game_path)?;
+                report.deleted.push(f.clone());
+            }
+        }
+
+        // ---- finish: bump version, clean staging ----
+        let cfg = LocalConfig {
+            version: to_version.to_string(),
+            app_id: self.server_entry().app_id.to_string(),
+            group: "default".to_string(),
+        };
+        state::write_local_config(&self.game_folder, &cfg)?;
+        std::fs::remove_dir_all(&inc)?;
+
+        Ok(report)
     }
 
     /// Full-tree MD5 verify/repair against the remote index.
     pub async fn sync(&self) -> Result<()> {
         Err(Error::Unimplemented("sync — next milestone"))
     }
+}
+
+/// Per-group result of the merge phase.
+enum GroupOutcome {
+    Merged,
+    Skipped,
+    /// The merge could not be used; these files were (or will be) downloaded
+    /// in full instead.
+    Fallback(Vec<FileRef>),
+}
+
+/// Merge one krpdiff group into staged outputs (or decide a fallback is
+/// needed). Reads only; the game folder is not modified.
+async fn merge_one_group(
+    game_folder: &Path,
+    inc: &Path,
+    group: &GroupInfo,
+    idx: usize,
+) -> Result<(String, GroupOutcome)> {
+    let name = group.dest.clone();
+
+    // already at target?
+    if group_already_target(game_folder, group) {
+        return Ok((name, GroupOutcome::Skipped));
+    }
+
+    // source sanity check (with .bak recovery)
+    let Some(first_src) = group.src_files.first() else {
+        return Ok((name, GroupOutcome::Fallback(group.dst_files.clone())));
+    };
+    let src_path = game_folder.join(first_src.dest.trim_start_matches('/'));
+    if !src_path.exists() {
+        recover_backup(&src_path)?;
+    }
+    let local_md5 = match kuro_patch::md5_file(&src_path) {
+        Ok(m) => m,
+        Err(_) => return Ok((name, GroupOutcome::Fallback(group.dst_files.clone()))),
+    };
+    let dst_md5s: HashSet<&str> = group.dst_files.iter().map(|d| d.md5.as_str()).collect();
+    if local_md5 != first_src.md5 && !dst_md5s.contains(local_md5.as_str()) {
+        return Ok((name, GroupOutcome::Fallback(group.dst_files.clone())));
+    }
+
+    // merge
+    let krpdiff_path = inc.join(&group.dest);
+    let out_dir = inc.join(".apply_tmp").join(format!("group_{idx}"));
+    if out_dir.exists() {
+        std::fs::remove_dir_all(&out_dir)?;
+    }
+    let merge_res = tokio::task::spawn_blocking({
+        let game_folder = game_folder.to_path_buf();
+        let krpdiff_path = krpdiff_path.clone();
+        let out_dir = out_dir.clone();
+        move || kuro_patch::apply_krdiff(&game_folder, &krpdiff_path, &out_dir)
+    })
+    .await
+    .map_err(|e| Error::Patch(format!("merge task join: {e}")))?;
+
+    if let Err(_e) = merge_res {
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return Ok((name, GroupOutcome::Fallback(group.dst_files.clone())));
+    }
+
+    // verify + stage outputs
+    let mut missing: Vec<FileRef> = Vec::new();
+    for dst in &group.dst_files {
+        let out_file = out_dir.join(dst.dest.trim_start_matches('/'));
+        let good = match kuro_patch::md5_file(&out_file) {
+            Ok(m) => m == dst.md5,
+            Err(_) => false,
+        };
+        if !good {
+            missing.push(dst.clone());
+            continue;
+        }
+        // NOTE: `inc` is already the incremental dir — join the relative dest
+        // directly (staged_patch_path would append `.incremental_download` again).
+        let staged = inc.join(dst.dest.trim_start_matches('/'));
+        std::fs::create_dir_all(staged.parent().unwrap())?;
+        std::fs::rename(&out_file, &staged)?;
+    }
+    let _ = std::fs::remove_dir_all(&out_dir);
+
+    if missing.is_empty() {
+        Ok((name, GroupOutcome::Merged))
+    } else {
+        Ok((name, GroupOutcome::Fallback(missing)))
+    }
+}
+
+/// Result summary of an apply run.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyReport {
+    pub merged: usize,
+    pub skipped: usize,
+    pub fallback: usize,
+    pub swapped: usize,
+    pub deleted: Vec<String>,
 }
 
 fn is_krpdiff(dest: &str) -> bool {
