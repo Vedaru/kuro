@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kuro-api",
+    "crates/kuro-patch",
+    "crates/kuro-core",
+    "crates/kuro-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/vedaru/kuro"
+[workspace.dependencies]
+kuro-api = { path = "crates/kuro-api" }
+kuro-patch = { path = "crates/kuro-patch" }
+kuro-core = { path = "crates/kuro-core" }

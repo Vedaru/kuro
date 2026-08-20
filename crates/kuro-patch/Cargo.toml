@@ -1,0 +1,14 @@
+[package]
+name = "kuro-patch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "KrDiff / HDiff patch application for Kuro Games client updates (native, no wine)"
+
+[dependencies]
+hdiffpatch-rs = { git = "https://github.com/TwintailTeam/hdiffpatch-rs", branch = "master", version = "2.0.0" }
+kuro-api.workspace = true
+md5 = "0.8.1"
+rayon = "1.12.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["fs"] }

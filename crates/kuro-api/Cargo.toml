@@ -1,0 +1,14 @@
+[package]
+name = "kuro-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kuro Games launcher API client: index.json, patch manifests, CDN selection"
+
+[dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "gzip", "zstd", "brotli"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "sync"] }
+url = "2.5.8"
