@@ -15,8 +15,9 @@ pub mod state;
 pub mod steam;
 
 pub use game::{
-    find_game_exe, ApplyReport, CheckoutReport, GameManager, GameStatus, InstallReport,
-    LauncherReport, PendingGroup, ProgressEvent, SyncReport,
+    ApplyReport, CheckoutReport, GameManager, GameStatus, InstallReport, PendingGroup,
+    ProgressEvent, SyncReport,
 };
 pub use kuro_api::{Error, Game, Result, Server};
 pub use steam::{default_game_dir, detect_steam, SteamInfo};
+pub use game::find_game_exe;

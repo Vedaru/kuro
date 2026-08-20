@@ -167,15 +167,3 @@ pub struct LocalConfig {
     #[serde(default)]
     pub group: String,
 }
-
-/// Response of the official launcher-installer gateway
-/// (`.../pc_app.json`): direct download URLs + version.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LauncherGateway {
-    #[serde(default)]
-    pub primary: Option<String>,
-    #[serde(default)]
-    pub secondary: Option<String>,
-    #[serde(default)]
-    pub version: Option<String>,
-}
