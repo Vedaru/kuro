@@ -546,6 +546,15 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
+        // progress relay (sync emits per-file progress)
+        let (ptx, mut prx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = prx.recv().await {
+                let _ = tx2.send(UiEvent::Progress(ev)).await;
+            }
+        });
+        let mut ptx = Some(ptx);
         let result = async {
             let mgr = GameManager::open(PathBuf::from(path)).await.map_err(|e| e.to_string())?;
             match kind {
@@ -561,7 +570,10 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                     ))
                 }
                 TaskKind::Sync => {
-                    let report = mgr.sync().await.map_err(|e| e.to_string())?;
+                    let report = mgr
+                        .sync_with_progress(ptx.take())
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok(format!(
                         "sync: checked={} ok={} repaired={} ({:.1} GiB) failed={}",
                         report.checked,
