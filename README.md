@@ -1,9 +1,10 @@
 # kuro
 
-A native Linux launcher and updater for **Kuro Games** titles — Wuthering Waves
-(鸣潮) and Punishing: Gray Raven (战双帕弥什). **No wine, no launcher.exe, no
-hpatchz — one static Rust binary** that talks to the official CDN directly and
-applies Kuro's `KrDiff` patches natively.
+A native Linux **installer and updater** for **Kuro Games** titles — Wuthering
+Waves (鸣潮) and Punishing: Gray Raven (战双帕弥什). **No wine, no launcher.exe,
+no hpatchz — one static Rust binary** that talks to the official CDN directly
+and applies Kuro's `KrDiff` patches natively. It downloads and updates game
+files; the game itself is launched via Steam + GE-Proton (see below).
 
 Inspired by [ww-manager](https://github.com/timetetng/wutheringwaves-cli-manager);
 the wine dependency is removed by applying patches via

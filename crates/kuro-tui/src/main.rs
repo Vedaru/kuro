@@ -722,7 +722,7 @@ fn ui(f: &mut Frame, state: &UiState) {
 
     let title = Line::from(vec![
         Span::styled("kuro", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" — Kuro Games launcher (native, no wine)"),
+        Span::raw(" — Kuro Games installer & updater (native, no wine)"),
     ]);
     f.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), chunks[0]);
 
@@ -865,7 +865,7 @@ fn ui(f: &mut Frame, state: &UiState) {
     // overlays: help / install modal
     if state.show_help {
         let help_lines: Vec<Line> = vec![
-            Line::raw("kuro — Kuro Games launcher (native, no wine)"),
+            Line::raw("kuro — Kuro Games installer & updater (native, no wine)"),
             Line::raw(""),
             Line::raw("  keys:"),
             Line::raw("    r        refresh status            d   predownload update"),
