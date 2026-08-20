@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{init, restore, Frame, Terminal};
 
-use kuro_core::{Game, GameManager, GameStatus, ProgressEvent, Server};
+use kuro_core::{default_game_dir, detect_steam, Game, GameManager, GameStatus, ProgressEvent, Server, SteamInfo};
 
 /// Default game folder (the user's known install).
 const DEFAULT_GAME_DIR: &str = "/home/vedaru/.local/share/Steam/steamapps/common/Wuthering Waves";
@@ -48,20 +48,28 @@ struct UiState {
     install: Option<InstallDraft>,
     /// Help overlay open.
     show_help: bool,
+    /// Detected Steam + Proton (for install targets).
+    steam: Option<SteamInfo>,
 }
 
 /// In-progress install selection.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct InstallDraft {
     game: Game,
     server: Server,
+    /// Install target folder (editable).
+    target: String,
+    /// True while typing the target path.
+    edit_target: bool,
 }
 
-impl Default for InstallDraft {
-    fn default() -> Self {
+impl InstallDraft {
+    fn new(target: String) -> Self {
         Self {
             game: Game::WuWa,
             server: Server::Cn,
+            target,
+            edit_target: false,
         }
     }
 }
@@ -216,6 +224,7 @@ async fn run(
 ) -> std::io::Result<()> {
     let mut state = UiState {
         paths,
+        steam: detect_steam(),
         ..Default::default()
     };
 
@@ -240,33 +249,56 @@ async fn run(
                     }
                     continue;
                 }
+                let mut start_install: Option<(Game, Server, String)> = None;
                 if let Some(draft) = state.install.as_mut() {
+                    if draft.edit_target {
+                        // typing the target path
+                        match key.code {
+                            KeyCode::Char(c) => draft.target.push(c),
+                            KeyCode::Backspace => {
+                                draft.target.pop();
+                            }
+                            KeyCode::Enter | KeyCode::Esc => draft.edit_target = false,
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('w') => draft.game = Game::WuWa,
                         KeyCode::Char('p') => draft.game = Game::Pgr,
                         KeyCode::Char('c') => draft.server = Server::Cn,
                         KeyCode::Char('b') => draft.server = Server::Bilibili,
                         KeyCode::Char('g') => draft.server = Server::Global,
-                        KeyCode::Enter => {
-                            let (game, server) = (draft.game, draft.server);
-                            state.install = None;
-                            if !state.busy {
-                                state.busy = true;
-                                state.task = Some(TaskUi {
-                                    kind: "install".into(),
-                                    ..Default::default()
-                                });
-                                push_log(
-                                    &mut state,
-                                    format!("installing {game}/{server} into {path}"),
-                                );
-                                spawn_install(&tx, &path, game, server);
+                        KeyCode::Char('s') => {
+                            if let Some(steam) = &state.steam {
+                                draft.target =
+                                    default_game_dir(steam, draft.game).to_string_lossy().into_owned();
                             }
+                        }
+                        KeyCode::Char('t') => draft.edit_target = true,
+                        KeyCode::Enter => {
+                            start_install =
+                                Some((draft.game, draft.server, draft.target.clone()));
                         }
                         KeyCode::Esc => state.install = None,
                         _ => {}
                     }
                     continue;
+                }
+                if let Some((game, server, target)) = start_install {
+                    state.install = None;
+                    if !state.busy {
+                        state.busy = true;
+                        state.task = Some(TaskUi {
+                            kind: "install".into(),
+                            ..Default::default()
+                        });
+                        push_log(
+                            &mut state,
+                            format!("installing {game}/{server} into {target}"),
+                        );
+                        spawn_install(&tx, &target, game, server);
+                    }
                 }
 
                 match key.code {
@@ -274,7 +306,8 @@ async fn run(
                     KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
                     KeyCode::Char('i') => {
                         if !state.busy {
-                            state.install = Some(InstallDraft::default());
+                            state.install =
+                                Some(InstallDraft::new(state.paths[state.active].clone()));
                         }
                     }
                     KeyCode::Tab => {
@@ -609,6 +642,8 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw("    r        refresh status            d   predownload update"),
             Line::raw("    a        apply update              s   sync / repair files"),
             Line::raw("    c        checkout server (CN<->B)  i   install a new game"),
+            Line::raw("    s        (in install) Steam default target"),
+            Line::raw("    t        (in install) edit target path"),
             Line::raw("    Tab      switch game (multi-folder)"),
             Line::raw("    PgUp/PgDn scroll log               h/?  this help"),
             Line::raw("    q        quit"),
@@ -626,12 +661,16 @@ fn ui(f: &mut Frame, state: &UiState) {
             Paragraph::new(help_lines).block(Block::default().borders(Borders::ALL).title("help")),
             area,
         );
-    } else if let Some(draft) = state.install {
-        let path = state.paths[state.active].clone();
-        let modal_lines: Vec<Line> = vec![
+    } else if let Some(draft) = state.install.as_ref() {
+        let mut modal_lines: Vec<Line> = vec![
             Line::raw("Install a new game"),
             Line::raw(""),
-            Line::raw(format!("  target:  {path}")),
+            Line::raw(if draft.edit_target {
+                "  target:  [EDITING — type, Backspace, Enter/Esc when done]"
+            } else {
+                "  target:"
+            }),
+            Line::raw(format!("           {}", draft.target)),
             Line::raw(format!(
                 "  game:    [w]uwa / [p]gr            -> {}",
                 if matches!(draft.game, Game::WuWa) {
@@ -645,18 +684,34 @@ fn ui(f: &mut Frame, state: &UiState) {
                 draft.server
             )),
             Line::raw(""),
-            Line::styled(
-                "  Enter: start install    Esc: cancel",
-                Style::default().fg(Color::Cyan),
-            ),
-            Line::raw(""),
-            Line::raw("  downloads the full client from the official CDN"),
-            Line::raw("  (wuwa ~85 GB, pgr ~7 GB; resumable, verified by md5)"),
         ];
-        let area = centered_rect(70, 45, f.area());
+        match &state.steam {
+            Some(steam) => {
+                let proton = steam
+                    .proton()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "none".to_string());
+                modal_lines.push(Line::raw(format!("  [s]: Steam default ({})", steam.steam_root.display())));
+                modal_lines.push(Line::raw(format!("  Steam: {}  Proton: {proton}", steam.steam_root.display())));
+            }
+            None => {
+                modal_lines.push(Line::raw("  Steam: not detected — type the target with [t]"));
+            }
+        }
+        modal_lines.push(Line::raw("  [t]: edit target    Esc: cancel"));
+        modal_lines.push(Line::styled(
+            "  Enter: start install",
+            Style::default().fg(Color::Cyan),
+        ));
+        modal_lines.push(Line::raw(""));
+        modal_lines.push(Line::raw("  downloads the full client from the official CDN"));
+        modal_lines.push(Line::raw("  (wuwa ~85 GB, pgr ~7 GB; resumable, verified by md5)"));
+        let area = centered_rect(75, 55, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(modal_lines)
+                .wrap(Wrap { trim: true })
                 .block(Block::default().borders(Borders::ALL).title("install")),
             area,
         );

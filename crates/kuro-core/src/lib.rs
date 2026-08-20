@@ -12,9 +12,11 @@ pub mod atomic;
 pub mod download;
 pub mod game;
 pub mod state;
+pub mod steam;
 
 pub use game::{
     ApplyReport, CheckoutReport, GameManager, GameStatus, InstallReport, PendingGroup,
     ProgressEvent, SyncReport,
 };
 pub use kuro_api::{Error, Game, Result, Server};
+pub use steam::{default_game_dir, detect_steam, SteamInfo};
