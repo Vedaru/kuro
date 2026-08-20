@@ -211,6 +211,17 @@ impl GameManager {
         )));
         let index = self.api.fetch_index(self.server_entry().api_url).await?;
         let cdn = self.api.pick_cdn(&index)?.url.clone();
+
+        let dir = incremental_dir(&self.game_folder);
+        std::fs::create_dir_all(&dir)?;
+
+        // nothing to download (already up to date)
+        if plan.patch_groups.is_empty() && plan.full_files.is_empty() {
+            let _ = tx.send(ProgressEvent::Log("already up to date".into())).await;
+            let _ = tx.send(ProgressEvent::Done).await;
+            return Ok(());
+        }
+
         let patch_cfg = index
             .default
             .config
@@ -218,9 +229,6 @@ impl GameManager {
             .iter()
             .find(|p| p.version == plan.from_version)
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
-
-        let dir = incremental_dir(&self.game_folder);
-        std::fs::create_dir_all(&dir)?;
         let patch_index = self.api.fetch_patch_index(&cdn, patch_cfg).await?;
         let res_by_dest: std::collections::HashMap<&str, &ResourceItem> = patch_index
             .resource
