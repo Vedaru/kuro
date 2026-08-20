@@ -12,6 +12,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/vedaru/kuro"
+
+# Smaller release binaries (strip symbols; behavior unchanged).
+[profile.release]
+strip = true
 [workspace.dependencies]
 kuro-api = { path = "crates/kuro-api" }
 kuro-patch = { path = "crates/kuro-patch" }
