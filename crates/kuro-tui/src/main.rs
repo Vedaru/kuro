@@ -10,7 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{init, restore, Frame, Terminal};
 
 use kuro_core::{Game, GameManager, GameStatus, ProgressEvent, Server};
@@ -42,6 +42,8 @@ struct UiState {
     /// Game folders in the manager; Tab cycles between them.
     paths: Vec<String>,
     active: usize,
+    /// Log panel scroll offset (lines from the newest).
+    log_scroll: usize,
 }
 
 fn push_log(state: &mut UiState, msg: impl Into<String>) {
@@ -247,6 +249,8 @@ async fn run(
                             spawn_simple(&tx, &path, TaskKind::Checkout);
                         }
                     }
+                    KeyCode::PageUp => state.log_scroll += 10,
+                    KeyCode::PageDown => state.log_scroll = state.log_scroll.saturating_sub(10),
                     _ => {}
                 }
             }
@@ -422,7 +426,9 @@ fn ui(f: &mut Frame, state: &UiState) {
         None => vec![Line::raw("loading...")],
     };
     f.render_widget(
-        Paragraph::new(status_lines).block(Block::default().borders(Borders::ALL).title("status")),
+        Paragraph::new(status_lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("status")),
         cols[0],
     );
 
@@ -451,14 +457,21 @@ fn ui(f: &mut Frame, state: &UiState) {
         }
     };
     f.render_widget(
-        Paragraph::new(task_lines).block(Block::default().borders(Borders::ALL).title("task")),
+        Paragraph::new(task_lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("task")),
         cols[1],
     );
 
-    // log panel
-    let log_lines: Vec<Line> = state.logs.iter().rev().take(60).map(|l| Line::raw(l)).collect();
+    // log panel: wrap long lines + scroll window (PgUp/PgDn)
+    let all_logs: Vec<Line> = state.logs.iter().rev().take(200).map(|l| Line::raw(l)).collect();
+    let max_scroll = all_logs.len().saturating_sub(1);
+    let scroll = state.log_scroll.min(max_scroll);
+    let log_lines: Vec<Line> = all_logs.iter().skip(scroll).take(60).cloned().collect();
     f.render_widget(
-        Paragraph::new(log_lines).block(Block::default().borders(Borders::ALL).title("log")),
+        Paragraph::new(log_lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("log (PgUp/PgDn)")),
         cols[2],
     );
 
