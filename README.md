@@ -33,33 +33,26 @@ Not yet: PGR server endpoints (discovery procedure below), global checkout
 (package differences), per-group progress gauges (names shown for now),
 persistent MD5 cache for sync speedups.
 
-## Adding PGR (Punishing: Gray Raven) — endpoint discovery
+## PGR (Punishing: Gray Raven) — supported ✅
 
-Status (2026-08): **partially done.** Verified from the official CN installer
-(`PGR_install_2.6.3.0.exe` → `KRPluginConfig.json` + embedded FE bundle):
+**Global (G143) is fully wired and verified against the live CDN** (2026-08):
 
-- GameId **G148**, appId **10012**, pkgId A1472 (see `kuro-api::config::pgr_cn_meta`)
-- Same gamestarter CDN platform as WuWa
-- Official installer gateway: `download.kurogames.com/pns/official/cn/zh-Hans/pc_app.json`
+- GameId `G143`, appId `50015`, token recovered from the launcher's WebView2
+  local storage on a real Windows install
+- Game manifest: `launcher/game/G143/50015_<token>/index.json` — structurally
+  identical to WuWa (patchConfig / krpdiff / weighted cdnList), current
+  version 4.7.0
+- Launcher self-update manifest: `launcher/launcher/50015_<token>/G143/index.json`
+- Everything in `kuro-api::config::pgr_meta`; the pipeline (status /
+  predownload / apply / sync) is game-agnostic and works as-is
+- The token is NOT embedded in launcher files — the launcher fetches it at
+  runtime via `pc-launcher-sdk-haru-api.kurogames.com` (Spring Boot SDK) and
+  the FE caches the resulting URL in WebView2 local storage
+  (`%APPDATA%\KRInstall_haru\G143\C50015\KRWebViewUserData\...\Local Storage\leveldb`)
 
-**Blocked on one piece:** unlike WuWa (static token `10003_Y8xXrXk…`), PGR's
-launcher fetches its config URL at runtime from
-`pc-launcher-sdk-haru-api.kurogames.com` (Spring Boot; endpoint path not
-embedded in the launcher — verified by exhaustive string scans of every
-launcher file). Completion options:
-
-1. Run the official launcher once under wine with a MITM proxy (install
-   mitmproxy, import its CA into the wine prefix), capture the SDK response
-   → the `launcherConfigUrl` containing the token
-2. Run the launcher on a Windows machine with Fiddler/Charles once, paste the
-   `launcherConfigUrl`
-3. Reverse the SDK API endpoint (clientId/Secret are known; path guessing so
-   far unsuccessful)
-
-**Community check:** no public PGR updater/launcher-replacement project exists
-(GitHub repos+issues, GameBox, KuroLauncher, ww-manager issues, moyingji,
-52pojie, bilibili all checked) — the official launcher is the only update
-mechanism the community has, unlike WuWa's ww-manager.
+**CN (G148 / appId 10012)** still needs its token (same SDK runtime flow).
+Installer gateway (CN + global) and package metadata are documented in
+`pgr_meta`.
 
 ## Crate layout
 

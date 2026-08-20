@@ -92,9 +92,17 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
         ],
         Game::Pgr => &[
             (
+                "global",
+                ServerEntry {
+                    api_url: "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/G143/50015_LWdk9D2Ep9mpJmqBZZkcPBU2YNraEWBQ/index.json",
+                    app_id: "50015",
+                    diff_files: &[],
+                },
+            ),
+            (
                 "cn",
                 ServerEntry {
-                    api_url: "https://TODO/pgr-cn-index.json", // token TBD — see PGR_DISCOVERY.md notes in README
+                    api_url: "https://TODO/pgr-cn-index.json", // CN token TBD (launcher SDK runtime flow)
                     app_id: "10012",
                     diff_files: &[],
                 },
@@ -103,34 +111,37 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
     }
 }
 
-/// Verified PGR (战双帕弥什) CN launcher-platform facts, from the official
-/// installer (2.6.3.0, 2026-08): `KRPluginConfig.json` + the embedded FE
-/// bundle. The index.json *token* is NOT static — the launcher obtains its
-/// config URL at runtime from the SDK API below.
-pub mod pgr_cn_meta {
-    /// Game platform id (launcher API path segment).
-    pub const GAME_ID: &str = "G148";
-    /// App id (second path segment of index.json).
-    pub const APP_ID: &str = "10012";
-    /// Package id from the FE bundle's per-game config.
-    pub const PKG_ID: &str = "A1472";
-    pub const CLIENT_ID: &str = "u43q212j621xjng8aeybtc7f";
-    pub const CLIENT_SECRET: &str = "j84ufc2hs4rlfeyn416pjm0s";
-    pub const CHANNEL_ID: u32 = 201;
-    /// Gamestarter CDN bases (primary + backups), same platform as WuWa.
-    pub const CDN_BASES: [&str; 3] = [
-        "https://prod-cn-alicdn-gamestarter.kurogame.com",
-        "https://prod-volcdn-gamestarter.kurogame.xyz",
-        "https://prod-tencentcdn-gamestarter.kurogame.com",
+/// Verified PGR (战双帕弥什) launcher-platform facts.
+///
+/// **Global (G143) is fully wired** — the game manifest at
+/// `launcher/game/G143/50015_<token>/index.json` is live and structurally
+/// identical to WuWa (patchConfig / krpdiff / weighted cdnList). The token was
+/// recovered from the launcher's WebView2 local storage on the user's Windows
+/// SSD (2026-08). Current game version: 4.7.0.
+///
+/// CN (G148) still needs its token (runtime SDK flow; see README).
+pub mod pgr_meta {
+    /// Global game platform id.
+    pub const GAME_ID_GLOBAL: &str = "G143";
+    /// Global app id.
+    pub const APP_ID_GLOBAL: &str = "50015";
+    /// Global launcher token (recovered from real Windows install).
+    pub const TOKEN_GLOBAL: &str = "LWdk9D2Ep9mpJmqBZZkcPBU2YNraEWBQ";
+    /// CN game platform id.
+    pub const GAME_ID_CN: &str = "G148";
+    /// CN app id.
+    pub const APP_ID_CN: &str = "10012";
+    /// Global CDN bases (primary + backups).
+    pub const CDN_BASES_GLOBAL: [&str; 3] = [
+        "https://prod-alicdn-gamestarter.kurogame.com",
+        "https://prod-volcdn-gamestarter.kurogame.net",
+        "https://prod-tencentcdn-gamestarter.kurogame.net",
     ];
-    /// Runtime config-URL source (Spring Boot; endpoint path unknown yet).
-    pub const SDK_API: &str = "https://pc-launcher-sdk-haru-api.kurogames.com";
-    /// Official CN PC installer gateway: returns {primary, secondary, version}.
-    pub const INSTALLER_JSON: &str =
-        "https://download.kurogames.com/pns/official/cn/zh-Hans/pc_app.json";
-    /// The launcher info URL shape (token delivered by the SDK API at runtime).
-    pub fn index_url(cdn_base: &str, token: &str) -> String {
-        format!("{cdn_base}/launcher/game/{GAME_ID}/{APP_ID}_{token}/index.json")
+    /// Global launcher meta URL (launcher self-update manifest).
+    pub fn launcher_meta_url(cdn_base: &str) -> String {
+        format!(
+            "{cdn_base}/launcher/launcher/{APP_ID_GLOBAL}_{TOKEN_GLOBAL}/{GAME_ID_GLOBAL}/index.json"
+        )
     }
 }
 
