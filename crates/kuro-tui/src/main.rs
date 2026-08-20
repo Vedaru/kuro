@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{init, restore, Frame, Terminal};
 
 use kuro_core::{Game, GameManager, GameStatus, ProgressEvent, Server};
@@ -44,6 +44,26 @@ struct UiState {
     active: usize,
     /// Log panel scroll offset (lines from the newest).
     log_scroll: usize,
+    /// Open install modal (game + server selection).
+    install: Option<InstallDraft>,
+    /// Help overlay open.
+    show_help: bool,
+}
+
+/// In-progress install selection.
+#[derive(Clone, Copy)]
+struct InstallDraft {
+    game: Game,
+    server: Server,
+}
+
+impl Default for InstallDraft {
+    fn default() -> Self {
+        Self {
+            game: Game::WuWa,
+            server: Server::Cn,
+        }
+    }
 }
 
 fn push_log(state: &mut UiState, msg: impl Into<String>) {
@@ -208,8 +228,55 @@ async fn run(
                     continue;
                 }
                 let path = state.paths[state.active].clone();
+
+                // modal shortcuts take priority
+                if state.show_help {
+                    match key.code {
+                        KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Esc => {
+                            state.show_help = false
+                        }
+                        KeyCode::Char('q') => break,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if let Some(draft) = state.install.as_mut() {
+                    match key.code {
+                        KeyCode::Char('w') => draft.game = Game::WuWa,
+                        KeyCode::Char('p') => draft.game = Game::Pgr,
+                        KeyCode::Char('c') => draft.server = Server::Cn,
+                        KeyCode::Char('b') => draft.server = Server::Bilibili,
+                        KeyCode::Char('g') => draft.server = Server::Global,
+                        KeyCode::Enter => {
+                            let (game, server) = (draft.game, draft.server);
+                            state.install = None;
+                            if !state.busy {
+                                state.busy = true;
+                                state.task = Some(TaskUi {
+                                    kind: "install".into(),
+                                    ..Default::default()
+                                });
+                                push_log(
+                                    &mut state,
+                                    format!("installing {game}/{server} into {path}"),
+                                );
+                                spawn_install(&tx, &path, game, server);
+                            }
+                        }
+                        KeyCode::Esc => state.install = None,
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
+                    KeyCode::Char('i') => {
+                        if !state.busy {
+                            state.install = Some(InstallDraft::default());
+                        }
+                    }
                     KeyCode::Tab => {
                         if state.paths.len() > 1 && !state.busy {
                             state.active = (state.active + 1) % state.paths.len();
@@ -362,6 +429,26 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
     });
 }
 
+fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game, server: Server) {
+    let tx = tx.clone();
+    let path = path.to_string();
+    tokio::spawn(async move {
+        let result = match GameManager::install(game, server, PathBuf::from(path)).await {
+            Ok(r) => Ok(format!(
+                "installed {} v{} (checked={} ok={} repaired={} failed={})",
+                game,
+                r.version,
+                r.sync.checked,
+                r.sync.ok,
+                r.sync.repaired,
+                r.sync.failed.len()
+            )),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(UiEvent::TaskDone(result)).await;
+    });
+}
+
 enum TaskKind {
     Apply,
     Sync,
@@ -499,7 +586,7 @@ fn ui(f: &mut Frame, state: &UiState) {
     );
 
     let footer = format!(
-        "{} | r: refresh  d: predownload  a: apply  s: sync  c: checkout  q: quit{}",
+        "{} | r: refresh  d: predownload  a: apply  s: sync  c: checkout  i: install  h: help  q: quit{}",
         if state.paths.len() > 1 {
             format!(
                 "Tab: switch game ({}/{})",
@@ -512,4 +599,86 @@ fn ui(f: &mut Frame, state: &UiState) {
         if state.busy { "   [busy]" } else { "" }
     );
     f.render_widget(Paragraph::new(Line::raw(footer)), chunks[2]);
+
+    // overlays: help / install modal
+    if state.show_help {
+        let help_lines: Vec<Line> = vec![
+            Line::raw("kuro — Kuro Games launcher (native, no wine)"),
+            Line::raw(""),
+            Line::raw("  keys:"),
+            Line::raw("    r        refresh status            d   predownload update"),
+            Line::raw("    a        apply update              s   sync / repair files"),
+            Line::raw("    c        checkout server (CN<->B)  i   install a new game"),
+            Line::raw("    Tab      switch game (multi-folder)"),
+            Line::raw("    PgUp/PgDn scroll log               h/?  this help"),
+            Line::raw("    q        quit"),
+            Line::raw(""),
+            Line::raw("  install a new game (also available via 'i'):"),
+            Line::raw("    kuro install wuwa cn ~/Games/WutheringWaves"),
+            Line::raw("    kuro install pgr global ~/PGR"),
+            Line::raw("  then run: kuro <folder1> <folder2> ...   (Tab switches)"),
+            Line::raw(""),
+            Line::raw("  press h / ? / Esc to close"),
+        ];
+        let area = centered_rect(70, 60, f.area());
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(help_lines).block(Block::default().borders(Borders::ALL).title("help")),
+            area,
+        );
+    } else if let Some(draft) = state.install {
+        let path = state.paths[state.active].clone();
+        let modal_lines: Vec<Line> = vec![
+            Line::raw("Install a new game"),
+            Line::raw(""),
+            Line::raw(format!("  target:  {path}")),
+            Line::raw(format!(
+                "  game:    [w]uwa / [p]gr            -> {}",
+                if matches!(draft.game, Game::WuWa) {
+                    "wuwa"
+                } else {
+                    "pgr"
+                }
+            )),
+            Line::raw(format!(
+                "  server:  [c]n / [b]ilibili / [g]lobal  -> {}",
+                draft.server
+            )),
+            Line::raw(""),
+            Line::styled(
+                "  Enter: start install    Esc: cancel",
+                Style::default().fg(Color::Cyan),
+            ),
+            Line::raw(""),
+            Line::raw("  downloads the full client from the official CDN"),
+            Line::raw("  (wuwa ~85 GB, pgr ~7 GB; resumable, verified by md5)"),
+        ];
+        let area = centered_rect(70, 45, f.area());
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(modal_lines)
+                .block(Block::default().borders(Borders::ALL).title("install")),
+            area,
+        );
+    }
+}
+
+/// A centered rectangle for overlays.
+fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let popup = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup[1])[1]
 }
