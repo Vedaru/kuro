@@ -738,7 +738,7 @@ fn ui(f: &mut Frame, state: &UiState) {
         ));
         modal_lines.push(Line::raw(""));
         modal_lines.push(Line::raw("  downloads the full client from the official CDN"));
-        modal_lines.push(Line::raw("  (wuwa ~85 GB, pgr ~7 GB; resumable, verified by md5)"));
+        modal_lines.push(Line::raw("  (wuwa ~85 GB, pgr ~64 GB fresh install; resumable, md5-verified)"));
         let area = centered_rect(75, 55, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
