@@ -283,7 +283,10 @@ async fn run(
                         KeyCode::Esc => state.install = None,
                         _ => {}
                     }
-                    continue;
+                    // stay in the modal unless Enter was pressed
+                    if start_install.is_none() {
+                        continue;
+                    }
                 }
                 if let Some((game, server, target)) = start_install {
                     state.install = None;
