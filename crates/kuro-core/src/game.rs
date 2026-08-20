@@ -118,6 +118,17 @@ impl GameManager {
         let cdn = self.api.pick_cdn(&index)?.url.clone();
         let to_version = index.default.version.clone();
 
+        // already up to date — nothing to plan
+        if from_version == to_version {
+            return Ok(PredownloadPlan {
+                from_version,
+                to_version,
+                patch_groups: vec![],
+                full_files: vec![],
+                total_bytes: 0,
+            });
+        }
+
         let patch_cfg = index
             .default
             .config
@@ -547,6 +558,12 @@ impl GameManager {
             download_single(&self.http, &url, &tmp, None, Some(expected_md5)).await?;
             safe_replace(&tmp, &game_path)?;
             swapped += 1;
+        }
+
+        if swapped == 0 {
+            return Err(Error::Patch(
+                "checkout: no channel files could be swapped (missing from target manifest) — config left unchanged".into(),
+            ));
         }
 
         let cfg = LocalConfig {
