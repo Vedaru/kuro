@@ -39,6 +39,9 @@ struct UiState {
     logs: Vec<String>,
     task: Option<TaskUi>,
     busy: bool,
+    /// Game folders in the manager; Tab cycles between them.
+    paths: Vec<String>,
+    active: usize,
 }
 
 fn push_log(state: &mut UiState, msg: impl Into<String>) {
@@ -51,14 +54,17 @@ fn push_log(state: &mut UiState, msg: impl Into<String>) {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
+    let mut paths: Vec<String> = std::env::args().skip(1).collect();
+    if paths.is_empty() {
+        paths.push(DEFAULT_GAME_DIR.to_string());
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UiEvent>(64);
 
-    // initial status
+    // initial status for the first game
     {
         let tx = tx.clone();
-        let path = path.clone();
+        let path = paths[0].clone();
         tokio::spawn(async move {
             let result = match GameManager::open(PathBuf::from(path)).await {
                 Ok(m) => m.status().await.map_err(|e| e.to_string()),
@@ -69,7 +75,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let terminal = init();
-    let res = run(terminal, &mut rx, tx, path).await;
+    let res = run(terminal, &mut rx, tx, paths).await;
     restore();
     res
 }
@@ -78,9 +84,12 @@ async fn run(
     mut terminal: Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     rx: &mut tokio::sync::mpsc::Receiver<UiEvent>,
     tx: tokio::sync::mpsc::Sender<UiEvent>,
-    path: String,
+    paths: Vec<String>,
 ) -> std::io::Result<()> {
-    let mut state = UiState::default();
+    let mut state = UiState {
+        paths,
+        ..Default::default()
+    };
 
     loop {
         terminal.draw(|f| ui(f, &state))?;
@@ -90,8 +99,22 @@ async fn run(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                let path = state.paths[state.active].clone();
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Tab => {
+                        if state.paths.len() > 1 && !state.busy {
+                            state.active = (state.active + 1) % state.paths.len();
+                            state.status = None;
+                            let msg = format!(
+                                "switched to game {} ({})",
+                                state.active + 1,
+                                state.paths[state.active]
+                            );
+                            push_log(&mut state, msg);
+                            spawn_status(&tx, &state.paths[state.active]);
+                        }
+                    }
                     KeyCode::Char('r') => {
                         if !state.busy {
                             spawn_status(&tx, &path);
@@ -353,7 +376,16 @@ fn ui(f: &mut Frame, state: &UiState) {
     );
 
     let footer = format!(
-        "r: refresh  d: predownload  a: apply  s: sync  c: checkout  q: quit{}",
+        "{} | r: refresh  d: predownload  a: apply  s: sync  c: checkout  q: quit{}",
+        if state.paths.len() > 1 {
+            format!(
+                "Tab: switch game ({}/{})",
+                state.active + 1,
+                state.paths.len()
+            )
+        } else {
+            "single game".to_string()
+        },
         if state.busy { "   [busy]" } else { "" }
     );
     f.render_widget(Paragraph::new(Line::raw(footer)), chunks[2]);

@@ -70,9 +70,15 @@ Adding a new Kuro title (e.g. Punishing: Gray Raven) = one entry in
 ## Usage
 
 ```sh
-cargo run -p kuro-tui -- [game-folder]
+cargo run -p kuro-tui -- [game-folder]...
+# one or more game folders — Tab switches between games (WuWa + PGR in one manager)
 # default: ~/.local/share/Steam/steamapps/common/Wuthering Waves
 ```
+
+Live-verified (2026-08): the same binary manages both games — WuWa CN
+(3.6.0) and PGR global (auto-detected from `launcherDownloadConfig.json`;
+status + predownload planning verified against the live CDN:
+`cargo run -p kuro-core --example pgr_proof`).
 
 ## Key facts learned from the wire (2026-08)
 
