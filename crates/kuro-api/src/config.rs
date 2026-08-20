@@ -94,12 +94,43 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
             (
                 "cn",
                 ServerEntry {
-                    api_url: "https://TODO.example/pgr-cn-index.json", // TODO: discovery spike
-                    app_id: "TODO",
+                    api_url: "https://TODO/pgr-cn-index.json", // token TBD — see PGR_DISCOVERY.md notes in README
+                    app_id: "10012",
                     diff_files: &[],
                 },
             ),
         ],
+    }
+}
+
+/// Verified PGR (战双帕弥什) CN launcher-platform facts, from the official
+/// installer (2.6.3.0, 2026-08): `KRPluginConfig.json` + the embedded FE
+/// bundle. The index.json *token* is NOT static — the launcher obtains its
+/// config URL at runtime from the SDK API below.
+pub mod pgr_cn_meta {
+    /// Game platform id (launcher API path segment).
+    pub const GAME_ID: &str = "G148";
+    /// App id (second path segment of index.json).
+    pub const APP_ID: &str = "10012";
+    /// Package id from the FE bundle's per-game config.
+    pub const PKG_ID: &str = "A1472";
+    pub const CLIENT_ID: &str = "u43q212j621xjng8aeybtc7f";
+    pub const CLIENT_SECRET: &str = "j84ufc2hs4rlfeyn416pjm0s";
+    pub const CHANNEL_ID: u32 = 201;
+    /// Gamestarter CDN bases (primary + backups), same platform as WuWa.
+    pub const CDN_BASES: [&str; 3] = [
+        "https://prod-cn-alicdn-gamestarter.kurogame.com",
+        "https://prod-volcdn-gamestarter.kurogame.xyz",
+        "https://prod-tencentcdn-gamestarter.kurogame.com",
+    ];
+    /// Runtime config-URL source (Spring Boot; endpoint path unknown yet).
+    pub const SDK_API: &str = "https://pc-launcher-sdk-haru-api.kurogames.com";
+    /// Official CN PC installer gateway: returns {primary, secondary, version}.
+    pub const INSTALLER_JSON: &str =
+        "https://download.kurogames.com/pns/official/cn/zh-Hans/pc_app.json";
+    /// The launcher info URL shape (token delivered by the SDK API at runtime).
+    pub fn index_url(cdn_base: &str, token: &str) -> String {
+        format!("{cdn_base}/launcher/game/{GAME_ID}/{APP_ID}_{token}/index.json")
     }
 }
 

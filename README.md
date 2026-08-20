@@ -35,18 +35,31 @@ persistent MD5 cache for sync speedups.
 
 ## Adding PGR (Punishing: Gray Raven) — endpoint discovery
 
-Kuro's titles share one launcher platform, but PGR's `index.json` URL isn't
-publicly documented. One-time discovery procedure:
+Status (2026-08): **partially done.** Verified from the official CN installer
+(`PGR_install_2.6.3.0.exe` → `KRPluginConfig.json` + embedded FE bundle):
 
-1. Install the official PGR launcher in a wine prefix
-2. Run it under `mitmproxy` (or check its `launcherDownloadConfig.json` /
-   `launcher_main.dll` strings) to capture the
-   `prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/GXXX/<appId>_<token>/index.json`
-   URL it calls
-3. Add the URL + appId to `kuro-api/src/config.rs` (`Game::Pgr` entry)
+- GameId **G148**, appId **10012**, pkgId A1472 (see `kuro-api::config::pgr_cn_meta`)
+- Same gamestarter CDN platform as WuWa
+- Official installer gateway: `download.kurogames.com/pns/official/cn/zh-Hans/pc_app.json`
 
-Everything else (download / merge / apply / sync / checkout / TUI) is
-game-agnostic and just works once the entry exists.
+**Blocked on one piece:** unlike WuWa (static token `10003_Y8xXrXk…`), PGR's
+launcher fetches its config URL at runtime from
+`pc-launcher-sdk-haru-api.kurogames.com` (Spring Boot; endpoint path not
+embedded in the launcher — verified by exhaustive string scans of every
+launcher file). Completion options:
+
+1. Run the official launcher once under wine with a MITM proxy (install
+   mitmproxy, import its CA into the wine prefix), capture the SDK response
+   → the `launcherConfigUrl` containing the token
+2. Run the launcher on a Windows machine with Fiddler/Charles once, paste the
+   `launcherConfigUrl`
+3. Reverse the SDK API endpoint (clientId/Secret are known; path guessing so
+   far unsuccessful)
+
+**Community check:** no public PGR updater/launcher-replacement project exists
+(GitHub repos+issues, GameBox, KuroLauncher, ww-manager issues, moyingji,
+52pojie, bilibili all checked) — the official launcher is the only update
+mechanism the community has, unlike WuWa's ww-manager.
 
 ## Crate layout
 
