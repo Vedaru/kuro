@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{init, restore, Frame, Terminal};
 
-use kuro_core::{GameManager, GameStatus, ProgressEvent, Server};
+use kuro_core::{Game, GameManager, GameStatus, ProgressEvent, Server};
 
 /// Default game folder (the user's known install).
 const DEFAULT_GAME_DIR: &str = "/home/vedaru/.local/share/Steam/steamapps/common/Wuthering Waves";
@@ -54,7 +54,26 @@ fn push_log(state: &mut UiState, msg: impl Into<String>) {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let mut paths: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // one-shot CLI subcommands
+    match args.first().map(|s| s.as_str()) {
+        Some("install") => {
+            return cli_install(&args).await;
+        }
+        Some("status") => {
+            let folder = args.get(1).cloned().unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
+            return cli_status(&folder).await;
+        }
+        Some("sync") => {
+            let folder = args.get(1).cloned().unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
+            return cli_sync(&folder).await;
+        }
+        _ => {}
+    }
+
+    // TUI: one or more game folders (default: WuWa)
+    let mut paths = args;
     if paths.is_empty() {
         paths.push(DEFAULT_GAME_DIR.to_string());
     }
@@ -78,6 +97,74 @@ async fn main() -> std::io::Result<()> {
     let res = run(terminal, &mut rx, tx, paths).await;
     restore();
     res
+}
+
+async fn cli_install(args: &[String]) -> std::io::Result<()> {
+    let game = match args.get(1).map(|s| s.as_str()) {
+        Some("wuwa") => Game::WuWa,
+        Some("pgr") => Game::Pgr,
+        _ => {
+            println!("usage: kuro install <wuwa|pgr> <cn|bilibili|global> <folder>");
+            return Ok(());
+        }
+    };
+    let server = match args.get(2).map(|s| s.as_str()) {
+        Some("cn") => Server::Cn,
+        Some("bilibili") => Server::Bilibili,
+        Some("global") => Server::Global,
+        _ => {
+            println!("bad server (cn|bilibili|global)");
+            return Ok(());
+        }
+    };
+    let Some(folder) = args.get(3) else {
+        println!("missing folder");
+        return Ok(());
+    };
+
+    match GameManager::install(game, server, folder.into()).await {
+        Ok(r) => println!(
+            "installed v{}: checked={} ok={} repaired={} failed={}",
+            r.version,
+            r.sync.checked,
+            r.sync.ok,
+            r.sync.repaired,
+            r.sync.failed.len()
+        ),
+        Err(e) => println!("install failed: {e}"),
+    }
+    Ok(())
+}
+
+async fn cli_status(folder: &str) -> std::io::Result<()> {
+    match GameManager::open(PathBuf::from(folder)).await {
+        Ok(m) => match m.status().await {
+            Ok(s) => println!(
+                "game={} server={} local={:?} remote={} update_available={}",
+                s.game, s.server, s.local_version, s.remote_version, s.update_available
+            ),
+            Err(e) => println!("status error: {e}"),
+        },
+        Err(e) => println!("open error: {e}"),
+    }
+    Ok(())
+}
+
+async fn cli_sync(folder: &str) -> std::io::Result<()> {
+    match GameManager::open(PathBuf::from(folder)).await {
+        Ok(m) => match m.sync().await {
+            Ok(r) => println!(
+                "checked={} ok={} repaired={} failed={}",
+                r.checked,
+                r.ok,
+                r.repaired,
+                r.failed.len()
+            ),
+            Err(e) => println!("sync error: {e}"),
+        },
+        Err(e) => println!("open error: {e}"),
+    }
+    Ok(())
 }
 
 async fn run(
