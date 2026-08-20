@@ -27,6 +27,15 @@ pub async fn download_single(
     let total = expected_size
         .or_else(|| resp.content_length())
         .unwrap_or(0);
+    if let Some(tx) = progress {
+        let _ = tx
+            .send(ProgressEvent::FileProgress {
+                name: name.to_string(),
+                bytes: 0,
+                total,
+            })
+            .await;
+    }
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
     let mut done: u64 = 0;
@@ -71,6 +80,16 @@ pub async fn download_chunked(
     }
     let last_end = chunks.iter().map(|c| c.end).max().unwrap_or(0);
     let expected_size = Some(last_end + 1);
+
+    if let Some(tx) = progress {
+        let _ = tx
+            .send(ProgressEvent::FileProgress {
+                name: name.to_string(),
+                bytes: 0,
+                total: expected_size.unwrap(),
+            })
+            .await;
+    }
 
     // Preallocate so concurrent writers can seek freely.
     {

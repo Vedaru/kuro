@@ -25,6 +25,9 @@ pub enum ProgressEvent {
     GroupDone { name: String, bytes: u64 },
     /// Total bytes of the operation, known once planning/verification is done.
     SetTotal { bytes: u64 },
+    /// Number of items queued for repair/download (replaces a per-item
+    /// GroupStart flood for large manifests — one event, not N).
+    SetQueued { count: usize },
     Done,
 }
 
@@ -208,7 +211,7 @@ impl GameManager {
         tx: tokio::sync::mpsc::Sender<ProgressEvent>,
     ) -> Result<()> {
         let _ = tx.send(ProgressEvent::Log(format!(
-            "predownload {} -> {} ({} groups, {:.1} GiB)",
+            "predownload {} → {} ({} groups, {:.1} GiB)",
             plan.from_version,
             plan.to_version,
             plan.patch_groups.len(),
@@ -795,30 +798,23 @@ impl GameManager {
         }
 
         // repair phase — parallel downloads, verified before swap
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(ProgressEvent::SetQueued {
+                    count: to_fix.len(),
+                })
+                .await;
+        }
         let sem = Arc::new(tokio::sync::Semaphore::new(CHUNK_CONCURRENCY));
-        let mut handles = Vec::with_capacity(to_fix.len());
+        let mut handles = tokio::task::JoinSet::new();
         for item in to_fix {
-            if let Some(tx) = &tx {
-                let _ = tx
-                    .send(ProgressEvent::GroupStart {
-                        name: item.dest.clone(),
-                    })
-                    .await;
-                let _ = tx
-                    .send(ProgressEvent::FileProgress {
-                        name: item.dest.clone(),
-                        bytes: 0,
-                        total: item.size,
-                    })
-                    .await;
-            }
             let sem = sem.clone();
             let http = self.http.clone();
             let game_folder = self.game_folder.clone();
             let cdn = cdn.to_string();
             let base = base.to_string();
             let tx = tx.clone();
-            handles.push(tokio::spawn(async move {
+            handles.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
                 let url = ApiClient::resource_url(&cdn, &from, &item.dest);
@@ -851,11 +847,12 @@ impl GameManager {
                 }
                 safe_replace(&tmp, &game_path)?;
                 Ok::<_, Error>((item.dest, item.size))
-            }));
+            });
         }
-        for h in handles {
-            let inner: std::result::Result<(String, u64), Error> = h
-                .await
+        // GroupDone in completion order, not spawn order: a slow first file
+        // must not stall progress reporting for every file after it.
+        while let Some(joined) = handles.join_next().await {
+            let inner: std::result::Result<(String, u64), Error> = joined
                 .map_err(|e| Error::Patch(format!("repair join: {e}")))?;
             match inner {
                 Ok((dest, size)) => {
