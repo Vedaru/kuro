@@ -14,6 +14,7 @@ pub mod game;
 pub mod state;
 
 pub use game::{
-    ApplyReport, CheckoutReport, GameManager, GameStatus, PendingGroup, ProgressEvent, SyncReport,
+    ApplyReport, CheckoutReport, GameManager, GameStatus, InstallReport, PendingGroup,
+    ProgressEvent, SyncReport,
 };
 pub use kuro_api::{Error, Game, Result, Server};

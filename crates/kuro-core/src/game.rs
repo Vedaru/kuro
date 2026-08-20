@@ -466,6 +466,29 @@ impl GameManager {
         Ok(report)
     }
 
+    /// Install a game from zero into `game_folder`: fetch the live manifest,
+    /// write `launcherDownloadConfig.json` (remote version + appId), then
+    /// sync the full client. Works for any Kuro game in the registry.
+    pub async fn install(game: Game, server: Server, game_folder: PathBuf) -> Result<InstallReport> {
+        let entry = server_entry(game, server)
+            .ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
+        let api = ApiClient::new()?;
+        let index = api.fetch_index(entry.api_url).await?;
+        let version = index.default.version.clone();
+
+        std::fs::create_dir_all(&game_folder)?;
+        let cfg = LocalConfig {
+            version: version.clone(),
+            app_id: entry.app_id.to_string(),
+            group: "default".to_string(),
+        };
+        state::write_local_config(&game_folder, &cfg)?;
+
+        let mgr = Self::open(game_folder).await?;
+        let sync = mgr.sync().await?;
+        Ok(InstallReport { version, sync })
+    }
+
     /// Switch server channel by swapping only the channel-specific files and
     /// updating the appId (CN <-> Bilibili). Global is a different package —
     /// not supported for fast-switch (mirrors ww-manager).
@@ -765,13 +788,20 @@ pub struct SyncReport {
     pub failed: Vec<String>,
 }
 
-/// Result summary of a server checkout.
+/// Result of a server checkout.
 #[derive(Debug, Clone)]
 pub struct CheckoutReport {
     pub from_server: Server,
     pub to_server: Server,
     pub swapped_files: usize,
     pub new_version: String,
+}
+
+/// Result of a from-zero install.
+#[derive(Debug, Clone)]
+pub struct InstallReport {
+    pub version: String,
+    pub sync: SyncReport,
 }
 
 fn is_krpdiff(dest: &str) -> bool {
