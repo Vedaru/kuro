@@ -2,27 +2,51 @@
 //! (range-request) downloads with MD5 verification.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
+use crate::game::ProgressEvent;
 use kuro_api::{ChunkInfo, Error, Result};
 
 /// Download a whole file to `dest` (temp file semantics: caller renames on
-/// success). Verifies size and MD5 when provided.
+/// success). Verifies size and MD5 when provided. Emits per-file progress if
+/// a sender is given.
 pub async fn download_single(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
     expected_size: Option<u64>,
     expected_md5: Option<&str>,
+    name: &str,
+    progress: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
 ) -> Result<()> {
     let resp = client.get(url).send().await?.error_for_status()?;
+    let total = expected_size
+        .or_else(|| resp.content_length())
+        .unwrap_or(0);
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
+    let mut done: u64 = 0;
+    let mut last_report: u64 = 0;
     while let Some(chunk) = stream.next().await {
-        file.write_all(&chunk?).await?;
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        done += chunk.len() as u64;
+        if let Some(tx) = progress {
+            if done - last_report >= (1 << 20) || done >= total {
+                last_report = done;
+                let _ = tx
+                    .send(ProgressEvent::FileProgress {
+                        name: name.to_string(),
+                        bytes: done,
+                        total,
+                    })
+                    .await;
+            }
+        }
     }
     file.flush().await?;
     drop(file);
@@ -39,6 +63,8 @@ pub async fn download_chunked(
     chunks: &[ChunkInfo],
     expected_md5: Option<&str>,
     concurrency: usize,
+    name: &str,
+    progress: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
 ) -> Result<()> {
     if chunks.is_empty() {
         return Err(Error::MissingField("chunkInfos"));
@@ -54,6 +80,7 @@ pub async fn download_chunked(
     }
 
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let done_counter = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let client = client.clone();
@@ -61,6 +88,7 @@ pub async fn download_chunked(
         let dest = dest.to_path_buf();
         let chunk = chunk.clone();
         let sem = sem.clone();
+        let done_counter = done_counter.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let range = format!("bytes={}-{}", chunk.start, chunk.end);
@@ -86,11 +114,21 @@ pub async fn download_chunked(
             f.seek(std::io::SeekFrom::Start(chunk.start)).await?;
             f.write_all(&bytes).await?;
             f.flush().await?;
+            done_counter.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             Ok::<_, Error>(())
         }));
     }
     for h in handles {
-        h.await.map_err(|e| Error::Patch(format!("chunk task join: {e}")))??;
+        h.await.map_err(|e| Error::Patch(format!("chunk task join: {e}")))?;
+        if let Some(tx) = progress {
+            let _ = tx
+                .send(ProgressEvent::FileProgress {
+                    name: name.to_string(),
+                    bytes: done_counter.load(Ordering::Relaxed),
+                    total: expected_size.unwrap(),
+                })
+                .await;
+        }
     }
 
     verify_file(dest, Some(expected_size.unwrap()), expected_md5).await

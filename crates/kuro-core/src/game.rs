@@ -19,6 +19,8 @@ use crate::state::{self, incremental_dir};
 pub enum ProgressEvent {
     Log(String),
     GroupStart { name: String },
+    /// Periodic per-file byte progress while downloading.
+    FileProgress { name: String, bytes: u64, total: u64 },
     GroupDone { name: String, bytes: u64 },
     /// Total bytes of the operation, known once planning/verification is done.
     SetTotal { bytes: u64 },
@@ -246,7 +248,16 @@ impl GameManager {
             let url = ApiClient::krpdiff_url(&cdn, patch_cfg, &group.name);
             let staged = state::staged_patch_path(&self.game_folder, &group.name);
             let tmp = staged.with_extension("krpdiff.tmp");
-            download_single(&self.http, &url, &tmp, Some(group.size), None).await?;
+            download_single(
+                &self.http,
+                &url,
+                &tmp,
+                Some(group.size),
+                None,
+                &group.name,
+                Some(&tx),
+            )
+            .await?;
             std::fs::rename(&tmp, &staged)?;
             let _ = tx.send(ProgressEvent::GroupDone {
                 name: group.name.clone(),
@@ -268,7 +279,16 @@ impl GameManager {
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = staged.with_extension("tmp");
             if res.chunk_infos.is_empty() {
-                download_single(&self.http, &url, &tmp, Some(res.size), Some(&res.md5)).await?;
+                download_single(
+                    &self.http,
+                    &url,
+                    &tmp,
+                    Some(res.size),
+                    Some(&res.md5),
+                    &res.dest,
+                    Some(&tx),
+                )
+                .await?;
             } else {
                 download_chunked(
                     &self.http,
@@ -277,6 +297,8 @@ impl GameManager {
                     &res.chunk_infos,
                     Some(&res.md5),
                     CHUNK_CONCURRENCY,
+                    &res.dest,
+                    Some(&tx),
                 )
                 .await?;
             }
@@ -405,10 +427,28 @@ impl GameManager {
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = staged.with_extension("tmp");
             if chunks.is_empty() {
-                download_single(&self.http, &url, &tmp, Some(dst.size), Some(&dst.md5)).await?;
+                download_single(
+                    &self.http,
+                    &url,
+                    &tmp,
+                    Some(dst.size),
+                    Some(&dst.md5),
+                    &dst.dest,
+                    None,
+                )
+                .await?;
             } else {
-                download_chunked(&self.http, &url, &tmp, &chunks, Some(&md5), CHUNK_CONCURRENCY)
-                    .await?;
+                download_chunked(
+                    &self.http,
+                    &url,
+                    &tmp,
+                    &chunks,
+                    Some(&md5),
+                    CHUNK_CONCURRENCY,
+                    &dst.dest,
+                    None,
+                )
+                .await?;
             }
             std::fs::rename(&tmp, &staged)?;
         }
@@ -580,7 +620,16 @@ impl GameManager {
             let game_path = self.game_folder.join(f.trim_start_matches('/'));
             std::fs::create_dir_all(game_path.parent().unwrap())?;
             let tmp = game_path.with_extension("checkout.tmp");
-            download_single(&self.http, &url, &tmp, None, Some(expected_md5)).await?;
+            download_single(
+                &self.http,
+                &url,
+                &tmp,
+                None,
+                Some(expected_md5),
+                f,
+                None,
+            )
+            .await?;
             safe_replace(&tmp, &game_path)?;
             swapped += 1;
         }
@@ -711,6 +760,7 @@ impl GameManager {
             let game_folder = self.game_folder.clone();
             let cdn = cdn.to_string();
             let base = base.to_string();
+            let tx = tx.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
@@ -719,7 +769,16 @@ impl GameManager {
                 std::fs::create_dir_all(game_path.parent().unwrap())?;
                 let tmp = game_path.with_extension("sync.tmp");
                 if item.chunk_infos.is_empty() {
-                    download_single(&http, &url, &tmp, Some(item.size), Some(&item.md5)).await?;
+                    download_single(
+                        &http,
+                        &url,
+                        &tmp,
+                        Some(item.size),
+                        Some(&item.md5),
+                        &item.dest,
+                        tx.as_ref(),
+                    )
+                    .await?;
                 } else {
                     download_chunked(
                         &http,
@@ -728,6 +787,8 @@ impl GameManager {
                         &item.chunk_infos,
                         Some(&item.md5),
                         CHUNK_CONCURRENCY,
+                        &item.dest,
+                        tx.as_ref(),
                     )
                     .await?;
                 }

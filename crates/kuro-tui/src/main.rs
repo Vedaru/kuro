@@ -29,10 +29,18 @@ struct TaskUi {
     kind: String,
     total: usize,
     done: usize,
-    current: Option<String>,
     finished: Option<Result<String, String>>,
     total_bytes: u64,
     done_bytes: u64,
+    /// In-flight files (parallel downloads), each with its own bar.
+    files: Vec<FileState>,
+}
+
+#[derive(Clone, Default)]
+struct FileState {
+    name: String,
+    done: u64,
+    total: u64,
 }
 
 #[derive(Default)]
@@ -52,6 +60,8 @@ struct UiState {
     show_help: bool,
     /// Detected Steam + Proton (for install targets).
     steam: Option<SteamInfo>,
+    /// Cached status per game path.
+    statuses: Vec<Option<Result<GameStatus, String>>>,
 }
 
 /// In-progress install selection.
@@ -227,8 +237,10 @@ async fn run(
     let mut state = UiState {
         paths,
         steam: detect_steam(),
+        statuses: Vec::new(),
         ..Default::default()
     };
+    state.statuses = vec![None; state.paths.len()];
 
     loop {
         terminal.draw(|f| ui(f, &state))?;
@@ -318,7 +330,9 @@ async fn run(
                     KeyCode::Tab => {
                         if state.paths.len() > 1 && !state.busy {
                             state.active = (state.active + 1) % state.paths.len();
-                            state.status = None;
+                            if state.active < state.statuses.len() {
+                                state.statuses[state.active] = None;
+                            }
                             let msg = format!(
                                 "switched to game {} ({})",
                                 state.active + 1,
@@ -384,7 +398,9 @@ async fn run(
             match ev {
                 UiEvent::Status(s) => {
                     push_log(&mut state, format!("status refreshed: {s:?}"));
-                    state.status = Some(s);
+                    if state.active < state.statuses.len() {
+                        state.statuses[state.active] = Some(s);
+                    }
                 }
                 UiEvent::Progress(p) => match p {
                     ProgressEvent::Log(m) => push_log(&mut state, m),
@@ -395,11 +411,29 @@ async fn run(
                     }
                     ProgressEvent::GroupStart { name } => {
                         if let Some(t) = state.task.as_mut() {
-                            t.current = Some(name);
+                            t.files.push(FileState {
+                                name,
+                                ..Default::default()
+                            });
+                            if t.files.len() > 12 {
+                                t.files.remove(0);
+                            }
                         }
                     }
-                    ProgressEvent::GroupDone { bytes, .. } => {
+                    ProgressEvent::FileProgress { name, bytes, total } => {
                         if let Some(t) = state.task.as_mut() {
+                            match t.files.iter_mut().find(|f| f.name == name) {
+                                Some(f) => {
+                                    f.done = bytes;
+                                    f.total = total;
+                                }
+                                None => t.files.push(FileState { name, done: bytes, total }),
+                            }
+                        }
+                    }
+                    ProgressEvent::GroupDone { name, bytes } => {
+                        if let Some(t) = state.task.as_mut() {
+                            t.files.retain(|f| f.name != name);
                             t.done += 1;
                             t.done_bytes += bytes;
                         }
@@ -556,9 +590,16 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
 }
 
 fn ui(f: &mut Frame, state: &UiState) {
+    // stacked sections: header / status / task / log / footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),      // header
+            Constraint::Length(9),      // status: one box per game
+            Constraint::Percentage(45), // task: overall + per-file bars
+            Constraint::Min(4),         // log
+            Constraint::Length(1),      // footer
+        ])
         .split(f.area());
 
     let title = Line::from(vec![
@@ -567,55 +608,59 @@ fn ui(f: &mut Frame, state: &UiState) {
     ]);
     f.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), chunks[0]);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Percentage(40)])
-        .split(chunks[1]);
+    // ---- status section: separate box per game ----
+    let n = state.paths.len().max(1);
+    if n > 1 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(
+                std::iter::repeat(Constraint::Ratio(1, n as u32))
+                    .take(n)
+                    .collect::<Vec<_>>(),
+            )
+            .split(chunks[1]);
+        for (i, col) in cols.iter().enumerate() {
+            let path = &state.paths[i];
+            let active = i == state.active;
+            let s = state.statuses.get(i).and_then(|x| x.as_ref());
+            let name = path.rsplit('/').next().unwrap_or("game").to_string();
+            let border = if active {
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("▶ {name}"))
+                    .border_style(Style::default().fg(Color::Cyan))
+            } else {
+                Block::default().borders(Borders::ALL).title(name)
+            };
+            f.render_widget(
+                Paragraph::new(status_box_lines(s)).wrap(Wrap { trim: true }).block(border),
+                *col,
+            );
+        }
+    } else {
+        let s = state.statuses.get(0).and_then(|x| x.as_ref());
+        f.render_widget(
+            Paragraph::new(status_box_lines(s))
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL).title("status")),
+            chunks[1],
+        );
+    }
 
-    // status panel
-    let status_lines: Vec<Line> = match &state.status {
-        Some(Ok(s)) => vec![
-            Line::raw(format!("game:    {}", s.game)),
-            Line::raw(format!("server:  {}", s.server)),
-            Line::raw(format!("local:   {}", s.local_version.as_deref().unwrap_or("none"))),
-            Line::raw(format!("remote:  {}", s.remote_version)),
-            Line::styled(
-                if s.update_available { "UPDATE AVAILABLE" } else { "up to date" },
-                Style::default().fg(if s.update_available { Color::Yellow } else { Color::Green }),
-            ),
-        ],
-        Some(Err(e)) => vec![Line::styled(format!("error: {e}"), Style::default().fg(Color::Red))],
-        None => vec![Line::raw("loading...")],
-    };
-    f.render_widget(
-        Paragraph::new(status_lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("status")),
-        cols[0],
-    );
-
-    // task panel
+    // ---- task section: overall bar + one bar per in-flight file ----
     let task_lines: Vec<Line> = match &state.task {
         None => vec![Line::raw("idle")],
         Some(t) => {
             let mut v = vec![
                 Line::raw(format!("task: {}", t.kind)),
                 Line::raw(format!("files done: {}", t.done)),
-                Line::raw(format!("current: {}", t.current.as_deref().unwrap_or("-"))),
             ];
             if t.total_bytes > 0 {
-                let ratio = (t.done_bytes as f64 / t.total_bytes as f64).clamp(0.0, 1.0);
-                let bar_w = 22usize;
-                let filled = (bar_w as f64 * ratio).round() as usize;
-                let bar = format!(
-                    "[{}{}] {:5.1}%  {:.2}/{:.2} GiB",
-                    "█".repeat(filled),
-                    "░".repeat(bar_w - filled),
-                    ratio * 100.0,
-                    t.done_bytes as f64 / (1 << 30) as f64,
-                    t.total_bytes as f64 / (1 << 30) as f64,
-                );
-                v.push(Line::raw(bar));
+                v.push(Line::raw(bar_line("overall", t.done_bytes, t.total_bytes, 34)));
+            }
+            for f in t.files.iter().take(6) {
+                let name = shorten(&f.name, 42);
+                v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
             }
             if let Some(f) = &t.finished {
                 v.push(Line::styled(
@@ -636,10 +681,10 @@ fn ui(f: &mut Frame, state: &UiState) {
         Paragraph::new(task_lines)
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title("task")),
-        cols[1],
+        chunks[2],
     );
 
-    // log panel: wrap long lines + scroll window (PgUp/PgDn)
+    // ---- log panel: wrap + scroll window (PgUp/PgDn) ----
     let all_logs: Vec<Line> = state.logs.iter().rev().take(200).map(|l| Line::raw(l)).collect();
     let max_scroll = all_logs.len().saturating_sub(1);
     let scroll = state.log_scroll.min(max_scroll);
@@ -648,7 +693,7 @@ fn ui(f: &mut Frame, state: &UiState) {
         Paragraph::new(log_lines)
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title("log (PgUp/PgDn)")),
-        cols[2],
+        chunks[3],
     );
 
     let footer = format!(
@@ -664,7 +709,7 @@ fn ui(f: &mut Frame, state: &UiState) {
         },
         if state.busy { "   [busy]" } else { "" }
     );
-    f.render_widget(Paragraph::new(Line::raw(footer)), chunks[2]);
+    f.render_widget(Paragraph::new(Line::raw(footer)), chunks[4]);
 
     // overlays: help / install modal
     if state.show_help {
@@ -751,6 +796,58 @@ fn ui(f: &mut Frame, state: &UiState) {
                 .block(Block::default().borders(Borders::ALL).title("install")),
             area,
         );
+    }
+}
+
+/// Lines for a per-game status box.
+fn status_box_lines(s: Option<&Result<GameStatus, String>>) -> Vec<Line> {
+    match s {
+        Some(Ok(s)) => vec![
+            Line::raw(format!("game:    {}", s.game)),
+            Line::raw(format!("server:  {}", s.server)),
+            Line::raw(format!("local:   {}", s.local_version.as_deref().unwrap_or("none"))),
+            Line::raw(format!("remote:  {}", s.remote_version)),
+            Line::styled(
+                if s.update_available {
+                    "UPDATE AVAILABLE"
+                } else {
+                    "up to date"
+                },
+                Style::default().fg(if s.update_available { Color::Yellow } else { Color::Green }),
+            ),
+        ],
+        Some(Err(e)) => vec![Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red),
+        )],
+        None => vec![Line::raw("loading...")],
+    }
+}
+
+/// A text progress bar line with a label.
+fn bar_line(label: &str, done: u64, total: u64, bar_w: usize) -> String {
+    if total == 0 {
+        return format!("{label}: ?");
+    }
+    let ratio = (done as f64 / total as f64).clamp(0.0, 1.0);
+    let filled = (bar_w as f64 * ratio).round() as usize;
+    format!(
+        "[{}{}] {:5.1}%  {:.2}/{:.2} GiB  {label}",
+        "█".repeat(filled),
+        "░".repeat(bar_w - filled),
+        ratio * 100.0,
+        done as f64 / (1 << 30) as f64,
+        total as f64 / (1 << 30) as f64,
+    )
+}
+
+/// Keep the tail of long file paths (the part that matters).
+fn shorten(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        format!("…{}", chars[chars.len() - max + 1..].iter().collect::<String>())
     }
 }
 
