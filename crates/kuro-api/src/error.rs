@@ -35,6 +35,9 @@ pub enum Error {
     #[error("patch error: {0}")]
     Patch(String),
 
+    #[error("{0}")]
+    TokenMissing(String),
+
     #[error("unimplemented: {0}")]
     Unimplemented(&'static str),
 }

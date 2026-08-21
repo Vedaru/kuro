@@ -49,9 +49,20 @@ the wine dependency is removed by applying patches via
 | Wuthering Waves (G152/G153) | ✅ | ✅ | ✅ |
 | Punishing: Gray Raven (G143/G148) | ⏳ token pending | — | ✅ |
 
-PGR global's launcher token was recovered from a real Windows install's
-WebView2 storage (the launcher fetches it at runtime via a private SDK API —
-see `kuro-api/src/config.rs` for details).
+## Tokens
+
+WuWa's launcher tokens are public and stable (same ones `ww-manager` ships), so
+they're compiled in. **PGR's global token is runtime-only** — it rotates, so it
+lives in `~/.config/kuro/tokens.toml` (or `KURO_PGR_GLOBAL_TOKEN`), never in
+the binary:
+
+```toml
+[pgr]
+global = "…token from the launcher's WebView2 storage on a Windows install…"
+```
+
+When PGR status starts failing (stale token), re-copy it from a real launcher
+install's cache and update the file.
 
 ## Install
 

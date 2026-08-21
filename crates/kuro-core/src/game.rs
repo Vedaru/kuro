@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use kuro_api::config::ServerEntry;
 use kuro_api::{
-    game_server_by_app_id, server_entry, ApiClient, Error, FileRef, Game, GroupInfo, LocalConfig,
-    PatchConfig, PatchIndex, ResourceItem, Server, Result,
+    game_server_by_app_id, index_url, server_entry, ApiClient, Error, FileRef, Game, GroupInfo,
+    LocalConfig, PatchConfig, PatchIndex, ResourceItem, Server, Result,
 };
 
 use crate::atomic::{recover_backup, safe_replace};
@@ -103,7 +103,7 @@ impl GameManager {
 
     /// Remote (current) version + whether an update is available.
     pub async fn status(&self) -> Result<GameStatus> {
-        let index = self.api.fetch_index(self.server_entry().api_url).await?;
+        let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let remote = index.default.version.clone();
         let local = self.local_version()?;
         Ok(GameStatus {
@@ -122,7 +122,7 @@ impl GameManager {
             .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
         let from_version = cfg;
 
-        let index = self.api.fetch_index(self.server_entry().api_url).await?;
+        let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let cdn = self.api.pick_cdn(&index)?.url.clone();
         let to_version = index.default.version.clone();
 
@@ -219,7 +219,7 @@ impl GameManager {
                 plan.total_bytes as f64 / (1 << 30) as f64
             )))
             .await;
-        let index = self.api.fetch_index(self.server_entry().api_url).await?;
+        let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let cdn = self.api.pick_cdn(&index)?.url.clone();
 
         let dir = incremental_dir(&self.game_folder);
@@ -352,7 +352,7 @@ impl GameManager {
             .local_version()?
             .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
 
-        let index = self.api.fetch_index(self.server_entry().api_url).await?;
+        let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let remote = index.default.version.clone();
         if remote == from_version {
             return Ok(ApplyReport::default()); // nothing to do
@@ -576,7 +576,7 @@ impl GameManager {
         let entry = server_entry(game, server)
             .ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
         let api = ApiClient::new()?;
-        let index = api.fetch_index(entry.api_url).await?;
+        let index = api.fetch_index(&index_url(game, server)?).await?;
         let version = index.default.version.clone();
 
         std::fs::create_dir_all(&game_folder)?;
@@ -616,9 +616,12 @@ impl GameManager {
         api_url: Option<&str>,
     ) -> Result<CheckoutReport> {
         let entry = server_entry(self.game, target).expect("registry covers all known servers");
-        let api_url = api_url.unwrap_or(entry.api_url);
+        let api_url = match api_url {
+            Some(u) => u.to_string(),
+            None => index_url(self.game, target)?,
+        };
 
-        let index = self.api.fetch_index(api_url).await?;
+        let index = self.api.fetch_index(&api_url).await?;
         let cdn = self.api.pick_cdn(&index)?.url.clone();
         let cfg = &index.default.config;
         let to_version = cfg.version.clone();
@@ -695,7 +698,7 @@ impl GameManager {
         &self,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<SyncReport> {
-        let index = self.api.fetch_index(self.server_entry().api_url).await?;
+        let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let cdn = self.api.pick_cdn(&index)?.url.clone();
         let cfg = &index.default.config;
         let url = format!(

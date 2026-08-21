@@ -16,7 +16,7 @@ use ratatui::{init, restore, Frame, Terminal};
 use kuro_core::{default_game_dir, detect_steam, Game, GameManager, GameStatus, ProgressEvent, Server, SteamInfo};
 
 /// Default game folder (the user's known install).
-const DEFAULT_GAME_DIR: &str = "/home/vedaru/.local/share/Steam/steamapps/common/Wuthering Waves";
+const DEFAULT_GAME_DIR: &str = "/home/vedaru/Games/Wuthering Waves";
 
 enum UiEvent {
     /// Status result for one game (index into `UiState::statuses`).
@@ -550,26 +550,32 @@ fn switch_game(state: &mut UiState, tx: &tokio::sync::mpsc::Sender<UiEvent>, del
     spawn_status(tx, &state.paths[state.active], state.active);
 }
 
-/// Find installed Kuro games: the standard Steam folders (any library) whose
-/// launcher config marks them as real installs.
+/// Find installed Kuro games: `~/Games` (the non-Steam layout this box uses)
+/// plus the standard Steam library folders — anything carrying the official
+/// launcher's `launcherDownloadConfig.json` counts as an install.
 fn auto_detect_games() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let Some(steam) = detect_steam() else {
-        return out;
-    };
-    for game in [Game::WuWa, Game::Pgr] {
-        let name = match game {
-            Game::WuWa => "Wuthering Waves",
-            Game::Pgr => "Punishing Gray Raven",
-        };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.push(PathBuf::from(&home).join("Games"));
+    if let Some(steam) = detect_steam() {
         for lib in &steam.libraries {
-            let dir = lib.join("common").join(name);
-            if dir.join("launcherDownloadConfig.json").is_file() {
+            roots.push(lib.join("common"));
+        }
+    }
+    for root in roots {
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let dir = entry.path();
+            if dir.is_dir() && dir.join("launcherDownloadConfig.json").is_file() {
                 out.push(dir.to_string_lossy().into_owned());
-                break; // one entry per game
             }
         }
     }
+    out.sort();
+    out.dedup();
     out
 }
 

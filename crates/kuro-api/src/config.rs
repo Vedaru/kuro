@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::error::{Error, Result};
+
 /// Known Kuro Games titles with a PC launcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Game {
@@ -47,6 +49,11 @@ impl fmt::Display for Server {
 
 /// One server entry: where to fetch the launcher index + which files differ
 /// between channels (used by the server-switch / checkout feature).
+///
+/// `api_url` is static only for servers whose launcher tokens are public and
+/// stable (WuWa — the same tokens the community `ww-manager` ships). PGR's
+/// token is **never compiled in**: it rotates and is resolved at runtime by
+/// [`index_url`] (env var or the tokens file).
 pub struct ServerEntry {
     pub api_url: &'static str,
     pub app_id: &'static str,
@@ -94,7 +101,8 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
             (
                 "global",
                 ServerEntry {
-                    api_url: "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/G143/50015_LWdk9D2Ep9mpJmqBZZkcPBU2YNraEWBQ/index.json",
+                    // Token is runtime-only (env / tokens file) — see index_url().
+                    api_url: "",
                     app_id: "50015",
                     diff_files: &[],
                 },
@@ -115,9 +123,10 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
 ///
 /// **Global (G143) is fully wired** — the game manifest at
 /// `launcher/game/G143/50015_<token>/index.json` is live and structurally
-/// identical to WuWa (patchConfig / krpdiff / weighted cdnList). The token was
-/// recovered from the launcher's WebView2 local storage on the user's Windows
-/// SSD (2026-08). Current game version: 4.7.0.
+/// identical to WuWa (patchConfig / krpdiff / weighted cdnList). The token is
+/// **not compiled in** — it rotates, and kuro resolves it at runtime via
+/// [`index_url`] (env var or `~/.config/kuro/tokens.toml`). Current game
+/// version: 4.7.0.
 ///
 /// CN (G148) still needs its token (runtime SDK flow; see README).
 pub mod pgr_meta {
@@ -125,8 +134,6 @@ pub mod pgr_meta {
     pub const GAME_ID_GLOBAL: &str = "G143";
     /// Global app id.
     pub const APP_ID_GLOBAL: &str = "50015";
-    /// Global launcher token (recovered from real Windows install).
-    pub const TOKEN_GLOBAL: &str = "LWdk9D2Ep9mpJmqBZZkcPBU2YNraEWBQ";
     /// CN game platform id.
     pub const GAME_ID_CN: &str = "G148";
     /// CN app id.
@@ -137,12 +144,78 @@ pub mod pgr_meta {
         "https://prod-volcdn-gamestarter.kurogame.net",
         "https://prod-tencentcdn-gamestarter.kurogame.net",
     ];
-    /// Global launcher meta URL (launcher self-update manifest).
-    pub fn launcher_meta_url(cdn_base: &str) -> String {
-        format!(
-            "{cdn_base}/launcher/launcher/{APP_ID_GLOBAL}_{TOKEN_GLOBAL}/{GAME_ID_GLOBAL}/index.json"
-        )
+}
+
+/// Resolve the launcher index URL for a game/server.
+///
+/// WuWa's tokens are public and stable (shipped by ww-manager too), so they
+/// stay static. PGR's global token is runtime-only — `KURO_PGR_GLOBAL_TOKEN`
+/// env var first, then `~/.config/kuro/tokens.toml` (`[pgr] global = "..."`).
+pub fn index_url(game: Game, server: Server) -> Result<String> {
+    match (game, server) {
+        (Game::WuWa, server) => {
+            let entry = server_entry(game, server)
+                .ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
+            Ok(entry.api_url.to_string())
+        }
+        (Game::Pgr, Server::Global) => Ok(format!(
+            "{}/launcher/game/G143/50015_{}/index.json",
+            pgr_meta::CDN_BASES_GLOBAL[0],
+            pgr_global_token()?
+        )),
+        (Game::Pgr, Server::Cn) => Err(Error::Unimplemented(
+            "PGR CN launcher token has not been recovered (private SDK runtime flow)",
+        )),
+        _ => Err(Error::UnknownAppId(format!("{game}/{server}"))),
     }
+}
+
+/// PGR global launcher token: env var first, then the tokens file.
+fn pgr_global_token() -> Result<String> {
+    if let Ok(t) = std::env::var("KURO_PGR_GLOBAL_TOKEN") {
+        if !t.is_empty() {
+            return Ok(t);
+        }
+    }
+    if let Some(t) = read_tokens_file().and_then(|m| m.get("pgr.global").cloned()) {
+        return Ok(t);
+    }
+    Err(Error::TokenMissing(
+        "PGR global launcher token is not configured: set KURO_PGR_GLOBAL_TOKEN \
+         or add `[pgr] global = \"...\"` to ~/.config/kuro/tokens.toml"
+            .into(),
+    ))
+}
+
+/// Minimal reader for the tokens file (`~/.config/kuro/tokens.toml`).
+/// Handles `[section]` headers and `key = "value"` lines — enough for
+/// `[pgr] global = "..."`; unknown sections are ignored.
+fn read_tokens_file() -> Option<std::collections::HashMap<String, String>> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::Path::new(&home).join(".config/kuro/tokens.toml");
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut map = std::collections::HashMap::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_string();
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim().trim_matches('"').trim();
+            let key = if section.is_empty() {
+                k.trim().to_string()
+            } else {
+                format!("{section}.{}", k.trim())
+            };
+            map.insert(key, v.to_string());
+        }
+    }
+    Some(map)
 }
 
 pub fn server_entry(game: Game, server: Server) -> Option<&'static ServerEntry> {
