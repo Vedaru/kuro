@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "kuro-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "kuro-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "kuro-api",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "kuro-patch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hdiffpatch-rs",
  "kuro-api",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "kuro-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "kuro-core",

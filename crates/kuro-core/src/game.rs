@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use kuro_api::config::ServerEntry;
 use kuro_api::{
-    game_server_by_app_id, index_url, server_entry, ApiClient, Error, FileRef, Game, GroupInfo,
-    LocalConfig, PatchConfig, PatchIndex, ResourceItem, Server, Result,
+    game_server_by_app_id, index_url, server_entry, ApiClient, ChunkInfo, Error, FileRef, Game,
+    GroupInfo, LocalConfig, PatchConfig, PatchIndex, ResourceItem, Server, Result,
 };
 
 use crate::atomic::{recover_backup, safe_replace};
@@ -59,7 +59,13 @@ pub struct GameStatus {
     pub update_available: bool,
 }
 
-const CHUNK_CONCURRENCY: usize = 8;
+const CHUNK_CONCURRENCY: usize = 32;
+/// CN 3.6.0 manifests carry no chunkInfos — synthesize fixed-size ranges so
+/// large paks download over parallel connections (CDNs rate-limit per conn).
+const SYNTH_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+/// Concurrent FILES in the repair/install download loop (each file then fans
+/// out to CHUNK_CONCURRENCY range requests → bounded total connections).
+const REPAIR_FILE_CONCURRENCY: usize = 4;
 /// Parallel krpdiff merges during apply (CPU-bound, native engine).
 const MERGE_CONCURRENCY: usize = 4;
 
@@ -308,7 +314,22 @@ impl GameManager {
             let staged = state::staged_resource_path(&self.game_folder, &res.dest);
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = staged.with_extension("tmp");
-            if res.chunk_infos.is_empty() {
+            // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
+            // ranges so big paks download over parallel connections (the CDN
+            // rate-limits per connection). Whole-file MD5 is still verified.
+            let chunk_infos = if res.chunk_infos.is_empty() && res.size > SYNTH_CHUNK_SIZE {
+                let n = (res.size + SYNTH_CHUNK_SIZE - 1) / SYNTH_CHUNK_SIZE;
+                (0..n)
+                    .map(|i| ChunkInfo {
+                        start: i * SYNTH_CHUNK_SIZE,
+                        end: ((i + 1) * SYNTH_CHUNK_SIZE - 1).min(res.size - 1),
+                        md5: String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                res.chunk_infos.clone()
+            };
+            if chunk_infos.is_empty() {
                 download_single(
                     &self.http,
                     &url,
@@ -324,7 +345,7 @@ impl GameManager {
                     &self.http,
                     &url,
                     &tmp,
-                    &res.chunk_infos,
+                    &chunk_infos,
                     Some(&res.md5),
                     CHUNK_CONCURRENCY,
                     &res.dest,
@@ -822,7 +843,7 @@ impl GameManager {
                 })
                 .await;
         }
-        let sem = Arc::new(tokio::sync::Semaphore::new(CHUNK_CONCURRENCY));
+        let sem = Arc::new(tokio::sync::Semaphore::new(REPAIR_FILE_CONCURRENCY));
         let mut handles = tokio::task::JoinSet::new();
         for item in to_fix {
             let sem = sem.clone();
@@ -838,7 +859,22 @@ impl GameManager {
                 let game_path = game_folder.join(item.dest.trim_start_matches('/'));
                 std::fs::create_dir_all(game_path.parent().unwrap())?;
                 let tmp = game_path.with_extension("sync.tmp");
-                if item.chunk_infos.is_empty() {
+                // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
+                // ranges so big paks download over parallel connections (the
+                // CDN rate-limits per connection). Whole-file MD5 still verified.
+                let chunk_infos = if item.chunk_infos.is_empty() && item.size > SYNTH_CHUNK_SIZE {
+                    let n = (item.size + SYNTH_CHUNK_SIZE - 1) / SYNTH_CHUNK_SIZE;
+                    (0..n)
+                        .map(|i| ChunkInfo {
+                            start: i * SYNTH_CHUNK_SIZE,
+                            end: ((i + 1) * SYNTH_CHUNK_SIZE - 1).min(item.size - 1),
+                            md5: String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    item.chunk_infos.clone()
+                };
+                if chunk_infos.is_empty() {
                     download_single(
                         &http,
                         &url,
@@ -854,7 +890,7 @@ impl GameManager {
                         &http,
                         &url,
                         &tmp,
-                        &item.chunk_infos,
+                        &chunk_infos,
                         Some(&item.md5),
                         CHUNK_CONCURRENCY,
                         &item.dest,
