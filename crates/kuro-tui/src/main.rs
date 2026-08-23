@@ -574,9 +574,20 @@ fn auto_detect_games() -> Vec<String> {
             }
         }
     }
-    out.sort();
-    out.dedup();
-    out
+    // Dedupe by CANONICAL path: `~/Games/<Game>` and a symlink alias
+    // (`steamapps/common/<Game>` -> `~/Games/<Game>`) are different strings
+    // but the same game — string dedup misses them. Keep the first (real,
+    // earlier-root) path, drop the symlink alias.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut deduped: Vec<String> = Vec::new();
+    for p in out {
+        let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p));
+        if seen.insert(canon) {
+            deduped.push(p);
+        }
+    }
+    deduped.sort();
+    deduped
 }
 
 fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
