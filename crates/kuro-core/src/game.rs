@@ -923,6 +923,12 @@ impl GameManager {
                 Err(e) => report.failed.push(e.to_string()),
             }
         }
+
+        // orphan sweep — anything on disk the manifest doesn't list (and
+        // isn't part of our own bookkeeping) gets removed. Closes the fourth
+        // case the doc-comment doesn't name: "exists on disk, not in manifest".
+        report.orphans_removed = sweep_orphans(&self.game_folder, &full_index.resource)?;
+
         Ok(report)
     }
 }
@@ -1032,6 +1038,10 @@ pub struct SyncReport {
     pub ok: usize,
     pub repaired: usize,
     pub repaired_bytes: u64,
+    /// Files present on disk that were not in the manifest and were removed.
+    /// Closes the "exists on disk but isn't in the manifest" case that pure
+    /// verify+repair can't catch on its own.
+    pub orphans_removed: usize,
     pub failed: Vec<String>,
 }
 
@@ -1101,4 +1111,117 @@ fn group_already_target(game_folder: &Path, group: &GroupInfo) -> bool {
             let p = game_folder.join(d.dest.trim_start_matches('/'));
             std::fs::metadata(p).map(|m| m.len() == d.size).unwrap_or(false)
         })
+}
+
+/// Walk `game_folder` and remove any file the manifest does not list. Returns
+/// the number of files removed. Never deletes directories that still contain
+/// other files; prunes directories that became empty as a side effect.
+///
+/// Excluded from deletion:
+/// - `launcherDownloadConfig.json` (the live local config we wrote)
+/// - `*.tmp` and `*.bak` (in-flight repair / backup of the file they sit next to)
+/// - anything inside `.incremental_download/` (predownload staging)
+///
+/// Path comparison is on forward-slash relative paths, matching the manifest's
+/// `dest` convention regardless of host OS.
+fn sweep_orphans(game_folder: &Path, manifest: &[ResourceItem]) -> Result<usize> {
+    use std::collections::HashSet;
+
+    let manifest_set: HashSet<String> = manifest
+        .iter()
+        .map(|r| r.dest.trim_start_matches('/').replace('\\', "/"))
+        .collect();
+
+    // collect orphans first, delete after — mutating the tree while walking it
+    // is a recipe for skipped entries on some platforms
+    let mut orphans: Vec<PathBuf> = Vec::new();
+    for entry in walk_files(game_folder)? {
+        let rel = entry
+            .strip_prefix(game_folder)
+            .map_err(|e| Error::Patch(format!("orphan walk prefix: {e}")))?
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if is_protected(&rel) {
+            continue;
+        }
+        if manifest_set.contains(&rel) {
+            continue;
+        }
+        orphans.push(entry);
+    }
+
+    for path in &orphans {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // prune empty directories bottom-up, but only inside the game folder and
+    // never the folder itself. Walking the full tree is cheap relative to a
+    // full install and keeps the logic correct for arbitrarily deep removals.
+    prune_empty_dirs(game_folder);
+
+    Ok(orphans.len())
+}
+
+/// Recursively prune any empty directory under `root`, never removing `root`
+/// itself. Best-effort: IO errors are ignored because the worst case is
+/// leaving an empty directory behind, not corrupting data.
+fn prune_empty_dirs(root: &Path) {
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path == root {
+            continue;
+        }
+        prune_empty_dirs(&path);
+        if is_dir_empty(&path) {
+            let _ = std::fs::remove_dir(&path);
+        }
+    }
+}
+
+fn is_dir_empty(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false)
+}
+
+/// Recursive file walker that does not follow the protected `.incremental_download`
+/// directory (we never want to touch predownload staging from sync).
+fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
+    fn recurse(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name == ".incremental_download" {
+                    continue;
+                }
+                recurse(&path, out)?;
+            } else {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    recurse(root, &mut out).map_err(|e| Error::Patch(format!("orphan walk: {e}")))?;
+    Ok(out)
+}
+
+/// Files / directories the sweep must never delete.
+fn is_protected(rel: &str) -> bool {
+    if rel == "launcherDownloadConfig.json" {
+        return true;
+    }
+    let lower = rel.to_ascii_lowercase();
+    if lower.ends_with(".tmp") || lower.ends_with(".bak") {
+        return true;
+    }
+    false
 }
