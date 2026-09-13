@@ -63,8 +63,8 @@ jobs:
           # can work. Until then publish.sh answers "unknown component" and
           # fails the run, which would read as breakage rather than "not landed
           # yet". Skip green instead, and say why.
-          if ! grep -q 'select_select_kuro()' publish.sh; then
-            echo "chezmoi main does not yet define select_select_kuro(); the per-tool"
+          if ! grep -q 'select_kuro()' publish.sh; then
+            echo "chezmoi main does not yet define select_kuro(); the per-tool"
             echo "split has not landed. Nothing to publish -- re-run after it does."
             exit 0
           fi
