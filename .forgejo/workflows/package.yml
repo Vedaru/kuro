@@ -5,39 +5,61 @@
 # workflow that used to re-tar whatever `kuro` was already installed on the
 # runner -- a snapshot of a machine, not a build.
 #
-# runs-on: vedaru-host is a runner on the Forgejo SERVER host, not on a laptop.
-# It is registered against this repo alone (repo-scoped registration token) and
-# runs as a systemd user unit in that host's /home/vedaru:
+# runs-on: glibc names a LABEL, and the label names an image. The Forgejo
+# SERVER's runner carries it, mapped to a glibc image:
 #
-#   ~/.local/bin/forgejo-runner                    v13.0.0, static; taken from
-#                                                  the runner image the server
-#                                                  already ran
-#                                                  (data.forgejo.org/forgejo/runner:13)
-#   ~/.local/share/forgejo-runner/config.yaml      labels: [vedaru-host:host]
-#   ~/.local/share/forgejo-runner/.runner          the registration
-#   ~/.config/systemd/user/forgejo-runner.service  enabled; linger is on, so it
-#                                                  starts at boot with no login
-#                                                  and restarts on failure
+#   runner:
+#     labels:
+#       - "glibc:docker://ubuntu:26.04"
 #
-# The HOST backend is load-bearing: jobs run directly on the server as vedaru
-# rather than in a container, because the build needs the rust toolchain under
-# ~/.cargo (cargo 1.98.1 there) and publish.sh reads $HOME/.local/bin/kuro and
-# calls dpkg, strings, tar, zstd and python3 -- none of which an Alpine job
-# image has.
+# so this job gets a throwaway ubuntu:26.04 container of its own, on the server.
+# That runner also sets `container.network: host`, which is the only reason the
+# loopback URLs below resolve: the instance listens on the host's 127.0.0.1:3000
+# and the job container shares the host's network namespace.
 #
-# The label is deliberately disjoint from the ones the containerised runner on
-# this same host claims (`ubuntu-latest`, `self-hosted`, `glibc`): those jobs
-# execute in an Alpine image with none of the host's /usr or ~/, so a shared
-# label would let a job race between the two runners and land in the one that
-# cannot build it.
+# A per-job `container:` block does NOT work on this runner -- it ignores it and
+# the job dies at container setup. The image must come from the runner's own
+# label, and the workflow only asks for the label. Vedaru/Hyprland's hyprbuntu
+# job is the same shape; its header carries the long version of this, including
+# why an Alpine image cannot be used for a glibc binary.
 #
-# This role used to live on a laptop, under the label `vedaru-laptop`. That
-# runner was moved to this server on 2026-09-17 and removed the same evening,
-# which left every push after 2026-09-15 queued behind a label no online runner
-# claimed -- the v0.3.0 sync fix in 7aa70ed among them, which is why this file
-# moved to the same label as the sibling tools. The server is the right home for
-# it: it is always up, it has the toolchain, and it is the host the Forgejo
-# instance already runs on.
+# Nothing from the host is mounted. The runner permits exactly one host path as
+# a job volume (/home/vedaru/Downloads, from `valid_volumes`) and this job uses
+# none of it: the toolchain is installed inside the container by the first step,
+# and the only files that leave are the ones uploaded to the registry.
+#
+# This replaces the `vedaru-host` runner: a forgejo-runner daemon under a
+# systemd user unit on the server, with the HOST backend, which ran these steps
+# as vedaru directly on the machine. It was retired on 2026-09-20 so that the
+# only way any job on this instance executes is inside a container. The history
+# is laptop runner (to 2026-09-17) -> server host runner (retired) -> this.
+#
+# Two things about the old setup are worth keeping in mind, because they are
+# what this file no longer relies on:
+#
+#   * the build used to need the server's ~/.cargo (cargo 1.98.1) and the
+#     publish step used to read $HOME/.local/bin/kuro -- staging the binary
+#     there was simultaneously the install on the server and the bundle input.
+#     Nothing is installed anywhere now.
+#   * the label was disjoint from `ubuntu-latest` on purpose, because two
+#     runners claimed that one and a job could land on the wrong host. There is
+#     no second runner any more, so `glibc` is now only a name for the image.
+#
+# HOME is set to /home/vedaru below, and that needs its own explanation,
+# because it is the one place a reader would reasonably assume a host
+# dependency survived. It does not. publish.sh selects the file to bundle by
+# expanding $HOME (select_kuro() reads "$HOME/.local/bin/kuro") and the
+# published MANIFEST.tsv records the path it selected; the tarball is built with
+# `cd / && tar ... -T list`, so that path becomes the archive member. A restore
+# extracts it with `tar -C /`. /home/vedaru therefore has to be the path the
+# bundle CLAIMS, whatever container the bundle is built in -- so the job creates
+# a synthetic /home/vedaru and stages into it. The chown to 1000:1000 on the
+# staged file is the same idea: the MANIFEST records owner:group, and 1000:1000
+# is what vedaru is on the machines that restore it.
+#
+# Consequence of the move: a push no longer refreshes a copy of kuro on the
+# server as a side effect. The server's ~/.local/bin/kuro now comes from the
+# next ansible restore, like every other machine's.
 #
 # Everything talks to the instance over loopback (127.0.0.1:3000), not
 # https://git.vedaru.cn. The public name resolves through Cloudflare, which
@@ -55,10 +77,6 @@
 # Nothing is version-pinned: kuro's bundle version is the flat 1.0, replaced on
 # every publish (--replace), so the per-tool SHA256SUMS is the integrity anchor
 # rather than a version number.
-#
-# A push therefore refreshes the SERVER's ~/.local/bin/kuro and the published
-# bundle. A laptop running kuro picks the change up from the bundle on its next
-# ansible restore, not from this job.
 
 name: Build and publish kuro package
 
@@ -67,10 +85,35 @@ on:
     branches: [master]
   workflow_dispatch:
 
+env:
+  # Not this container's home -- see the header. This is the path the published
+  # bundle has to claim, recreated inside the job.
+  HOME: /home/vedaru
+
 jobs:
   package:
-    runs-on: vedaru-host
+    runs-on: glibc
     steps:
+      - name: Install the build toolchain
+        # The job container is a bare ubuntu:26.04, so everything the build and
+        # publish.sh need is installed here rather than assumed from a host.
+        # rustup is pinned to the 1.98.1 that built the bundle being replaced:
+        # a toolchain bump should be a deliberate act with a green run behind
+        # it, not whatever the release channel served that morning.
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+              build-essential ca-certificates curl git pkg-config \
+              python3 python3-yaml binutils zstd xz-utils file
+          # rustup writes into $HOME (which is the synthetic /home/vedaru), so
+          # it has to exist before it runs.
+          install -d -m 0755 "$HOME"
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+              --default-toolchain 1.98.1 --no-modify-path
+          "$HOME/.cargo/bin/cargo" --version
+
       - name: Fetch the chezmoi repo (publish.sh and MANIFEST.md only)
         env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
@@ -88,13 +131,11 @@ jobs:
         run: |
           set -euo pipefail
           [ "$HOME" = /home/vedaru ] || {
-            echo "runner HOME is $HOME, expected /home/vedaru" >&2
-            echo "select_kuro() reads \$HOME/.local/bin; refusing to stage elsewhere." >&2
+            echo "HOME is $HOME, expected the synthetic /home/vedaru" >&2
+            echo "select_kuro() reads \$HOME/.local/bin, and the bundle records that path." >&2
             exit 1
           }
-          # The rust toolchain lives under ~/.cargo/bin, which is added by
-          # ~/.profile for interactive shells. The runner's step shell is
-          # non-login, so put it on PATH explicitly rather than depend on that.
+          # The toolchain was installed into $HOME/.cargo by the first step.
           export PATH="$HOME/.cargo/bin:$PATH"
           command -v cargo >/dev/null || { echo "cargo not on PATH" >&2; exit 1; }
           helper='!f() { echo "username=x"; printf "password=%s\n" "$FORGEJO_TOKEN"; }; f'
@@ -113,9 +154,11 @@ jobs:
           [ -x "$bin" ] || { echo "build produced no $bin" >&2; exit 1; }
           echo "built kuro ($(stat -c '%s' "$bin") bytes)"
 
-          # Exactly what select_kuro() reads, at the mode the published bundle
-          # records (775, 1000:1000). Staging here is also the install.
-          install -Dm775 "$bin" "$HOME/.local/bin/kuro"
+          # Exactly what select_kuro() reads, at the mode and ownership the
+          # published bundle records (775, 1000:1000). The steps run as root in
+          # the job container, so the ids are set explicitly -- nothing on a
+          # restore target has a root-owned ~/.local/bin.
+          install -Dm775 -o 1000 -g 1000 "$bin" "$HOME/.local/bin/kuro"
 
       - name: Publish the kuro package
         env:
