@@ -239,10 +239,11 @@ async fn cli_sync(folder: &str) -> std::io::Result<()> {
     match GameManager::open(PathBuf::from(folder)).await {
         Ok(m) => match m.sync().await {
             Ok(r) => println!(
-                "checked={} ok={} repaired={} failed={}",
+                "checked={} ok={} repaired={} stale_removed={} failed={}",
                 r.checked,
                 r.ok,
                 r.repaired,
+                r.orphans_removed,
                 r.failed.len()
             ),
             Err(e) => println!("sync error: {e}"),
@@ -697,10 +698,11 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                         format!(", {} failed", report.failed.len())
                     };
                     Ok(format!(
-                        "sync complete — {} repaired ({:.1} GiB), {} ok{failed}",
+                        "sync complete — {} repaired ({:.1} GiB), {} ok, {} stale removed{failed}",
                         report.repaired,
                         report.repaired_bytes as f64 / (1 << 30) as f64,
-                        report.ok
+                        report.ok,
+                        report.orphans_removed
                     ))
                 }
                 TaskKind::Checkout => {

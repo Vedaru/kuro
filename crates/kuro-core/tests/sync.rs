@@ -1,5 +1,5 @@
-//! Sync: verify the whole tree, repair missing/corrupt files, leave good
-//! files untouched.
+//! Sync: verify the whole tree, repair missing/corrupt files, leave good files
+//! untouched — and sweep only stale build artifacts, never live game state.
 
 mod common;
 
@@ -101,20 +101,19 @@ async fn sync_removes_files_not_in_manifest() {
     let file_a = b"FILE-A-CONTENT";
     std::fs::write(game.join("Client/Content/Paks/fileA.pak"), file_a).unwrap();
 
-    // orphans: an old pakchunk the manifest dropped, plus a stray file
-    // in a directory the manifest still uses
+    // orphan: an old pakchunk the manifest dropped, in a directory the manifest
+    // still ships .pak into — a stale build artifact by the sweep's definition
     let orphan_chunk = b"OLD-PAKCHUNK-3.5-CONTENT";
-    let stray = b"SOMETHING-PGR-PUT-HERE";
     std::fs::write(
         game.join("Client/Content/Paks/pakchunk18-WindowsNoEditor.pak"),
         orphan_chunk,
     )
     .unwrap();
-    std::fs::write(game.join("Client/Content/Paks/stray.tmp"), stray).unwrap();
+    std::fs::write(game.join("Client/Content/Paks/stray.tmp"), b"STRAY").unwrap();
 
     // protected files the sweep must NOT touch (per the chosen exclusion rules)
     std::fs::write(
-        game.join("Client/Content/Paks/inflight.sync.tmp"),
+        game.join("Client/Content/Paks/inflight.pak.sync.tmp"),
         b"IN-FLIGHT",
     )
     .unwrap();
@@ -125,7 +124,26 @@ async fn sync_removes_files_not_in_manifest() {
     )
     .unwrap();
 
-    // also: a directory that becomes empty after its only file is removed
+    // live game state: not in the manifest, and never this sweep's to delete.
+    // The client's own resource channel, its settings/saves/local storage, and
+    // the SDK / anti-cheat / crash-reporter files it writes for itself.
+    let live = [
+        "Client/Saved/Resources/Video/Paks/188_0/Video_188_0-WindowsNoEditor.pak",
+        "Client/Saved/Resources/3.6.0/Lang_en/Base/pakchunk10-WindowsNoEditor.pak",
+        "Client/Saved/Config/WindowsNoEditor/GameUserSettings.ini",
+        "Client/Saved/LocalStorage/LocalStorage.db",
+        "Client/Binaries/Win64/KDData-data.db",
+        "Client/Binaries/Win64/AntiCheatExpert/pld.dat",
+        "Client/Binaries/Win64/CrashSightLog/CrashSight.1.336.log",
+    ];
+    for rel in live {
+        let p = game.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"LIVE-GAME-STATE").unwrap();
+    }
+
+    // an unknown directory (not in the manifest) with a manifest-looking
+    // extension must survive too
     std::fs::create_dir_all(game.join("Client/Content/Paks/OldLocale/en-US")).unwrap();
     std::fs::write(
         game.join("Client/Content/Paks/OldLocale/en-US/old.bin"),
@@ -153,25 +171,28 @@ async fn sync_removes_files_not_in_manifest() {
     assert_eq!(report.ok, 1);
     assert_eq!(report.repaired, 0);
     assert!(report.failed.is_empty(), "no failures: {report:?}");
-    // two true orphans: the dropped pakchunk and old.bin inside the directory
-    // that will be pruned. The .sync.tmp and stray.tmp are protected by the
-    // .tmp rule and the .incremental_download/ tree is skipped by the walker.
+    // exactly one true orphan: the dropped pakchunk. The .tmp files and the
+    // .incremental_download/ tree are excluded by rule, and every file under
+    // Client/Saved (plus the SDK/anti-cheat/crash state) is live game state.
     assert_eq!(
-        report.orphans_removed, 2,
-        "pakchunk + old.bin removed; .tmp and incr preserved: {report:?}"
+        report.orphans_removed, 1,
+        "only the stale pakchunk is removed: {report:?}"
     );
 
     // manifest file still present, untouched
     assert_eq!(std::fs::read(game.join("Client/Content/Paks/fileA.pak")).unwrap(), file_a);
 
-    // orphans gone
+    // the stale artifact is gone
     assert!(!game.join("Client/Content/Paks/pakchunk18-WindowsNoEditor.pak").exists());
-    assert!(!game.join("Client/Content/Paks/OldLocale/en-US/old.bin").exists());
-    // empty directory pruned
-    assert!(!game.join("Client/Content/Paks/OldLocale").exists());
+
+    // live state survived
+    for rel in live {
+        assert!(game.join(rel).exists(), "{rel} must not be swept");
+    }
+    assert!(game.join("Client/Content/Paks/OldLocale/en-US/old.bin").exists());
 
     // protected files still present
-    assert!(game.join("Client/Content/Paks/inflight.sync.tmp").exists());
+    assert!(game.join("Client/Content/Paks/inflight.pak.sync.tmp").exists());
     assert!(game.join("Client/Content/Paks/stray.tmp").exists());
     assert!(game.join("Client/Content/Paks/.incremental_download/staged.pak").exists());
     assert!(game.join("launcherDownloadConfig.json").exists());

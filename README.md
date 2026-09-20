@@ -37,7 +37,12 @@ the wine dependency is removed by applying patches via
 - **apply** — merge `KrDiff` patches **natively** (no wine), MD5-verify every
   output, atomic `.bak` swap, version bump; full-file fallback if a merge fails
 - **sync** — parallel full-tree MD5 verify + repair of missing/corrupt files,
-  resumable across restarts
+  resumable across restarts; followed by a **stale-artifact sweep** that only
+  removes files the manifest has dropped (same directory *and* same extension as
+  manifest entries). Live game state is never deleted: `Client/Saved/**` (the
+  client's own resource/video channel, settings, saves, local storage, logs),
+  the SDK / anti-cheat / crash-reporter payloads the client writes for itself,
+  and anything in a directory the manifest doesn't ship into
 - **install** — from-zero client download for any supported game
 - **checkout** — CN ⇄ Bilibili channel switch for WuWa (diff-file swap + appId)
 - Resumable, MD5-verified downloads with per-file progress bars
@@ -165,6 +170,15 @@ cargo run -p kuro-core --example pgr_proof   # live CDN smoke test (PGR)
 - PGR CN (`G148`) launcher token not yet recovered (private SDK runtime flow)
 - ACE anti-cheat doesn't run under Proton (see above)
 - No persistent MD5 cache yet — sync re-hashes the tree each run (fast on NVMe)
+- The CDN manifest describes the base client only, so it is **not** an inventory
+  of a WuWa install: the game's own resource channel (`Client/Saved/**`, i.e.
+  Video/Lang/Resource packs — not the `Client/Content/Paks` base paks) is
+  fetched by the client itself and is invisible to Kuro
+- WuWa CN hotfixes (e.g. 3.6.0 → 3.6.1) have no `krpdiff` groups and no
+  `fromFolder`: `predownload` stages the changed files as full files, and
+  `apply` refuses to record the new version unless every target file is already
+  on disk at its target hash — use `sync` for those, which downloads and
+  verifies them directly
 
 ## License
 

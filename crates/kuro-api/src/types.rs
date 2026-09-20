@@ -3,8 +3,11 @@
 //! Modeled on the live wire format (verified against the CN WuWa CDN, 2026-08):
 //!
 //! * `GET {api_url}`  -> `LauncherIndex` (per-game/per-server entry point)
-//! * `GET {cdn}/{indexFile}` -> `PatchIndex` (one per source version; lists the
-//!   krpdiff groups needed to reach the target version)
+//! * `GET {cdn}/{indexFile}` -> `PatchIndex`. For a *full* manifest this is the
+//!   whole client; for a source version it lists what changed. Both are often
+//!   plain full-file entries — WuWa CN hotfixes ship no krpdiff groups at all,
+//!   and their entries carry no `fromFolder`, so a consumer must be able to fall
+//!   back to the manifest's own base URL.
 //!
 //! All extra/mystery fields are ignored (`serde` default behavior) so Kuro can
 //! add fields without breaking us.

@@ -152,6 +152,62 @@ async fn apply_merges_verifies_swaps_and_cleans() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// An apply that swaps nothing must not record the new version: otherwise
+/// `status` reports "up to date" forever and the real update is never taken.
+#[tokio::test]
+async fn apply_refuses_to_record_a_version_it_did_not_install() {
+    let base = std::env::temp_dir().join(format!("kuro-apply-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let game = setup_game(&base);
+    // staging exists (a predownload ran) but holds nothing usable — the shape of
+    // the live WuWa CN hotfix manifest, whose entries carry no source folder.
+    std::fs::create_dir_all(game.join(".incremental_download")).unwrap();
+
+    let target = b"PAK-3.6.1-DATA".repeat(50);
+    let patch_index = PatchIndex {
+        resource: vec![ResourceItem {
+            dest: "Client/Content/Paks/pakchunk0.pak".to_string(),
+            md5: md5_bytes(&target),
+            size: target.len() as u64,
+            from_folder: None,
+            chunk_infos: vec![],
+        }],
+        delete_files: vec![],
+        group_infos: vec![],
+        apply_types: vec![],
+    };
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let err = mgr
+        .apply_inner(
+            &patch_index,
+            "https://cdn.invalid",
+            &PatchConfig {
+                version: "0.9.0".to_string(),
+                index_file: String::new(),
+                base_url: "zip".to_string(),
+            },
+            "1.0.0",
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("refusing to record 1.0.0"),
+        "expected the version guard to fire, got: {err}"
+    );
+    let cfg = kuro_core::state::read_local_config(&game).unwrap().unwrap();
+    assert_eq!(cfg.version, "0.9.0", "version must not be bumped");
+    assert!(
+        game.join(".incremental_download").exists(),
+        "staging survives for a retry"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[tokio::test]
 async fn apply_without_predownload_errors_cleanly() {
     let base = std::env::temp_dir().join(format!("kuro-apply-notest-{}", std::process::id()));

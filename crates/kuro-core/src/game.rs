@@ -152,6 +152,17 @@ impl GameManager {
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
         let patch_index = self.api.fetch_patch_index(&cdn, patch_cfg).await?;
 
+        Ok(self.plan_from_patch_index(&patch_index, &from_version, &to_version))
+    }
+
+    /// Build a plan from an already-fetched patch manifest (no network, so it
+    /// is directly testable).
+    fn plan_from_patch_index(
+        &self,
+        patch_index: &PatchIndex,
+        from_version: &str,
+        to_version: &str,
+    ) -> PredownloadPlan {
         let mut patch_groups = Vec::new();
         let mut full_files = Vec::new();
         let mut total = 0u64;
@@ -184,9 +195,10 @@ impl GameManager {
             if is_krpdiff(&item.dest) {
                 continue; // handled above
             }
-            if item.from_folder.as_deref().is_none() {
-                continue;
-            }
+            // No `fromFolder` is normal — the file is served off the patch's own
+            // base (see `resource_base`). Demanding it here is how a real WuWa
+            // CN update (3.6.0 -> 3.6.1: 173 files, 1.49 GiB, *no* fromFolder
+            // on any entry) ended up planning zero bytes instead.
             let staged = state::staged_resource_path(&self.game_folder, &item.dest);
             let ready = file_matches(&staged, item.size, &item.md5);
             if !ready {
@@ -199,13 +211,13 @@ impl GameManager {
             });
         }
 
-        Ok(PredownloadPlan {
-            from_version,
-            to_version,
+        PredownloadPlan {
+            from_version: from_version.to_string(),
+            to_version: to_version.to_string(),
             patch_groups,
             full_files,
             total_bytes: total,
-        })
+        }
     }
 
     /// Download all pending krpdiffs + full-file fallbacks into the staging
@@ -270,7 +282,7 @@ impl GameManager {
                 .await;
             let url = ApiClient::krpdiff_url(&cdn, patch_cfg, &group.name);
             let staged = state::staged_patch_path(&self.game_folder, &group.name);
-            let tmp = staged.with_extension("krpdiff.tmp");
+            let tmp = tmp_sibling(&staged, "krpdiff");
             download_single(
                 &self.http,
                 &url,
@@ -309,11 +321,11 @@ impl GameManager {
             let res = res_by_dest
                 .get(item.name.as_str())
                 .ok_or_else(|| Error::MissingField("resource entry"))?;
-            let from = res.from_folder.as_deref().ok_or(Error::MissingField("fromFolder"))?;
-            let url = ApiClient::resource_url(&cdn, from, &res.dest);
+            let from = resource_base(res, patch_cfg);
+            let url = ApiClient::resource_url(&cdn, &from, &res.dest);
             let staged = state::staged_resource_path(&self.game_folder, &res.dest);
             std::fs::create_dir_all(staged.parent().unwrap())?;
-            let tmp = staged.with_extension("tmp");
+            let tmp = tmp_sibling(&staged, "dl");
             // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
             // ranges so big paks download over parallel connections (the CDN
             // rate-limits per connection). Whole-file MD5 is still verified.
@@ -478,7 +490,7 @@ impl GameManager {
             };
             let staged = state::staged_patch_path(&self.game_folder, &dst.dest);
             std::fs::create_dir_all(staged.parent().unwrap())?;
-            let tmp = staged.with_extension("tmp");
+            let tmp = tmp_sibling(&staged, "dl");
             if chunks.is_empty() {
                 download_single(
                     &self.http,
@@ -537,7 +549,7 @@ impl GameManager {
         };
 
         for (dest, staged) in &staged_outputs {
-            let game_path = self.game_folder.join(dest.trim_start_matches('/'));
+            let game_path = self.game_folder.join(normalise_dest(dest));
             recover_backup(&game_path)?;
             safe_replace(staged, &game_path)?;
             report.swapped += 1;
@@ -552,7 +564,7 @@ impl GameManager {
             if !staged.exists() {
                 continue; // not downloaded (already current or not needed)
             }
-            let game_path = self.game_folder.join(item.dest.trim_start_matches('/'));
+            let game_path = self.game_folder.join(normalise_dest(&item.dest));
             std::fs::create_dir_all(game_path.parent().unwrap())?;
             recover_backup(&game_path)?;
             safe_replace(&staged, &game_path)?;
@@ -561,11 +573,52 @@ impl GameManager {
 
         // ---- delete phase ----
         for f in &patch_index.delete_files {
-            let game_path = self.game_folder.join(f.trim_start_matches('/'));
+            let game_path = self.game_folder.join(normalise_dest(f));
             if game_path.exists() {
                 std::fs::remove_file(&game_path)?;
                 report.deleted.push(f.clone());
             }
+        }
+
+        // ---- guard: never record a version we did not actually install ----
+        // Writing `to_version` regardless is how a no-op apply (a patch
+        // manifest whose entries were all skipped) left the launcher config
+        // claiming 3.6.1 while the client was still on 3.6.0 — after which
+        // `status` reports "up to date" forever and the real update is missed.
+        let mut not_installed: Vec<String> = Vec::new();
+        for item in &patch_index.resource {
+            if is_krpdiff(&item.dest) {
+                continue;
+            }
+            let game_path = self.game_folder.join(normalise_dest(&item.dest));
+            if !file_matches(&game_path, item.size, &item.md5) {
+                not_installed.push(item.dest.clone());
+            }
+        }
+        for group in &patch_index.group_infos {
+            for dst in &group.dst_files {
+                if is_krpdiff(&dst.dest) || complete_dests.contains(&dst.dest) {
+                    continue;
+                }
+                let game_path = self.game_folder.join(normalise_dest(&dst.dest));
+                if !file_matches(&game_path, dst.size, &dst.md5) {
+                    not_installed.push(dst.dest.clone());
+                }
+            }
+        }
+        if !not_installed.is_empty() {
+            let sample = not_installed
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Patch(format!(
+                "refusing to record {to_version} as installed: {} target file(s) are not at \
+                 the target revision (e.g. {sample}) — the update is not applied yet; \
+                 rerun predownload (then apply) or sync, staging kept",
+                not_installed.len()
+            )));
         }
 
         // ---- finish: bump version, clean staging ----
@@ -575,7 +628,10 @@ impl GameManager {
             group: "default".to_string(),
         };
         state::write_local_config(&self.game_folder, &cfg)?;
-        std::fs::remove_dir_all(&inc)?;
+        // Best-effort: the version is already recorded, so failing the whole
+        // apply because staging was busy/locked would report failure for a
+        // successful update. The next predownload reuses or clears the dir.
+        let _ = std::fs::remove_dir_all(&inc);
 
         Ok(report)
     }
@@ -601,6 +657,12 @@ impl GameManager {
         let version = index.default.version.clone();
 
         std::fs::create_dir_all(&game_folder)?;
+        // `open()` (and the sync that follows) resolve game+server from this
+        // file, so it has to be written before we can sync — but a failed sync
+        // must not leave it claiming a version we never installed. Keep the
+        // previous bytes and put them back on failure.
+        let cfg_path = game_folder.join(state::LOCAL_CONFIG_FILE);
+        let prev_cfg = std::fs::read(&cfg_path).ok();
         let cfg = LocalConfig {
             version: version.clone(),
             app_id: entry.app_id.to_string(),
@@ -609,7 +671,20 @@ impl GameManager {
         state::write_local_config(&game_folder, &cfg)?;
 
         let mgr = Self::open(game_folder.clone()).await?;
-        let sync = mgr.sync_with_progress(tx).await?;
+        let sync = match mgr.sync_with_progress(tx).await {
+            Ok(report) => report,
+            Err(e) => {
+                match prev_cfg {
+                    Some(bytes) => {
+                        let _ = std::fs::write(&cfg_path, bytes);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&cfg_path);
+                    }
+                }
+                return Err(e);
+            }
+        };
         let game_exe = find_game_exe(&game_folder);
         Ok(InstallReport {
             version,
@@ -785,7 +860,7 @@ impl GameManager {
                             });
                         }
                     }
-                    let p = game_folder.join(item.dest.trim_start_matches('/'));
+                    let p = game_folder.join(normalise_dest(&item.dest));
                     let size_ok = std::fs::metadata(&p)
                         .map(|m| m.len() == item.size)
                         .unwrap_or(false);
@@ -856,9 +931,9 @@ impl GameManager {
                 let _permit = sem.acquire().await.unwrap();
                 let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
                 let url = ApiClient::resource_url(&cdn, &from, &item.dest);
-                let game_path = game_folder.join(item.dest.trim_start_matches('/'));
+                let game_path = game_folder.join(normalise_dest(&item.dest));
                 std::fs::create_dir_all(game_path.parent().unwrap())?;
-                let tmp = game_path.with_extension("sync.tmp");
+                let tmp = tmp_sibling(&game_path, "sync");
                 // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
                 // ranges so big paks download over parallel connections (the
                 // CDN rate-limits per connection). Whole-file MD5 still verified.
@@ -924,9 +999,9 @@ impl GameManager {
             }
         }
 
-        // orphan sweep — anything on disk the manifest doesn't list (and
-        // isn't part of our own bookkeeping) gets removed. Closes the fourth
-        // case the doc-comment doesn't name: "exists on disk, not in manifest".
+        // orphan sweep — stale build artefacts only (see `sweep_orphans`: the
+        // manifest covers the base client alone, so "not listed" must never
+        // mean "delete" for state the game creates for itself).
         report.orphans_removed = sweep_orphans(&self.game_folder, &full_index.resource)?;
 
         Ok(report)
@@ -1038,9 +1113,10 @@ pub struct SyncReport {
     pub ok: usize,
     pub repaired: usize,
     pub repaired_bytes: u64,
-    /// Files present on disk that were not in the manifest and were removed.
-    /// Closes the "exists on disk but isn't in the manifest" case that pure
-    /// verify+repair can't catch on its own.
+    /// Stale build artefacts removed — files not in the manifest that sat in a
+    /// manifest directory with a manifest extension. Live game state (the
+    /// client's resource channel, saves, settings, logs, SDK payloads) is never
+    /// counted here because it is never removed; see [`sweep_orphans`].
     pub orphans_removed: usize,
     pub failed: Vec<String>,
 }
@@ -1092,6 +1168,50 @@ fn is_krpdiff(dest: &str) -> bool {
     dest.to_ascii_lowercase().ends_with(".krpdiff")
 }
 
+/// Manifest paths are CDN paths: forward slashes, no drive prefix, relative to
+/// the install root (a stray leading `/` also shows up in the live files).
+/// Normalise once so every join and comparison agrees.
+fn normalise_dest(dest: &str) -> String {
+    dest.trim_start_matches('/').replace('\\', "/")
+}
+
+fn split_dest(dest: &str) -> (&str, &str) {
+    match dest.rsplit_once('/') {
+        Some((dir, name)) => (dir, name),
+        None => ("", dest),
+    }
+}
+
+fn extension_of(name: &str) -> Option<String> {
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+}
+
+/// Temp path for an in-flight download, sitting next to its destination.
+///
+/// Appends instead of replacing the extension: `Path::with_extension` maps
+/// `pakchunk0.pak` and `pakchunk0.sig` — siblings the CDN always ships
+/// together, and repairs/downloads run several files at once — onto the same
+/// `pakchunk0.tmp`, so two concurrent writers can clobber each other's
+/// half-written file. The `.tmp` suffix also keeps it protected from the
+/// orphan sweep.
+fn tmp_sibling(path: &Path, tag: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(format!(".{tag}.tmp"));
+    PathBuf::from(s)
+}
+
+/// CDN folder a full-file entry is fetched from. Entries without `fromFolder`
+/// (every entry of the live WuWa CN hotfix manifest) are served straight off
+/// the patch's own base URL — the same fallback `sync` uses for the full
+/// manifest.
+fn resource_base(res: &ResourceItem, patch_cfg: &PatchConfig) -> String {
+    res.from_folder
+        .clone()
+        .unwrap_or_else(|| patch_cfg.base_url.clone())
+}
+
 fn file_matches(path: &Path, size: u64, md5: &str) -> bool {
     match std::fs::metadata(path) {
         Ok(m) if m.len() == size && !md5.is_empty() => {
@@ -1113,13 +1233,25 @@ fn group_already_target(game_folder: &Path, group: &GroupInfo) -> bool {
         })
 }
 
-/// Walk `game_folder` and remove any file the manifest does not list. Returns
-/// the number of files removed. Never deletes directories that still contain
-/// other files; prunes directories that became empty as a side effect.
+/// Walk `game_folder` and remove stale build artefacts — files the manifest
+/// does not list *and* that sit in a directory the manifest ships into, with
+/// an extension the manifest uses there. Returns the number removed. Never
+/// deletes directories that still contain other files; prunes directories that
+/// became empty as a side effect.
 ///
-/// Excluded from deletion:
+/// The narrowing is the whole point. Kuro's CDN manifest describes **only** the
+/// base client: it has zero entries for `Client/Saved/**`, and none for the
+/// SDK / anti-cheat / crash-reporter payloads the client writes for itself. A
+/// blanket "delete whatever isn't listed" sweep therefore wipes live game state
+/// — the client's resource + video channel (tens of GB), graphics settings,
+/// local storage, saves, crash state — and the client's very next launch starts
+/// re-downloading all of it from zero. That is a self-inflicted 30 GB repair.
+///
+/// Always excluded from deletion:
 /// - `launcherDownloadConfig.json` (the live local config we wrote)
-/// - `*.tmp` and `*.bak` (in-flight repair / backup of the file they sit next to)
+/// - `Client/Saved/**` and the client's runtime segments/artefacts — see
+///   [`is_protected`]
+/// - `*.tmp` / `*.bak` (in-flight repair / backup of the file they sit next to)
 /// - anything inside `.incremental_download/` (predownload staging)
 ///
 /// Path comparison is on forward-slash relative paths, matching the manifest's
@@ -1127,10 +1259,8 @@ fn group_already_target(game_folder: &Path, group: &GroupInfo) -> bool {
 fn sweep_orphans(game_folder: &Path, manifest: &[ResourceItem]) -> Result<usize> {
     use std::collections::HashSet;
 
-    let manifest_set: HashSet<String> = manifest
-        .iter()
-        .map(|r| r.dest.trim_start_matches('/').replace('\\', "/"))
-        .collect();
+    let manifest_set: HashSet<String> = manifest.iter().map(|r| normalise_dest(&r.dest)).collect();
+    let dir_exts = manifest_dir_extensions(manifest);
 
     // collect orphans first, delete after — mutating the tree while walking it
     // is a recipe for skipped entries on some platforms
@@ -1148,6 +1278,9 @@ fn sweep_orphans(game_folder: &Path, manifest: &[ResourceItem]) -> Result<usize>
         if manifest_set.contains(&rel) {
             continue;
         }
+        if !is_stale_artifact(&rel, &dir_exts) {
+            continue; // live game state we have no way to restore
+        }
         orphans.push(entry);
     }
 
@@ -1161,6 +1294,36 @@ fn sweep_orphans(game_folder: &Path, manifest: &[ResourceItem]) -> Result<usize>
     prune_empty_dirs(game_folder);
 
     Ok(orphans.len())
+}
+
+/// For every directory the manifest ships files into, the set of lowercase
+/// extensions it uses there.
+fn manifest_dir_extensions(manifest: &[ResourceItem]) -> HashMap<String, HashSet<String>> {
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    for r in manifest {
+        let dest = normalise_dest(&r.dest);
+        let (dir, name) = split_dest(&dest);
+        if let Some(ext) = extension_of(name) {
+            map.entry(dir.to_string()).or_default().insert(ext);
+        }
+    }
+    map
+}
+
+/// True when `rel` looks like a stale build artefact rather than live game
+/// state: its directory is one the manifest ships into, and its extension is
+/// one the manifest uses there. Anything else (unknown directory, foreign
+/// extension) is left alone — the cost of keeping a stray file is zero, the
+/// cost of deleting live state is a full re-download or lost saves.
+fn is_stale_artifact(rel: &str, dir_exts: &HashMap<String, HashSet<String>>) -> bool {
+    let (dir, name) = split_dest(rel);
+    let Some(exts) = dir_exts.get(dir) else {
+        return false;
+    };
+    match extension_of(name) {
+        Some(ext) => exts.contains(&ext),
+        None => false,
+    }
 }
 
 /// Recursively prune any empty directory under `root`, never removing `root`
@@ -1214,7 +1377,12 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Files / directories the sweep must never delete.
+/// Files the sweep must never delete, whatever the manifest says.
+///
+/// The manifest only covers the base client, so "not in the manifest" is not a
+/// synonym for "stale". Everything matched here is state the *game* owns, is
+/// not on the CDN, and cannot be repaired — only re-downloaded by the client
+/// on its next launch (for the resource channel: tens of gigabytes).
 fn is_protected(rel: &str) -> bool {
     if rel == "launcherDownloadConfig.json" {
         return true;
@@ -1223,5 +1391,192 @@ fn is_protected(rel: &str) -> bool {
     if lower.ends_with(".tmp") || lower.ends_with(".bak") {
         return true;
     }
+    // The client's own tree: resource/video channel (Resources/**, Video/Paks),
+    // config, saves, local storage, logs, crash reports. The live WuWa CN
+    // manifest has zero entries under here.
+    if lower.starts_with("client/saved/") {
+        return true;
+    }
+    // Runtime segments the client, its SDK and its crash reporter create at any
+    // depth (including outside Client/Saved).
+    const RUNTIME_SEGMENTS: &[&str] = &[
+        "crashsightlog/",
+        "crashsight64/",
+        "wesight/",
+        "pipe_client/",
+        "crashreportclient/",
+        ".quality/",
+    ];
+    if RUNTIME_SEGMENTS.iter().any(|seg| lower.contains(seg)) {
+        return true;
+    }
+    // Runtime artefacts by extension: logs, crash dumps, local databases,
+    // per-machine hashes, local saves.
+    const RUNTIME_SUFFIXES: &[&str] = &[
+        ".log",
+        ".dmp",
+        ".dmp.gz",
+        ".db",
+        ".db-journal",
+        ".hash",
+        ".sav",
+    ];
+    if RUNTIME_SUFFIXES.iter().any(|suf| lower.ends_with(suf)) {
+        return true;
+    }
+    // Anti-cheat loader data; regenerated by ACE but not by us.
+    if lower.ends_with("/pld.dat") || lower == "pld.dat" {
+        return true;
+    }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn res(dest: &str, size: u64, from_folder: Option<&str>) -> ResourceItem {
+        ResourceItem {
+            dest: dest.to_string(),
+            md5: String::new(),
+            size,
+            from_folder: from_folder.map(str::to_string),
+            chunk_infos: vec![],
+        }
+    }
+
+    /// Everything the client writes for itself must survive a sweep — these are
+    /// the real paths that were deleted on a live WuWa install, taking the
+    /// client's resource channel, settings, saves and SDK state with them.
+    #[test]
+    fn sweep_protects_client_state() {
+        for rel in [
+            "Client/Saved/Resources/Video/Paks/188_0/Video_188_0-WindowsNoEditor.pak",
+            "Client/Saved/Resources/3.6.0/Lang_en/Base/pakchunk10-WindowsNoEditor.pak",
+            "Client/Saved/Resources/3.6.0/ResManifest/ManifestAggregated_3.6.17.txt",
+            "Client/Saved/Config/WindowsNoEditor/GameUserSettings.ini",
+            "Client/Saved/Config/CrashReportClient/UE4CC-1/CrashReportClient.ini",
+            "Client/Saved/LocalStorage/LocalStorage.db",
+            "Client/Saved/LocalStorage/LocalStorage.db-journal",
+            "Client/Saved/Logs/Client.log",
+            "Client/Binaries/Win64/AntiCheatExpert/pld.dat",
+            "Client/Binaries/Win64/KDData-data.db",
+            "Client/Binaries/Win64/CrashSightLog/CrashSight.1789914449.336.log",
+            "Client/Binaries/Win64/CrashSight64/dump/GbDump.GbS.1.dmp.gz",
+            "Client/Binaries/Win64/wesight/crashsight_data/crash_data.info_1",
+            "Client/Binaries/Win64/pipe_client/pipeclient_1.log",
+            "Client/Binaries/Win64/.quality/performance/performance_data",
+            "launcherDownloadConfig.json",
+            "Client/Content/Paks/pakchunk0.pak.sync.tmp",
+            "Client/Content/Paks/pakchunk0.pak.bak",
+        ] {
+            assert!(is_protected(rel), "{rel} must be protected from the sweep");
+        }
+    }
+
+    /// The sweep's actual job: stale build output the manifest no longer ships.
+    #[test]
+    fn sweep_only_removes_stale_build_output() {
+        let manifest = vec![
+            res("Client/Content/Paks/pakchunk0.pak", 10, None),
+            res("Client/Content/Paks/pakchunk0.sig", 10, None),
+            res("Client/Binaries/Win64/Client-Win64-Shipping.exe", 10, None),
+        ];
+        let dirs = manifest_dir_extensions(&manifest);
+
+        // dropped build artifacts -> swept (both halves of a pak/sig pair)
+        assert!(is_stale_artifact(
+            "Client/Content/Paks/pakchunk18-WindowsNoEditor.pak",
+            &dirs
+        ));
+        assert!(is_stale_artifact(
+            "Client/Content/Paks/pakchunk18-WindowsNoEditor.sig",
+            &dirs
+        ));
+
+        // foreign extension in a manifest directory -> kept
+        assert!(!is_stale_artifact(
+            "Client/Binaries/Win64/KDData-data.db",
+            &dirs
+        ));
+        assert!(!is_stale_artifact(
+            "Client/Binaries/Win64/cdbe868d_unique_id_kurodata",
+            &dirs
+        ));
+
+        // directory the manifest does not ship into -> kept
+        assert!(!is_stale_artifact(
+            "Client/Saved/Resources/Video/Paks/272_1/Video_272_1-WindowsNoEditor.pak",
+            &dirs
+        ));
+        assert!(!is_stale_artifact(
+            "Client/Content/Paks/OldLocale/en-US/old.bin",
+            &dirs
+        ));
+    }
+
+    #[test]
+    fn concurrent_downloads_get_distinct_temp_paths() {
+        let pak = Path::new("/g/Client/Content/Paks/pakchunk0.pak");
+        let sig = Path::new("/g/Client/Content/Paks/pakchunk0.sig");
+        let a = tmp_sibling(pak, "sync");
+        let b = tmp_sibling(sig, "sync");
+        assert_ne!(a, b, "pak and sig must not share a temp file");
+        assert!(a.to_string_lossy().ends_with("pakchunk0.pak.sync.tmp"));
+        // the sweep must never consider an in-flight download an orphan
+        assert!(is_protected(&a.to_string_lossy()));
+    }
+
+    #[test]
+    fn resource_base_falls_back_to_the_patch_base() {
+        let patch_cfg = PatchConfig {
+            version: "3.6.0".to_string(),
+            index_file: String::new(),
+            base_url: "launcher/game/G152/10003/3.6.1/tok/zip/".to_string(),
+        };
+        assert_eq!(
+            resource_base(&res("Client/a.dll", 1, None), &patch_cfg),
+            patch_cfg.base_url
+        );
+        assert_eq!(
+            resource_base(&res("Client/a.dll", 1, Some("zip")), &patch_cfg),
+            "zip"
+        );
+    }
+
+    /// Regression: a patch manifest with no `fromFolder` (the live WuWa CN
+    /// hotfix manifest) must still plan its files, not report "up to date".
+    #[tokio::test]
+    async fn plan_covers_entries_without_from_folder() {
+        let dir = std::env::temp_dir().join(format!("kuro-plan-nofrom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        state::write_local_config(
+            &dir,
+            &LocalConfig {
+                version: "3.6.0".to_string(),
+                app_id: "10003".to_string(),
+                group: "default".to_string(),
+            },
+        )
+        .unwrap();
+
+        let patch_index = PatchIndex {
+            resource: vec![
+                res("Client/Binaries/Win64/a.dll", 100, None),
+                res("Client/Content/Paks/b.pak", 200, Some("zip")),
+            ],
+            delete_files: vec![],
+            group_infos: vec![],
+            apply_types: vec![],
+        };
+
+        let mgr = GameManager::open(dir.clone()).await.unwrap();
+        let plan = mgr.plan_from_patch_index(&patch_index, "3.6.0", "3.6.1");
+        assert_eq!(plan.full_files.len(), 2, "both entries must be planned");
+        assert_eq!(plan.total_bytes, 300);
+        assert!(plan.full_files.iter().all(|f| !f.local_ready));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

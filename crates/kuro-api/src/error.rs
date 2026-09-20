@@ -35,6 +35,9 @@ pub enum Error {
     #[error("patch error: {0}")]
     Patch(String),
 
+    #[error("manifest path `{0}` is unsafe (absolute, drive-qualified or escaping the install root)")]
+    UnsafePath(String),
+
     #[error("{0}")]
     TokenMissing(String),
 
