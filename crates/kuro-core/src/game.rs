@@ -150,7 +150,7 @@ impl GameManager {
             .iter()
             .find(|p| p.version == from_version)
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
-        let patch_index = self.api.fetch_patch_index(&cdn, patch_cfg).await?;
+        let patch_index = self.api.fetch_manifest(&cdn, &patch_cfg.index_file).await?;
 
         Ok(self.plan_from_patch_index(&patch_index, &from_version, &to_version))
     }
@@ -257,7 +257,7 @@ impl GameManager {
             .iter()
             .find(|p| p.version == plan.from_version)
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
-        let patch_index = self.api.fetch_patch_index(&cdn, patch_cfg).await?;
+        let patch_index = self.api.fetch_manifest(&cdn, &patch_cfg.index_file).await?;
         let res_by_dest: std::collections::HashMap<&str, &ResourceItem> = patch_index
             .resource
             .iter()
@@ -398,7 +398,7 @@ impl GameManager {
             .iter()
             .find(|p| p.version == from_version)
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
-        let patch_index = self.api.fetch_patch_index(&cdn, patch_cfg).await?;
+        let patch_index = self.api.fetch_manifest(&cdn, &patch_cfg.index_file).await?;
 
         self.apply_inner(&patch_index, &cdn, patch_cfg, &remote).await
     }
@@ -724,18 +724,7 @@ impl GameManager {
         let base = cfg.base_url.clone();
 
         // full index → md5s for the diff files
-        let full_index: PatchIndex = self
-            .http
-            .get(format!(
-                "{}/{}",
-                cdn.trim_end_matches('/'),
-                cfg.index_file.trim_start_matches('/')
-            ))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let full_index = self.api.fetch_manifest(&cdn, &cfg.index_file).await?;
         let md5_by_dest: HashMap<String, String> = full_index
             .resource
             .iter()
@@ -797,19 +786,7 @@ impl GameManager {
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let cdn = self.api.pick_cdn(&index)?.url.clone();
         let cfg = &index.default.config;
-        let url = format!(
-            "{}/{}",
-            cdn.trim_end_matches('/'),
-            cfg.index_file.trim_start_matches('/')
-        );
-        let full_index: PatchIndex = self
-            .http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let full_index = self.api.fetch_manifest(&cdn, &cfg.index_file).await?;
         self.sync_inner_with_progress(&full_index, &cdn, &cfg.base_url, tx)
             .await
     }

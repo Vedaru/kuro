@@ -42,9 +42,14 @@ impl ApiClient {
         Ok(nodes[nodes.len() - 1])
     }
 
-    /// Fetch the patch manifest for one source version.
-    pub async fn fetch_patch_index(&self, cdn_base: &str, patch: &PatchConfig) -> Result<PatchIndex> {
-        let url = format!("{}/{}", cdn_base.trim_end_matches('/'), patch.index_file.trim_start_matches('/'));
+    /// Fetch and validate a manifest (`PatchIndex` JSON) by its CDN-relative
+    /// path — either a full install manifest (`config.indexFile`) or one
+    /// source version's patch manifest (`patchConfig[].indexFile`).
+    ///
+    /// This is the only way a remote manifest should enter the process: it is
+    /// where `validate_manifest_paths` runs.
+    pub async fn fetch_manifest(&self, cdn_base: &str, index_file: &str) -> Result<PatchIndex> {
+        let url = format!("{}/{}", cdn_base.trim_end_matches('/'), index_file.trim_start_matches('/'));
         let body = self.http.get(&url).send().await?.error_for_status()?;
         let index: PatchIndex = body.json().await?;
         validate_manifest_paths(&index)?;
