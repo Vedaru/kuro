@@ -3,34 +3,62 @@
 # A push to master builds kuro here and republishes it to the Forgejo generic
 # registry as the per-tool bundle the ansible restore reads. This replaces the
 # workflow that used to re-tar whatever `kuro` was already installed on the
-# runner -- a snapshot of the laptop, not a build.
+# runner -- a snapshot of a machine, not a build.
 #
-# runs-on: vedaru-laptop is this laptop's own runner -- see
-# ~/.local/share/forgejo-runner, label `vedaru-laptop`, host backend. It runs on
-# the host rather than in a container, which is load-bearing twice over: the
-# build needs the rust toolchain under ~/.cargo, and publish.sh packages files
-# under the runner's own $HOME (select_kuro reads $HOME/.local/bin/kuro).
+# runs-on: vedaru-host is a runner on the Forgejo SERVER host, not on a laptop.
+# It is registered against this repo alone (repo-scoped registration token) and
+# runs as a systemd user unit in that host's /home/vedaru:
 #
-# NOT ubuntu-latest: the Forgejo server's runner claims that label too, so an
-# ubuntu-latest job races between the two hosts and can land on the server, in
-# an Alpine container with none of this host's /usr, /opt or ~/.local trees --
-# where the $HOME guard below would fail the job. The two hosts hold disjoint
-# labels on purpose (vedaru-laptop here, glibc on the server); see chezmoi
-# commit 0d96cb4, which made the split.
+#   ~/.local/bin/forgejo-runner                    v13.0.0, static; taken from
+#                                                  the runner image the server
+#                                                  already ran
+#                                                  (data.forgejo.org/forgejo/runner:13)
+#   ~/.local/share/forgejo-runner/config.yaml      labels: [vedaru-host:host]
+#   ~/.local/share/forgejo-runner/.runner          the registration
+#   ~/.config/systemd/user/forgejo-runner.service  enabled; linger is on, so it
+#                                                  starts at boot with no login
+#                                                  and restarts on failure
 #
-# A push here DOES refresh the installed copy: publish.sh selects from
-# ~/.local/bin, so staging the freshly built binary there is both the install
-# and the bundle input. The machine's tool staying in step with the pushed
-# source is the point.
+# The HOST backend is load-bearing: jobs run directly on the server as vedaru
+# rather than in a container, because the build needs the rust toolchain under
+# ~/.cargo (cargo 1.98.1 there) and publish.sh reads $HOME/.local/bin/kuro and
+# calls dpkg, strings, tar, zstd and python3 -- none of which an Alpine job
+# image has.
+#
+# The label is deliberately disjoint from the ones the containerised runner on
+# this same host claims (`ubuntu-latest`, `self-hosted`, `glibc`): those jobs
+# execute in an Alpine image with none of the host's /usr or ~/, so a shared
+# label would let a job race between the two runners and land in the one that
+# cannot build it.
+#
+# This role used to live on a laptop, under the label `vedaru-laptop`. That
+# runner was moved to this server on 2026-09-17 and removed the same evening,
+# which left every push after 2026-09-15 queued behind a label no online runner
+# claimed -- the v0.3.0 sync fix in 7aa70ed among them, which is why this file
+# moved to the same label as the sibling tools. The server is the right home for
+# it: it is always up, it has the toolchain, and it is the host the Forgejo
+# instance already runs on.
+#
+# Everything talks to the instance over loopback (127.0.0.1:3000), not
+# https://git.vedaru.cn. The public name resolves through Cloudflare, which
+# completes TCP on its IPv6 addresses and then drops the TLS ClientHello, and
+# which has answered 502/524 on the large PUTs publish.sh makes; the clone and
+# every upload used to carry a credential helper plus an http.curloptResolve
+# IPv4 pin to survive that. Same host, so the loopback hop is shorter and is the
+# only path that never leaves the machine. The credential helper itself stays:
+# the job still authenticates rather than relying on anonymous read.
 #
 # There is deliberately no actions/checkout step. The default action source is
 # github.com -- the one host this setup exists to avoid -- so the fetches below
-# clone over git, with the same per-command credential helper and IPv4 pin
-# bootstrap.sh uses.
+# clone over git from the local instance.
 #
 # Nothing is version-pinned: kuro's bundle version is the flat 1.0, replaced on
 # every publish (--replace), so the per-tool SHA256SUMS is the integrity anchor
 # rather than a version number.
+#
+# A push therefore refreshes the SERVER's ~/.local/bin/kuro and the published
+# bundle. A laptop running kuro picks the change up from the bundle on its next
+# ansible restore, not from this job.
 
 name: Build and publish kuro package
 
@@ -41,24 +69,18 @@ on:
 
 jobs:
   package:
-    runs-on: vedaru-laptop
+    runs-on: vedaru-host
     steps:
       - name: Fetch the chezmoi repo (publish.sh and MANIFEST.md only)
         env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
         run: |
           set -euo pipefail
-          # Cloudflare completes TCP on its IPv6 addresses and then drops the
-          # TLS ClientHello, and libcurl does not retry the next address after a
-          # TLS failure. http.curloptResolve (git >= 2.46) pins the name to one
-          # IPv4 address, with SNI and the certificate still valid.
-          ip=$(getent ahostsv4 git.vedaru.cn | awk 'NR==1 {print $1}')
           helper='!f() { echo "username=x"; printf "password=%s\n" "$FORGEJO_TOKEN"; }; f'
           rm -rf "$RUNNER_TEMP/chezmoi-src"
           git -c credential.helper= -c "credential.helper=$helper" \
-              -c "http.curloptResolve=git.vedaru.cn:443:$ip" \
               clone --quiet --depth 1 \
-              https://git.vedaru.cn/Vedaru/chezmoi.git "$RUNNER_TEMP/chezmoi-src"
+              http://127.0.0.1:3000/Vedaru/chezmoi.git "$RUNNER_TEMP/chezmoi-src"
 
       - name: Build kuro from source and stage it
         env:
@@ -75,14 +97,12 @@ jobs:
           # non-login, so put it on PATH explicitly rather than depend on that.
           export PATH="$HOME/.cargo/bin:$PATH"
           command -v cargo >/dev/null || { echo "cargo not on PATH" >&2; exit 1; }
-          ip=$(getent ahostsv4 git.vedaru.cn | awk 'NR==1 {print $1}')
           helper='!f() { echo "username=x"; printf "password=%s\n" "$FORGEJO_TOKEN"; }; f'
           src="$RUNNER_TEMP/kuro-src"
           rm -rf "$src"
           git -c credential.helper= -c "credential.helper=$helper" \
-              -c "http.curloptResolve=git.vedaru.cn:443:$ip" \
               clone --quiet --depth 1 \
-              https://git.vedaru.cn/Vedaru/kuro.git "$src"
+              http://127.0.0.1:3000/Vedaru/kuro.git "$src"
           echo "building kuro at $(git -C "$src" rev-parse --short HEAD)"
           # Not --locked: the committed Cargo.lock is honored anyway, and a lock
           # that has drifted from Cargo.toml should not be the thing that
@@ -100,6 +120,7 @@ jobs:
       - name: Publish the kuro package
         env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          FORGEJO_URL: http://127.0.0.1:3000
           OUT_DIR: ${{ runner.temp }}/vendored-build
         run: |
           set -euo pipefail
@@ -140,8 +161,8 @@ jobs:
           echo "published $built; restore pin says $pinned"
 
           listing="$RUNNER_TEMP/kuro-packages.json"
-          curl -4 -fsSL -H "Authorization: token $FORGEJO_TOKEN" \
-               "https://git.vedaru.cn/api/v1/packages/Vedaru?type=generic&q=kuro&limit=50" \
+          curl -fsSL -H "Authorization: token $FORGEJO_TOKEN" \
+               "http://127.0.0.1:3000/api/v1/packages/Vedaru?type=generic&q=kuro&limit=50" \
                > "$listing"
           versions=$(python3 - "$listing" <<'PY'
           import json, sys
@@ -156,9 +177,9 @@ jobs:
               echo "  keep   kuro $v"
               kept=$((kept + 1))
             else
-              code=$(curl -4 -sS -o /dev/null -w '%{http_code}' -X DELETE \
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
                      -H "Authorization: token $FORGEJO_TOKEN" \
-                     "https://git.vedaru.cn/api/v1/packages/Vedaru/generic/kuro/$v")
+                     "http://127.0.0.1:3000/api/v1/packages/Vedaru/generic/kuro/$v")
               echo "  delete kuro $v -> HTTP $code"
             fi
           done
