@@ -795,7 +795,12 @@ fn ui(f: &mut Frame, state: &UiState) {
                 Line::raw(format!("files done: {}   queued: {}", t.done, t.queued)),
             ];
             if t.total_bytes > 0 {
-                v.push(Line::raw(bar_line("overall", t.done_bytes, t.total_bytes, 34)));
+                // Include in-flight bytes: `done_bytes` only moves on GroupDone
+                // (a whole file), so the overall bar used to sit still for the
+                // entire duration of one file and jump when it landed.
+                let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
+                let shown = (t.done_bytes + in_flight).min(t.total_bytes);
+                v.push(Line::raw(bar_line("overall", shown, t.total_bytes, 34)));
             }
             for f in t.files.iter().take(8) {
                 let name = shorten(&f.name, 42);

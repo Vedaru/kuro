@@ -71,7 +71,7 @@ async fn install_flow_writes_config_and_downloads_everything() {
     assert_eq!(format!("{}", mgr.server), "global");
 
     let report = mgr
-        .sync_inner(&full_index(file_a, file_b), &server, "zip")
+        .sync_inner(&full_index(file_a, file_b), &[server.as_str()], "zip")
         .await
         .unwrap();
     assert_eq!(report.checked, 2);

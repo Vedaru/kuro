@@ -6,9 +6,10 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod retry;
 pub mod types;
 
-pub use client::ApiClient;
+pub use client::{build_client, ApiClient};
 pub use config::{game_server_by_app_id, index_url, server_entry, servers, Game, Server, ServerEntry};
 pub use error::{Error, Result};
 pub use types::{

@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use kuro_api::config::ServerEntry;
 use kuro_api::{
-    game_server_by_app_id, index_url, server_entry, ApiClient, ChunkInfo, Error, FileRef, Game,
-    GroupInfo, LocalConfig, PatchConfig, PatchIndex, ResourceItem, Server, Result,
+    build_client, game_server_by_app_id, index_url, server_entry, ApiClient, ChunkInfo, Error,
+    FileRef, Game, GroupInfo, LauncherIndex, LocalConfig, PatchConfig, PatchIndex, ResourceItem,
+    Server, Result,
 };
 
 use crate::atomic::{recover_backup, safe_replace};
@@ -59,7 +60,12 @@ pub struct GameStatus {
     pub update_available: bool,
 }
 
-const CHUNK_CONCURRENCY: usize = 32;
+/// Parallel range requests per file. Kept modest on purpose: at 32, a single
+/// 4 MiB ranged GET against the Kuro CDN was measured at 52.3s while its
+/// peers finished in 2.8–8.4s — the fan-out itself provokes the stalls, and
+/// each stalled connection then blocks the file. With `REPAIR_FILE_CONCURRENCY`
+/// files in flight this bounds peak concurrent connections at 32.
+const CHUNK_CONCURRENCY: usize = 8;
 /// CN 3.6.0 manifests carry no chunkInfos — synthesize fixed-size ranges so
 /// large paks download over parallel connections (CDNs rate-limit per conn).
 const SYNTH_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
@@ -86,9 +92,7 @@ impl GameManager {
         let (game, server) =
             game_server_by_app_id(&cfg.app_id).ok_or_else(|| Error::UnknownAppId(cfg.app_id.clone()))?;
         let api = ApiClient::new()?;
-        let http = reqwest::Client::builder()
-            .user_agent("kuro/0.1 (+https://github.com/vedaru/kuro)")
-            .build()?;
+        let http = build_client()?;
         Ok(Self {
             game_folder,
             game,
@@ -129,7 +133,7 @@ impl GameManager {
         let from_version = cfg;
 
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
-        let cdn = self.api.pick_cdn(&index)?.url.clone();
+        let nodes = cdn_nodes(&self.api, &index)?;
         let to_version = index.default.version.clone();
 
         // already up to date — nothing to plan
@@ -150,7 +154,7 @@ impl GameManager {
             .iter()
             .find(|p| p.version == from_version)
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
-        let patch_index = self.api.fetch_manifest(&cdn, &patch_cfg.index_file).await?;
+        let patch_index = self.api.fetch_manifest(&nodes, &patch_cfg.index_file).await?;
 
         Ok(self.plan_from_patch_index(&patch_index, &from_version, &to_version))
     }
@@ -238,7 +242,7 @@ impl GameManager {
             )))
             .await;
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
-        let cdn = self.api.pick_cdn(&index)?.url.clone();
+        let nodes = cdn_nodes(&self.api, &index)?;
 
         let dir = incremental_dir(&self.game_folder);
         std::fs::create_dir_all(&dir)?;
@@ -257,7 +261,7 @@ impl GameManager {
             .iter()
             .find(|p| p.version == plan.from_version)
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
-        let patch_index = self.api.fetch_manifest(&cdn, &patch_cfg.index_file).await?;
+        let patch_index = self.api.fetch_manifest(&nodes, &patch_cfg.index_file).await?;
         let res_by_dest: std::collections::HashMap<&str, &ResourceItem> = patch_index
             .resource
             .iter()
@@ -280,12 +284,12 @@ impl GameManager {
                     total: group.size,
                 })
                 .await;
-            let url = ApiClient::krpdiff_url(&cdn, patch_cfg, &group.name);
+            let urls = node_urls(&nodes, |base| ApiClient::krpdiff_url(base, patch_cfg, &group.name));
             let staged = state::staged_patch_path(&self.game_folder, &group.name);
             let tmp = tmp_sibling(&staged, "krpdiff");
             download_single(
                 &self.http,
-                &url,
+                &urls,
                 &tmp,
                 Some(group.size),
                 None,
@@ -322,7 +326,7 @@ impl GameManager {
                 .get(item.name.as_str())
                 .ok_or_else(|| Error::MissingField("resource entry"))?;
             let from = resource_base(res, patch_cfg);
-            let url = ApiClient::resource_url(&cdn, &from, &res.dest);
+            let urls = node_urls(&nodes, |base| ApiClient::resource_url(base, &from, &res.dest));
             let staged = state::staged_resource_path(&self.game_folder, &res.dest);
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = tmp_sibling(&staged, "dl");
@@ -344,7 +348,7 @@ impl GameManager {
             if chunk_infos.is_empty() {
                 download_single(
                     &self.http,
-                    &url,
+                    &urls,
                     &tmp,
                     Some(res.size),
                     Some(&res.md5),
@@ -355,7 +359,7 @@ impl GameManager {
             } else {
                 download_chunked(
                     &self.http,
-                    &url,
+                    &urls,
                     &tmp,
                     &chunk_infos,
                     Some(&res.md5),
@@ -390,7 +394,7 @@ impl GameManager {
         if remote == from_version {
             return Ok(ApplyReport::default()); // nothing to do
         }
-        let cdn = self.api.pick_cdn(&index)?.url.clone();
+        let nodes = cdn_nodes(&self.api, &index)?;
         let patch_cfg = index
             .default
             .config
@@ -398,9 +402,9 @@ impl GameManager {
             .iter()
             .find(|p| p.version == from_version)
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
-        let patch_index = self.api.fetch_manifest(&cdn, &patch_cfg.index_file).await?;
+        let patch_index = self.api.fetch_manifest(&nodes, &patch_cfg.index_file).await?;
 
-        self.apply_inner(&patch_index, &cdn, patch_cfg, &remote).await
+        self.apply_inner(&patch_index, &nodes, patch_cfg, &remote).await
     }
 
     /// The apply pipeline, testable with a synthetic `PatchIndex`.
@@ -416,7 +420,7 @@ impl GameManager {
     pub async fn apply_inner(
         &self,
         patch_index: &PatchIndex,
-        cdn: &str,
+        cdn_nodes: &[&str],
         patch_cfg: &PatchConfig,
         to_version: &str,
     ) -> Result<ApplyReport> {
@@ -477,24 +481,25 @@ impl GameManager {
                 continue;
             }
             let res = res_by_dest.get(&dst.dest);
-            let (url, chunks, md5) = match res {
+            let (from, chunks, md5) = match res {
                 Some(r) if r.from_folder.is_some() => (
-                    ApiClient::resource_url(cdn, r.from_folder.as_deref().unwrap(), &dst.dest),
+                    r.from_folder.clone().unwrap(),
                     r.chunk_infos.clone(),
                     r.md5.clone(),
                 ),
                 _ => {
                     // fall back to the patch's zip base
-                    (ApiClient::resource_url(cdn, &patch_cfg.base_url, &dst.dest), vec![], String::new())
+                    (patch_cfg.base_url.clone(), vec![], String::new())
                 }
             };
+            let urls = node_urls(cdn_nodes, |base| ApiClient::resource_url(base, &from, &dst.dest));
             let staged = state::staged_patch_path(&self.game_folder, &dst.dest);
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = tmp_sibling(&staged, "dl");
             if chunks.is_empty() {
                 download_single(
                     &self.http,
-                    &url,
+                    &urls,
                     &tmp,
                     Some(dst.size),
                     Some(&dst.md5),
@@ -505,7 +510,7 @@ impl GameManager {
             } else {
                 download_chunked(
                     &self.http,
-                    &url,
+                    &urls,
                     &tmp,
                     &chunks,
                     Some(&md5),
@@ -718,13 +723,13 @@ impl GameManager {
         };
 
         let index = self.api.fetch_index(&api_url).await?;
-        let cdn = self.api.pick_cdn(&index)?.url.clone();
+        let nodes = cdn_nodes(&self.api, &index)?;
         let cfg = &index.default.config;
         let to_version = cfg.version.clone();
         let base = cfg.base_url.clone();
 
         // full index → md5s for the diff files
-        let full_index = self.api.fetch_manifest(&cdn, &cfg.index_file).await?;
+        let full_index = self.api.fetch_manifest(&nodes, &cfg.index_file).await?;
         let md5_by_dest: HashMap<String, String> = full_index
             .resource
             .iter()
@@ -736,13 +741,13 @@ impl GameManager {
             let Some(expected_md5) = md5_by_dest.get(*f) else {
                 continue;
             };
-            let url = ApiClient::resource_url(&cdn, &base, f);
+            let urls = node_urls(&nodes, |n| ApiClient::resource_url(n, &base, f));
             let game_path = self.game_folder.join(f.trim_start_matches('/'));
             std::fs::create_dir_all(game_path.parent().unwrap())?;
             let tmp = game_path.with_extension("checkout.tmp");
             download_single(
                 &self.http,
-                &url,
+                &urls,
                 &tmp,
                 None,
                 Some(expected_md5),
@@ -784,10 +789,10 @@ impl GameManager {
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<SyncReport> {
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
-        let cdn = self.api.pick_cdn(&index)?.url.clone();
+        let nodes = cdn_nodes(&self.api, &index)?;
         let cfg = &index.default.config;
-        let full_index = self.api.fetch_manifest(&cdn, &cfg.index_file).await?;
-        self.sync_inner_with_progress(&full_index, &cdn, &cfg.base_url, tx)
+        let full_index = self.api.fetch_manifest(&nodes, &cfg.index_file).await?;
+        self.sync_inner_with_progress(&full_index, &nodes, &cfg.base_url, tx)
             .await
     }
 
@@ -795,17 +800,17 @@ impl GameManager {
     pub async fn sync_inner(
         &self,
         full_index: &PatchIndex,
-        cdn: &str,
+        cdn_nodes: &[&str],
         base: &str,
     ) -> Result<SyncReport> {
-        self.sync_inner_with_progress(full_index, cdn, base, None).await
+        self.sync_inner_with_progress(full_index, cdn_nodes, base, None).await
     }
 
     /// Sync core with progress events.
     pub async fn sync_inner_with_progress(
         &self,
         full_index: &PatchIndex,
-        cdn: &str,
+        cdn_nodes: &[&str],
         base: &str,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<SyncReport> {
@@ -897,17 +902,18 @@ impl GameManager {
         }
         let sem = Arc::new(tokio::sync::Semaphore::new(REPAIR_FILE_CONCURRENCY));
         let mut handles = tokio::task::JoinSet::new();
+        let cdn_nodes: Arc<Vec<String>> = Arc::new(cdn_nodes.iter().map(|s| s.to_string()).collect());
         for item in to_fix {
             let sem = sem.clone();
             let http = self.http.clone();
             let game_folder = self.game_folder.clone();
-            let cdn = cdn.to_string();
+            let cdn_nodes = cdn_nodes.clone();
             let base = base.to_string();
             let tx = tx.clone();
             handles.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
-                let url = ApiClient::resource_url(&cdn, &from, &item.dest);
+                let urls = node_urls(&cdn_nodes, |n| ApiClient::resource_url(n, &from, &item.dest));
                 let game_path = game_folder.join(normalise_dest(&item.dest));
                 std::fs::create_dir_all(game_path.parent().unwrap())?;
                 let tmp = tmp_sibling(&game_path, "sync");
@@ -929,7 +935,7 @@ impl GameManager {
                 if chunk_infos.is_empty() {
                     download_single(
                         &http,
-                        &url,
+                        &urls,
                         &tmp,
                         Some(item.size),
                         Some(&item.md5),
@@ -940,7 +946,7 @@ impl GameManager {
                 } else {
                     download_chunked(
                         &http,
-                        &url,
+                        &urls,
                         &tmp,
                         &chunk_infos,
                         Some(&item.md5),
@@ -1187,6 +1193,24 @@ fn resource_base(res: &ResourceItem, patch_cfg: &PatchConfig) -> String {
     res.from_folder
         .clone()
         .unwrap_or_else(|| patch_cfg.base_url.clone())
+}
+
+/// CDN base URLs to try for this run, best edge first (borrows from `index`).
+fn cdn_nodes<'a>(api: &ApiClient, index: &'a LauncherIndex) -> Result<Vec<&'a str>> {
+    Ok(api
+        .cdn_candidates(index)?
+        .iter()
+        .map(|n| n.url.as_str())
+        .collect())
+}
+
+/// Build one resource's URL on every candidate CDN edge, best first.
+///
+/// The download primitives take this list and fail over to the next edge when
+/// one stalls, so a request is never pinned to the single node that was picked
+/// when the operation started.
+fn node_urls<S: AsRef<str>>(nodes: &[S], build: impl Fn(&str) -> String) -> Vec<String> {
+    nodes.iter().map(|n| build(n.as_ref())).collect()
 }
 
 fn file_matches(path: &Path, size: u64, md5: &str) -> bool {

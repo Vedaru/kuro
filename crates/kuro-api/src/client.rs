@@ -1,8 +1,31 @@
 //! HTTP client for the Kuro launcher API.
 
 use crate::error::{Error, Result};
+use crate::retry;
 use crate::types::{CdnNode, LauncherIndex, PatchConfig, PatchIndex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Bound on the connect + TLS handshake. A stalled edge handshake was
+/// measured at >6s; 10s leaves room for slow links while still failing fast
+/// enough to retry.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on the gap between two successful reads, not the whole transfer: a
+/// 26 GiB pak is a legitimate multi-hour download, but no single read should
+/// stall for a minute.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Build the process-wide HTTP client, with the transport tuning above.
+///
+/// Both `kuro-api` and `kuro-core` build their clients here so there is one
+/// place that decides how long kuro waits before giving up on a connection.
+pub fn build_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent("kuro/0.1 (+https://github.com/vedaru/kuro)")
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()?)
+}
 
 /// Thin wrapper over `reqwest` with the Kuro-specific URL builders.
 #[derive(Debug, Clone)]
@@ -12,16 +35,23 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new() -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent("kuro/0.1 (+https://github.com/vedaru/kuro)")
-            .build()?;
+        let http = build_client()?;
         Ok(Self { http })
     }
 
-    /// Fetch the launcher entry point (`index.json`).
+    /// Fetch the launcher entry point (`index.json`), retrying transient
+    /// transport failures. Decoding happens outside the retry loop so a
+    /// malformed body surfaces as `Error::Json` instead of being re-fetched.
     pub async fn fetch_index(&self, api_url: &str) -> Result<LauncherIndex> {
-        let body = self.http.get(api_url).send().await?.error_for_status()?;
-        Ok(body.json::<LauncherIndex>().await?)
+        let client = &self.http;
+        let bytes = retry::retry(retry::ATTEMPTS, |_| {
+            Box::pin(async move {
+                let resp = client.get(api_url).send().await?.error_for_status()?;
+                Ok(resp.bytes().await?)
+            })
+        })
+        .await?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     /// Pick a CDN node from `cdnList`, weighted by `P` (0 = excluded).
@@ -42,16 +72,49 @@ impl ApiClient {
         Ok(nodes[nodes.len() - 1])
     }
 
+    /// Every usable CDN node, best first: the weighted pick, then the rest by
+    /// descending weight.
+    ///
+    /// A download is pinned to whichever node was picked when the operation
+    /// started, so when that edge stalls there is no way out but to fail the
+    /// whole run. Carrying the full candidate list lets each request fall over
+    /// to the next edge.
+    pub fn cdn_candidates<'a>(&self, index: &'a LauncherIndex) -> Result<Vec<&'a CdnNode>> {
+        let primary = self.pick_cdn(index)?;
+        let mut rest: Vec<&CdnNode> = index
+            .default
+            .cdn_list
+            .iter()
+            .filter(|n| n.p > 0 && !std::ptr::eq(*n, primary))
+            .collect();
+        rest.sort_by(|a, b| b.p.cmp(&a.p));
+        let mut out = Vec::with_capacity(rest.len() + 1);
+        out.push(primary);
+        out.extend(rest);
+        Ok(out)
+    }
+
     /// Fetch and validate a manifest (`PatchIndex` JSON) by its CDN-relative
     /// path — either a full install manifest (`config.indexFile`) or one
-    /// source version's patch manifest (`patchConfig[].indexFile`).
+    /// source version's patch manifest (`patchConfig[].indexFile`). The first
+    /// candidate base that serves it wins.
     ///
     /// This is the only way a remote manifest should enter the process: it is
     /// where `validate_manifest_paths` runs.
-    pub async fn fetch_manifest(&self, cdn_base: &str, index_file: &str) -> Result<PatchIndex> {
-        let url = format!("{}/{}", cdn_base.trim_end_matches('/'), index_file.trim_start_matches('/'));
-        let body = self.http.get(&url).send().await?.error_for_status()?;
-        let index: PatchIndex = body.json().await?;
+    pub async fn fetch_manifest(&self, cdn_bases: &[&str], index_file: &str) -> Result<PatchIndex> {
+        let urls: Vec<String> = cdn_bases
+            .iter()
+            .map(|base| format!("{}/{}", base.trim_end_matches('/'), index_file.trim_start_matches('/')))
+            .collect();
+        let client = &self.http;
+        let bytes = retry::retry_across(&urls, |url, _| {
+            Box::pin(async move {
+                let resp = client.get(url).send().await?.error_for_status()?;
+                Ok(resp.bytes().await?)
+            })
+        })
+        .await?;
+        let index: PatchIndex = serde_json::from_slice(&bytes)?;
         validate_manifest_paths(&index)?;
         Ok(index)
     }

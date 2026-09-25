@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("HTTP request failed: {0}")]
+    #[error("HTTP request failed: {}", http_chain(.0))]
     Http(#[from] reqwest::Error),
 
     #[error("JSON parse failed: {0}")]
@@ -46,3 +46,21 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Flatten a `reqwest::Error`'s `source()` chain into the message.
+///
+/// `reqwest::Error`'s own `Display` is often just `error sending request for
+/// url (…)`; the reason (DNS failure, connect timeout, TLS alert, body error)
+/// is one or two `source()` hops down. Without this the report is
+/// unactionable, which is what made a real CDN stall look like a mystery.
+fn http_chain(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
+}

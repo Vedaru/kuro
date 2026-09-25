@@ -74,7 +74,7 @@ async fn sync_repairs_missing_and_bad_files() {
     };
 
     let mgr = GameManager::open(game.clone()).await.unwrap();
-    let report = mgr.sync_inner(&full_index, &server, "zip").await.unwrap();
+    let report = mgr.sync_inner(&full_index, &[server.as_str()], "zip").await.unwrap();
 
     assert_eq!(report.checked, 3);
     assert_eq!(report.ok, 1, "only fileC was intact");
@@ -165,7 +165,7 @@ async fn sync_removes_files_not_in_manifest() {
     };
 
     let mgr = GameManager::open(game.clone()).await.unwrap();
-    let report = mgr.sync_inner(&full_index, &server, "zip").await.unwrap();
+    let report = mgr.sync_inner(&full_index, &[server.as_str()], "zip").await.unwrap();
 
     assert_eq!(report.checked, 1, "only manifest files are verified");
     assert_eq!(report.ok, 1);

@@ -117,7 +117,7 @@ async fn apply_merges_verifies_swaps_and_cleans() {
 
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let report = mgr
-        .apply_inner(&patch_index, "https://cdn.invalid", &patch_cfg, "1.0.0")
+        .apply_inner(&patch_index, &["https://cdn.invalid"], &patch_cfg, "1.0.0")
         .await
         .unwrap();
 
@@ -183,7 +183,7 @@ async fn apply_refuses_to_record_a_version_it_did_not_install() {
     let err = mgr
         .apply_inner(
             &patch_index,
-            "https://cdn.invalid",
+            &["https://cdn.invalid"],
             &PatchConfig {
                 version: "0.9.0".to_string(),
                 index_file: String::new(),
@@ -224,7 +224,7 @@ async fn apply_without_predownload_errors_cleanly() {
                 group_infos: vec![],
                 apply_types: vec![],
             },
-            "https://cdn.invalid",
+            &["https://cdn.invalid"],
             &PatchConfig {
                 version: "0.9.0".to_string(),
                 index_file: String::new(),
