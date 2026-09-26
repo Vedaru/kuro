@@ -1,0 +1,19 @@
+[package]
+name = "hdiffpatch-rs"
+description = "Rust implementation of HDiffPatch with bit of extra sauce"
+authors = ["TukanDev"]
+version = "2.0.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1.8.5"
+bzip2 = "0.6.1"
+crc32fast = "1.5.0"
+digest = "0.11.3"
+flate2 = "1.1.9"
+liblzma = "0.4.7"
+md-5 = "0.11.0"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+zstd = "0.13.3"

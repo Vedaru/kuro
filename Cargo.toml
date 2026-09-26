@@ -6,6 +6,9 @@ members = [
     "crates/kuro-core",
     "crates/kuro-tui",
 ]
+# The vendored third-party crate is a path dependency of kuro-patch, not a
+# workspace member — keep its test suite out of `cargo test` at the root.
+exclude = ["vendor/hdiffpatch-rs"]
 
 [workspace.package]
 version = "0.3.0"

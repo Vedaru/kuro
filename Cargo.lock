@@ -872,7 +872,6 @@ dependencies = [
 [[package]]
 name = "hdiffpatch-rs"
 version = "2.0.0"
-source = "git+https://github.com/TwintailTeam/hdiffpatch-rs?branch=master#d58f4553b7d45acccd0b8e3b57badc26b9b04b6e"
 dependencies = [
  "blake3",
  "bzip2",

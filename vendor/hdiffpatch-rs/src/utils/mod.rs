@@ -1,0 +1,10 @@
+pub(crate) mod binary;
+pub(crate) mod checksum;
+pub(crate) mod compression;
+pub(crate) mod create;
+pub(crate) mod diff_info;
+pub(crate) mod fadler_tables;
+pub(crate) mod header;
+pub(crate) mod mt;
+pub(crate) mod patch;
+pub(crate) mod types;

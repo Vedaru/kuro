@@ -6,7 +6,10 @@ license.workspace = true
 description = "KrDiff / HDiff patch application for Kuro Games client updates (native, no wine)"
 
 [dependencies]
-hdiffpatch-rs = { git = "https://github.com/TwintailTeam/hdiffpatch-rs", branch = "master", version = "2.0.0" }
+# Vendored from github.com/TwintailTeam/hdiffpatch-rs at d58f4553 (master,
+# v2.0.0) — the build host has no github access and the crate is not on
+# crates.io, so the pinned source ships in-tree instead of being fetched.
+hdiffpatch-rs = { path = "../../vendor/hdiffpatch-rs", version = "2.0.0" }
 kuro-api.workspace = true
 md5 = "0.8.1"
 rayon = "1.12.0"
