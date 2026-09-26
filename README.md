@@ -52,18 +52,19 @@ the wine dependency is removed by applying patches via
 | Game | CN 官服 | Bilibili | Global |
 |------|---------|----------|--------|
 | Wuthering Waves (G152/G153) | ✅ | ✅ | ✅ |
-| Punishing: Gray Raven (G143/G148) | ⏳ token pending | — | ✅ |
+| Punishing: Gray Raven (G143/G148) | ✅ token | — | ✅ |
 
 ## Tokens
 
 WuWa's launcher tokens are public and stable (same ones `ww-manager` ships), so
-they're compiled in. **PGR's global token is runtime-only** — it rotates, so it
-lives in `~/.config/kuro/tokens.toml` (or `KURO_PGR_GLOBAL_TOKEN`), never in
-the binary:
+they're compiled in. **PGR's tokens are runtime-only** — they rotate, so they
+live in `~/.config/kuro/tokens.toml` (or `KURO_PGR_GLOBAL_TOKEN` /
+`KURO_PGR_CN_TOKEN`), never in the binary:
 
 ```toml
 [pgr]
 global = "…token from the launcher's WebView2 storage on a Windows install…"
+cn = "…same, from a CN launcher install's cache…"
 ```
 
 When PGR status starts failing (stale token), re-copy it from a real launcher
@@ -167,7 +168,11 @@ cargo run -p kuro-core --example pgr_proof   # live CDN smoke test (PGR)
 
 ## Known limitations
 
-- PGR CN (`G148`) launcher token not yet recovered (private SDK runtime flow)
+- PGR launcher tokens rotate and are issued by Kuro's private launcher SDK at
+  runtime — kuro cannot fetch them (yet), so both PGR servers need a token you
+  supply yourself (`~/.config/kuro/tokens.toml`, see Tokens). PGR CN's CDN host
+  is derived from the shared launcher platform, not yet confirmed against a
+  live session
 - ACE anti-cheat doesn't run under Proton (see above)
 - No persistent MD5 cache yet — sync re-hashes the tree each run (fast on NVMe)
 - The CDN manifest describes the base client only, so it is **not** an inventory

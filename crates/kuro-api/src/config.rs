@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 pub enum Game {
     /// Wuthering Waves (鸣潮)
     WuWa,
-    /// Punishing: Gray Raven (战双帕弥什) — endpoints TBD (discovery spike).
+    /// Punishing: Gray Raven (战双帕弥什) — token resolved at runtime by [`index_url`].
     Pgr,
 }
 
@@ -110,7 +110,8 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
             (
                 "cn",
                 ServerEntry {
-                    api_url: "https://TODO/pgr-cn-index.json", // CN token TBD (launcher SDK runtime flow)
+                    // Token is runtime-only (env / tokens file) — see index_url().
+                    api_url: "",
                     app_id: "10012",
                     diff_files: &[],
                 },
@@ -128,7 +129,9 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
 /// [`index_url`] (env var or `~/.config/kuro/tokens.toml`). Current game
 /// version: 4.7.0.
 ///
-/// CN (G148) still needs its token (runtime SDK flow; see README).
+/// CN (G148) resolves its token at runtime like global — it is issued by
+/// Kuro's private launcher SDK and rotates, so supply `KURO_PGR_CN_TOKEN`
+/// or `[pgr] cn` in the tokens file (see README).
 pub mod pgr_meta {
     /// Global game platform id.
     pub const GAME_ID_GLOBAL: &str = "G143";
@@ -144,13 +147,16 @@ pub mod pgr_meta {
         "https://prod-volcdn-gamestarter.kurogame.net",
         "https://prod-tencentcdn-gamestarter.kurogame.net",
     ];
+    /// CN launcher-platform host (the host WuWa CN's G152 lives on).
+    pub const CDN_BASE_CN: &str = "https://prod-cn-alicdn-gamestarter.kurogame.com";
 }
 
 /// Resolve the launcher index URL for a game/server.
 ///
 /// WuWa's tokens are public and stable (shipped by ww-manager too), so they
-/// stay static. PGR's global token is runtime-only — `KURO_PGR_GLOBAL_TOKEN`
-/// env var first, then `~/.config/kuro/tokens.toml` (`[pgr] global = "..."`).
+/// stay static. PGR's tokens are runtime-only — `KURO_PGR_GLOBAL_TOKEN` /
+/// `KURO_PGR_CN_TOKEN` env var first, then `~/.config/kuro/tokens.toml`
+/// (`[pgr] global = "..."` / `[pgr] cn = "..."`).
 pub fn index_url(game: Game, server: Server) -> Result<String> {
     match (game, server) {
         (Game::WuWa, server) => {
@@ -158,33 +164,41 @@ pub fn index_url(game: Game, server: Server) -> Result<String> {
                 .ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
             Ok(entry.api_url.to_string())
         }
-        (Game::Pgr, Server::Global) => Ok(format!(
-            "{}/launcher/game/G143/50015_{}/index.json",
-            pgr_meta::CDN_BASES_GLOBAL[0],
-            pgr_global_token()?
-        )),
-        (Game::Pgr, Server::Cn) => Err(Error::Unimplemented(
-            "PGR CN launcher token has not been recovered (private SDK runtime flow)",
-        )),
+        (Game::Pgr, Server::Global) => {
+            let token = pgr_token("KURO_PGR_GLOBAL_TOKEN", "pgr.global", "[pgr] global")?;
+            Ok(format!(
+                "{}/launcher/game/G143/50015_{token}/index.json",
+                pgr_meta::CDN_BASES_GLOBAL[0]
+            ))
+        }
+        (Game::Pgr, Server::Cn) => {
+            let token = pgr_token("KURO_PGR_CN_TOKEN", "pgr.cn", "[pgr] cn")?;
+            Ok(format!(
+                "{}/launcher/game/G148/10012_{token}/index.json",
+                pgr_meta::CDN_BASE_CN
+            ))
+        }
         _ => Err(Error::UnknownAppId(format!("{game}/{server}"))),
     }
 }
 
-/// PGR global launcher token: env var first, then the tokens file.
-fn pgr_global_token() -> Result<String> {
-    if let Ok(t) = std::env::var("KURO_PGR_GLOBAL_TOKEN") {
+/// PGR launcher token: env var first, then the tokens file. Never compiled
+/// in — PGR's launcher tokens are issued by Kuro's private launcher SDK at
+/// runtime and rotate, so each run resolves one instead of shipping it. A
+/// token copied from a real launcher install's cache works for either server.
+fn pgr_token(env: &str, file_key: &str, hint: &str) -> Result<String> {
+    if let Ok(t) = std::env::var(env) {
         if !t.is_empty() {
             return Ok(t);
         }
     }
-    if let Some(t) = read_tokens_file().and_then(|m| m.get("pgr.global").cloned()) {
+    if let Some(t) = read_tokens_file().and_then(|m| m.get(file_key).cloned()) {
         return Ok(t);
     }
-    Err(Error::TokenMissing(
-        "PGR global launcher token is not configured: set KURO_PGR_GLOBAL_TOKEN \
-         or add `[pgr] global = \"...\"` to ~/.config/kuro/tokens.toml"
-            .into(),
-    ))
+    Err(Error::TokenMissing(format!(
+        "PGR launcher token is not configured: set {env} \
+         or add `{hint} = \"...\"` to ~/.config/kuro/tokens.toml"
+    )))
 }
 
 /// Minimal reader for the tokens file (`~/.config/kuro/tokens.toml`).
