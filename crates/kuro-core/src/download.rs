@@ -13,14 +13,60 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::game::ProgressEvent;
 use kuro_api::retry;
 use kuro_api::{ChunkInfo, Error, Result};
 
+/// Process-wide ceiling on in-flight HTTP requests, one permit per open
+/// connection.
+///
+/// The Kuro CDN throttles per *connection*: measured 2026-09, a single edge
+/// streamed ~0.05–0.10 MB/s no matter how fast the client's link was, while N
+/// parallel ranges scaled almost linearly (8 connections ≈ 0.6 MB/s against a
+/// ~0.8 MB/s machine ceiling). So throughput comes from concurrency, but past
+/// a point the fan-out itself provokes stalls — a 16-way batch left requests
+/// hanging for minutes, and a documented 32-way fan-out stalled a 4 MiB GET
+/// for 52.3s.
+///
+/// The budget is shared by *every* download in a run rather than handed out
+/// per file. A big pak fans its ranges out into the same pool small files draw
+/// from, so when a range finishes and a small file has nothing else to do, it
+/// takes the freed slot instead of the tail of one file leaving the link idle
+/// while the next file waits its turn.
+#[derive(Clone, Default)]
+pub struct Budget(Option<Arc<Semaphore>>);
+
+impl Budget {
+    /// A budget of `permits` concurrent requests.
+    pub fn new(permits: usize) -> Self {
+        Self(Some(Arc::new(Semaphore::new(permits.max(1)))))
+    }
+
+    /// No ceiling — used by tests and callers that manage their own.
+    pub fn unlimited() -> Self {
+        Self(None)
+    }
+
+    /// Take one slot, held until the returned permit is dropped.
+    async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+        match &self.0 {
+            Some(sem) => Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .expect("download budget semaphore is never closed"),
+            ),
+            None => None,
+        }
+    }
+}
+
 /// Download a whole file to `dest` (temp file semantics: caller renames on
 /// success). Verifies size and MD5 when provided. Emits per-file progress if
 /// a sender is given.
+#[allow(clippy::too_many_arguments)]
 pub async fn download_single(
     client: &reqwest::Client,
     urls: &[String],
@@ -29,6 +75,7 @@ pub async fn download_single(
     expected_md5: Option<&str>,
     name: &str,
     progress: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
+    budget: &Budget,
 ) -> Result<()> {
     retry::retry_across(urls, |url, _| {
         Box::pin(download_single_once(
@@ -39,6 +86,7 @@ pub async fn download_single(
             expected_md5,
             name,
             progress,
+            budget,
         ))
     })
     .await
@@ -47,6 +95,7 @@ pub async fn download_single(
 /// One complete attempt: fetch, stream to `dest`, verify. Written as a single
 /// unit so that a truncated body (caught by the hash check) is retried too.
 /// `File::create` truncates, so a retry never appends to a partial file.
+#[allow(clippy::too_many_arguments)]
 async fn download_single_once(
     client: &reqwest::Client,
     url: &str,
@@ -55,7 +104,10 @@ async fn download_single_once(
     expected_md5: Option<&str>,
     name: &str,
     progress: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
+    budget: &Budget,
 ) -> Result<()> {
+    // Held for the whole streamed body, released before a retry backs off.
+    let _permit = budget.acquire().await;
     let resp = client.get(url).send().await?.error_for_status()?;
     let total = expected_size.or_else(|| resp.content_length()).unwrap_or(0);
     if let Some(tx) = progress {
@@ -96,6 +148,7 @@ async fn download_single_once(
 /// Download a file in parallel byte ranges (`chunkInfos` from the manifest).
 /// Each chunk is fetched with a `Range` header and written at its offset;
 /// every chunk's MD5 is checked, then the whole file's size/MD5 if given.
+#[allow(clippy::too_many_arguments)]
 pub async fn download_chunked(
     client: &reqwest::Client,
     urls: &[String],
@@ -105,6 +158,7 @@ pub async fn download_chunked(
     concurrency: usize,
     name: &str,
     progress: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
+    budget: &Budget,
 ) -> Result<()> {
     if chunks.is_empty() {
         return Err(Error::MissingField("chunkInfos"));
@@ -178,6 +232,7 @@ pub async fn download_chunked(
         let chunk = chunk.clone();
         let sem = sem.clone();
         let written = written.clone();
+        let budget = budget.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let range = format!("bytes={}-{}", chunk.start, chunk.end);
@@ -189,11 +244,16 @@ pub async fn download_chunked(
                 let url = url.to_string();
                 let client = client.clone();
                 let dest = dest.clone();
+                let budget = budget.clone();
                 let counter = &written[idx];
                 Box::pin(async move {
                     // Re-fetch overwrites the same region, so count from zero
                     // again rather than double-counting the retried bytes.
                     counter.store(0, Ordering::Relaxed);
+                    // One slot per in-flight range, from the shared pool: a
+                    // file's ranges compete with every other file's rather than
+                    // each file reserving its own.
+                    let _permit = budget.acquire().await;
                     let resp = client
                         .get(&url)
                         .header(reqwest::header::RANGE, range)
@@ -320,9 +380,18 @@ mod tests {
     async fn download_single_with_no_candidates_fails_cleanly() {
         let dir = temp_dir("nocand");
         let client = reqwest::Client::new();
-        let err = download_single(&client, &[], &dir.join("x.bin"), None, None, "x", None)
-            .await
-            .unwrap_err();
+        let err = download_single(
+            &client,
+            &[],
+            &dir.join("x.bin"),
+            None,
+            None,
+            "x",
+            None,
+            &Budget::unlimited(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, Error::NoCdnNode), "got {err:?}");
     }
 
@@ -335,9 +404,19 @@ mod tests {
             end: 3,
             md5: String::new(),
         }];
-        let err = download_chunked(&client, &[], &dir.join("x.bin"), &chunks, None, 2, "x", None)
-            .await
-            .unwrap_err();
+        let err = download_chunked(
+            &client,
+            &[],
+            &dir.join("x.bin"),
+            &chunks,
+            None,
+            2,
+            "x",
+            None,
+            &Budget::unlimited(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, Error::NoCdnNode), "got {err:?}");
     }
 }

@@ -13,7 +13,7 @@ use kuro_api::{
 };
 
 use crate::atomic::{recover_backup, safe_replace};
-use crate::download::{download_chunked, download_single};
+use crate::download::{download_chunked, download_single, Budget};
 use crate::state::{self, incremental_dir};
 
 /// Events emitted during long operations (for the TUI / progress UI).
@@ -60,18 +60,35 @@ pub struct GameStatus {
     pub update_available: bool,
 }
 
-/// Parallel range requests per file. Kept modest on purpose: at 32, a single
-/// 4 MiB ranged GET against the Kuro CDN was measured at 52.3s while its
-/// peers finished in 2.8–8.4s — the fan-out itself provokes the stalls, and
-/// each stalled connection then blocks the file. With `REPAIR_FILE_CONCURRENCY`
-/// files in flight this bounds peak concurrent connections at 32.
+/// Global ceiling on in-flight CDN requests for the whole run — every file and
+/// every byte range draws from this one pool (see [`Budget`]).
+///
+/// The Kuro CDN throttles per *connection*: a single edge streamed
+/// ~0.05–0.10 MB/s however fast the client's link was, so throughput comes
+/// from concurrency. But only up to a point — measured 2026-09, aggregate
+/// throughput scaled ~linearly to 8 connections (~0.6 MB/s against a ~0.8 MB/s
+/// machine ceiling), and at 12+ the fan-out itself provoked stalls (a 32-way
+/// batch hung a 4 MiB ranged GET for 52.3s while its peers finished in
+/// 2.8–8.4s). 8 is the measured sweet spot.
+///
+/// Sharing one budget across the run is the point: a big pak's ranges and a
+/// small file's request compete for the same 8 slots instead of each file
+/// reserving its own, so the tail of one file no longer leaves the link idle
+/// while the next file waits its turn.
+const DOWNLOAD_CONCURRENCY: usize = 8;
+/// Range tasks a single chunked file may have outstanding at once. Actual
+/// connections are capped by `DOWNLOAD_CONCURRENCY`; this only sizes one
+/// file's fan-out.
 const CHUNK_CONCURRENCY: usize = 8;
 /// CN 3.6.0 manifests carry no chunkInfos — synthesize fixed-size ranges so
 /// large paks download over parallel connections (CDNs rate-limit per conn).
 const SYNTH_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-/// Concurrent FILES in the repair/install download loop (each file then fans
-/// out to CHUNK_CONCURRENCY range requests → bounded total connections).
-const REPAIR_FILE_CONCURRENCY: usize = 4;
+/// Concurrent files the download loops keep in flight. The `JoinSet` still
+/// spawns a task per file, but this semaphore gates how many run at once, so it
+/// bounds open file handles and in-flight work: enough files that a small file
+/// fills a slot a big file's tail would leave idle, without a run-wide list of
+/// open descriptors.
+const FILE_CONCURRENCY: usize = 8;
 /// Parallel krpdiff merges during apply (CPU-bound, native engine).
 const MERGE_CONCURRENCY: usize = 4;
 
@@ -81,6 +98,8 @@ pub struct GameManager {
     pub server: Server,
     api: ApiClient,
     http: reqwest::Client,
+    /// Run-wide connection budget shared by every download this manager starts.
+    budget: Budget,
 }
 
 impl GameManager {
@@ -99,6 +118,7 @@ impl GameManager {
             server,
             api,
             http,
+            budget: Budget::new(DOWNLOAD_CONCURRENCY),
         })
     }
 
@@ -268,60 +288,48 @@ impl GameManager {
             .map(|r| (r.dest.as_str(), r))
             .collect();
 
+        // Both passes run across FILES in parallel, each file bounded by the
+        // shared connection budget. Sequentially, one file's slow tail left the
+        // link idle while the rest queued behind it; the TUI keys events by
+        // file name, so completion order does not matter.
+        let sem = Arc::new(tokio::sync::Semaphore::new(FILE_CONCURRENCY));
+        let mut handles = tokio::task::JoinSet::new();
+
         for group in &plan.patch_groups {
             if group.local_ready {
                 continue;
             }
-            let _ = tx
-                .send(ProgressEvent::GroupStart {
-                    name: group.name.clone(),
-                })
-                .await;
-            let _ = tx
-                .send(ProgressEvent::FileProgress {
-                    name: group.name.clone(),
-                    bytes: 0,
-                    total: group.size,
-                })
-                .await;
             let urls = node_urls(&nodes, |base| ApiClient::krpdiff_url(base, patch_cfg, &group.name));
             let staged = state::staged_patch_path(&self.game_folder, &group.name);
             let tmp = tmp_sibling(&staged, "krpdiff");
-            download_single(
-                &self.http,
-                &urls,
-                &tmp,
-                Some(group.size),
-                None,
-                &group.name,
-                Some(&tx),
-            )
-            .await?;
-            std::fs::rename(&tmp, &staged)?;
-            let _ = tx
-                .send(ProgressEvent::GroupDone {
-                    name: group.name.clone(),
-                    bytes: group.size,
-                })
-                .await;
+            let name = group.name.clone();
+            let size = group.size;
+            let http = self.http.clone();
+            let budget = self.budget.clone();
+            let tx = tx.clone();
+            let sem = sem.clone();
+            handles.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let _ = tx.send(ProgressEvent::GroupStart { name: name.clone() }).await;
+                let _ = tx
+                    .send(ProgressEvent::FileProgress {
+                        name: name.clone(),
+                        bytes: 0,
+                        total: size,
+                    })
+                    .await;
+                download_single(&http, &urls, &tmp, Some(size), None, &name, Some(&tx), &budget)
+                    .await?;
+                std::fs::rename(&tmp, &staged)?;
+                let _ = tx.send(ProgressEvent::GroupDone { name, bytes: size }).await;
+                Ok::<_, Error>(())
+            });
         }
 
         for item in &plan.full_files {
             if item.local_ready {
                 continue;
             }
-            let _ = tx
-                .send(ProgressEvent::GroupStart {
-                    name: item.name.clone(),
-                })
-                .await;
-            let _ = tx
-                .send(ProgressEvent::FileProgress {
-                    name: item.name.clone(),
-                    bytes: 0,
-                    total: item.size,
-                })
-                .await;
             let res = res_by_dest
                 .get(item.name.as_str())
                 .ok_or_else(|| Error::MissingField("resource entry"))?;
@@ -345,37 +353,65 @@ impl GameManager {
             } else {
                 res.chunk_infos.clone()
             };
-            if chunk_infos.is_empty() {
-                download_single(
-                    &self.http,
-                    &urls,
-                    &tmp,
-                    Some(res.size),
-                    Some(&res.md5),
-                    &res.dest,
-                    Some(&tx),
-                )
-                .await?;
-            } else {
-                download_chunked(
-                    &self.http,
-                    &urls,
-                    &tmp,
-                    &chunk_infos,
-                    Some(&res.md5),
-                    CHUNK_CONCURRENCY,
-                    &res.dest,
-                    Some(&tx),
-                )
-                .await?;
-            }
-            std::fs::rename(&tmp, &staged)?;
-            let _ = tx
-                .send(ProgressEvent::GroupDone {
-                    name: item.name.clone(),
-                    bytes: item.size,
-                })
-                .await;
+            let size = res.size;
+            let md5 = res.md5.clone();
+            let dest = res.dest.clone();
+            let name = item.name.clone();
+            let item_size = item.size;
+            let http = self.http.clone();
+            let budget = self.budget.clone();
+            let tx = tx.clone();
+            let sem = sem.clone();
+            handles.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let _ = tx.send(ProgressEvent::GroupStart { name: name.clone() }).await;
+                let _ = tx
+                    .send(ProgressEvent::FileProgress {
+                        name: name.clone(),
+                        bytes: 0,
+                        total: item_size,
+                    })
+                    .await;
+                if chunk_infos.is_empty() {
+                    download_single(
+                        &http,
+                        &urls,
+                        &tmp,
+                        Some(size),
+                        Some(md5.as_str()),
+                        &dest,
+                        Some(&tx),
+                        &budget,
+                    )
+                    .await?;
+                } else {
+                    download_chunked(
+                        &http,
+                        &urls,
+                        &tmp,
+                        &chunk_infos,
+                        Some(md5.as_str()),
+                        CHUNK_CONCURRENCY,
+                        &dest,
+                        Some(&tx),
+                        &budget,
+                    )
+                    .await?;
+                }
+                std::fs::rename(&tmp, &staged)?;
+                let _ = tx
+                    .send(ProgressEvent::GroupDone {
+                        name,
+                        bytes: item_size,
+                    })
+                    .await;
+                Ok::<_, Error>(())
+            });
+        }
+
+        while let Some(joined) = handles.join_next().await {
+            joined
+                .map_err(|e| Error::Patch(format!("predownload join: {e}")))??;
         }
 
         let _ = tx.send(ProgressEvent::Done).await;
@@ -476,6 +512,8 @@ impl GameManager {
 
         // ---- fallback downloads (full files, chunked when possible) ----
         let mut seen: HashSet<String> = HashSet::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(FILE_CONCURRENCY));
+        let mut handles = tokio::task::JoinSet::new();
         for dst in fallback_dests {
             if !seen.insert(dst.dest.clone()) {
                 continue;
@@ -496,31 +534,47 @@ impl GameManager {
             let staged = state::staged_patch_path(&self.game_folder, &dst.dest);
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = tmp_sibling(&staged, "dl");
-            if chunks.is_empty() {
-                download_single(
-                    &self.http,
-                    &urls,
-                    &tmp,
-                    Some(dst.size),
-                    Some(&dst.md5),
-                    &dst.dest,
-                    None,
-                )
-                .await?;
-            } else {
-                download_chunked(
-                    &self.http,
-                    &urls,
-                    &tmp,
-                    &chunks,
-                    Some(&md5),
-                    CHUNK_CONCURRENCY,
-                    &dst.dest,
-                    None,
-                )
-                .await?;
-            }
-            std::fs::rename(&tmp, &staged)?;
+            let size = dst.size;
+            let dst_md5 = dst.md5.clone();
+            let name = dst.dest.clone();
+            let http = self.http.clone();
+            let budget = self.budget.clone();
+            let sem = sem.clone();
+            handles.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                if chunks.is_empty() {
+                    download_single(
+                        &http,
+                        &urls,
+                        &tmp,
+                        Some(size),
+                        Some(dst_md5.as_str()),
+                        &name,
+                        None,
+                        &budget,
+                    )
+                    .await?;
+                } else {
+                    download_chunked(
+                        &http,
+                        &urls,
+                        &tmp,
+                        &chunks,
+                        Some(md5.as_str()),
+                        CHUNK_CONCURRENCY,
+                        &name,
+                        None,
+                        &budget,
+                    )
+                    .await?;
+                }
+                std::fs::rename(&tmp, &staged)?;
+                Ok::<_, Error>(())
+            });
+        }
+        while let Some(joined) = handles.join_next().await {
+            joined
+                .map_err(|e| Error::Patch(format!("fallback download join: {e}")))??;
         }
 
         // ---- migration phase: verify everything is staged, then swap ----
@@ -737,6 +791,8 @@ impl GameManager {
             .collect();
 
         let mut swapped = 0;
+        let sem = Arc::new(tokio::sync::Semaphore::new(FILE_CONCURRENCY));
+        let mut handles = tokio::task::JoinSet::new();
         for f in entry.diff_files {
             let Some(expected_md5) = md5_by_dest.get(*f) else {
                 continue;
@@ -745,17 +801,21 @@ impl GameManager {
             let game_path = self.game_folder.join(f.trim_start_matches('/'));
             std::fs::create_dir_all(game_path.parent().unwrap())?;
             let tmp = game_path.with_extension("checkout.tmp");
-            download_single(
-                &self.http,
-                &urls,
-                &tmp,
-                None,
-                Some(expected_md5),
-                f,
-                None,
-            )
-            .await?;
-            safe_replace(&tmp, &game_path)?;
+            let name = f.to_string();
+            let md5 = expected_md5.clone();
+            let http = self.http.clone();
+            let budget = self.budget.clone();
+            let sem = sem.clone();
+            handles.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                download_single(&http, &urls, &tmp, None, Some(md5.as_str()), &name, None, &budget)
+                    .await?;
+                safe_replace(&tmp, &game_path)?;
+                Ok::<_, Error>(())
+            });
+        }
+        while let Some(joined) = handles.join_next().await {
+            joined.map_err(|e| Error::Patch(format!("checkout join: {e}")))??;
             swapped += 1;
         }
 
@@ -900,12 +960,13 @@ impl GameManager {
                 })
                 .await;
         }
-        let sem = Arc::new(tokio::sync::Semaphore::new(REPAIR_FILE_CONCURRENCY));
+        let sem = Arc::new(tokio::sync::Semaphore::new(FILE_CONCURRENCY));
         let mut handles = tokio::task::JoinSet::new();
         let cdn_nodes: Arc<Vec<String>> = Arc::new(cdn_nodes.iter().map(|s| s.to_string()).collect());
         for item in to_fix {
             let sem = sem.clone();
             let http = self.http.clone();
+            let budget = self.budget.clone();
             let game_folder = self.game_folder.clone();
             let cdn_nodes = cdn_nodes.clone();
             let base = base.to_string();
@@ -938,9 +999,10 @@ impl GameManager {
                         &urls,
                         &tmp,
                         Some(item.size),
-                        Some(&item.md5),
+                        Some(item.md5.as_str()),
                         &item.dest,
                         tx.as_ref(),
+                        &budget,
                     )
                     .await?;
                 } else {
@@ -949,10 +1011,11 @@ impl GameManager {
                         &urls,
                         &tmp,
                         &chunk_infos,
-                        Some(&item.md5),
+                        Some(item.md5.as_str()),
                         CHUNK_CONCURRENCY,
                         &item.dest,
                         tx.as_ref(),
+                        &budget,
                     )
                     .await?;
                 }

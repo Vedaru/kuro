@@ -3,7 +3,7 @@
 //! *within* a chunk, not jump only when a whole chunk lands.
 
 use kuro_api::ChunkInfo;
-use kuro_core::download::download_chunked;
+use kuro_core::download::{download_chunked, Budget};
 use kuro_core::ProgressEvent;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -92,6 +92,7 @@ async fn chunked_streams_and_reports_progress_within_a_chunk() {
         1,
         "out.bin",
         Some(&tx),
+        &Budget::unlimited(),
     )
     .await
     .unwrap();

@@ -12,8 +12,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bound on the gap between two successful reads, not the whole transfer: a
 /// 26 GiB pak is a legitimate multi-hour download, but no single read should
-/// stall for a minute.
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// stall for long. This resets after every successful read, so it never trips
+/// on a slow-but-alive edge — only on one that has genuinely gone quiet.
+///
+/// Kept at 30s rather than a minute: the download engine runs at most
+/// `DOWNLOAD_CONCURRENCY` connections, so a stalled edge occupies one of a
+/// handful of scarce slots. CDN stalls of 50s+ were measured, and abandoning
+/// the connection at 30s hands the slot to a retry (or to another edge) twice
+/// as fast.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle keep-alive connections retained per CDN host. The engine never has
+/// more than `DOWNLOAD_CONCURRENCY` (8) in flight, so keeping an unbounded
+/// number warm buys nothing; 16 covers the working set plus a little slack for
+/// connections freed by retries.
+const IDLE_POOL_PER_HOST: usize = 16;
 
 /// Build the process-wide HTTP client, with the transport tuning above.
 ///
@@ -24,6 +37,7 @@ pub fn build_client() -> Result<reqwest::Client> {
         .user_agent("kuro/0.1 (+https://github.com/vedaru/kuro)")
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        .pool_max_idle_per_host(IDLE_POOL_PER_HOST)
         .build()?)
 }
 
