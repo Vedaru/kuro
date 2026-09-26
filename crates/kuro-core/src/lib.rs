@@ -11,6 +11,7 @@
 pub mod atomic;
 pub mod download;
 pub mod game;
+pub mod md5_cache;
 pub mod state;
 pub mod steam;
 

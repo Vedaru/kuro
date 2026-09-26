@@ -43,6 +43,10 @@ the wine dependency is removed by applying patches via
   client's own resource/video channel, settings, saves, local storage, logs),
   the SDK / anti-cheat / crash-reporter payloads the client writes for itself,
   and anything in a directory the manifest doesn't ship into
+- **persistent MD5 cache** — a verified file is never hashed twice: entries in
+  `<game>/.kuro_cache/md5.json` are keyed by manifest path and validated on
+  (size, mtime) like `make`/`git`, so re-verify costs one stat per file. Pure
+  I/O savings — delete `.kuro_cache/` any time to force a full re-hash
 - **install** — from-zero client download for any supported game
 - **checkout** — CN ⇄ Bilibili channel switch for WuWa (diff-file swap + appId)
 - Resumable, MD5-verified downloads with per-file progress bars
@@ -174,7 +178,6 @@ cargo run -p kuro-core --example pgr_proof   # live CDN smoke test (PGR)
   is derived from the shared launcher platform, not yet confirmed against a
   live session
 - ACE anti-cheat doesn't run under Proton (see above)
-- No persistent MD5 cache yet — sync re-hashes the tree each run (fast on NVMe)
 - The CDN manifest describes the base client only, so it is **not** an inventory
   of a WuWa install: the game's own resource channel (`Client/Saved/**`, i.e.
   Video/Lang/Resource packs — not the `Client/Content/Paks` base paks) is

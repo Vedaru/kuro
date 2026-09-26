@@ -12,6 +12,8 @@ pub const LOCAL_CONFIG_FILE: &str = "launcherDownloadConfig.json";
 pub const INCREMENTAL_DIR: &str = ".incremental_download";
 /// Tool cache (md5 cache, saved indexes).
 pub const CACHE_DIR: &str = ".kuro_cache";
+/// Persistent MD5 hash cache file, inside [`CACHE_DIR`] (see `md5_cache`).
+pub const MD5_CACHE_FILE: &str = "md5.json";
 
 pub fn incremental_dir(game_folder: &Path) -> PathBuf {
     game_folder.join(INCREMENTAL_DIR)

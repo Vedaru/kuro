@@ -887,6 +887,8 @@ impl GameManager {
         let game_folder = self.game_folder.clone();
         let verify_tx = tx.clone();
         let checked = Arc::new(AtomicUsize::new(0));
+        let cache = crate::md5_cache::Md5Cache::load(&self.game_folder);
+        let verify_cache = cache.clone();
         let checks: Vec<(ResourceItem, bool)> = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             items
@@ -902,15 +904,15 @@ impl GameManager {
                             });
                         }
                     }
-                    let p = game_folder.join(normalise_dest(&item.dest));
-                    let size_ok = std::fs::metadata(&p)
-                        .map(|m| m.len() == item.size)
-                        .unwrap_or(false);
-                    let ok = size_ok
-                        && (item.md5.is_empty()
-                            || kuro_patch::md5_file(&p)
-                                .map(|a| a == item.md5)
-                                .unwrap_or(false));
+                    let key = normalise_dest(&item.dest);
+                    let p = game_folder.join(&key);
+                    let meta = std::fs::metadata(&p).ok();
+                    let ok = match &meta {
+                        Some(m) if m.len() == item.size => {
+                            item.md5.is_empty() || verify_cache.matches(&key, &p, m, &item.md5)
+                        }
+                        _ => false,
+                    };
                     (item.clone(), ok)
                 })
                 .collect()
@@ -968,6 +970,7 @@ impl GameManager {
             let http = self.http.clone();
             let budget = self.budget.clone();
             let game_folder = self.game_folder.clone();
+            let cache = cache.clone();
             let cdn_nodes = cdn_nodes.clone();
             let base = base.to_string();
             let tx = tx.clone();
@@ -975,7 +978,8 @@ impl GameManager {
                 let _permit = sem.acquire().await.unwrap();
                 let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
                 let urls = node_urls(&cdn_nodes, |n| ApiClient::resource_url(n, &from, &item.dest));
-                let game_path = game_folder.join(normalise_dest(&item.dest));
+                let key = normalise_dest(&item.dest);
+                let game_path = game_folder.join(&key);
                 std::fs::create_dir_all(game_path.parent().unwrap())?;
                 let tmp = tmp_sibling(&game_path, "sync");
                 // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
@@ -1020,6 +1024,7 @@ impl GameManager {
                     .await?;
                 }
                 safe_replace(&tmp, &game_path)?;
+                cache.record_file(&key, &game_path, &item.md5);
                 Ok::<_, Error>((item.dest, item.size))
             });
         }
@@ -1044,6 +1049,10 @@ impl GameManager {
                 Err(e) => report.failed.push(e.to_string()),
             }
         }
+
+        // Persist the hash cache — best effort: a failed write only costs the
+        // re-hash it was meant to save and must not fail a good sync.
+        let _ = cache.save();
 
         // orphan sweep — stale build artefacts only (see `sweep_orphans`: the
         // manifest covers the base client alone, so "not listed" must never

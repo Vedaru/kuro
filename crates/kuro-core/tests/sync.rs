@@ -199,3 +199,130 @@ async fn sync_removes_files_not_in_manifest() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+fn file_mtime_ns(p: &Path) -> u64 {
+    std::fs::metadata(p)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+/// Rewrite the md5 cache entry for `dest` to claim the given (size, mtime)
+/// stat — keeping the hash recorded on the first sync, so the entry reads as
+/// "this stat is the file that hashed to the manifest md5".
+fn patch_cache_entry(game: &Path, dest: &str, size: u64, mtime_ns: u64) {
+    let path = kuro_core::state::cache_dir(game).join(kuro_core::state::MD5_CACHE_FILE);
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let entry = map.get_mut(dest).expect("entry recorded by the first sync");
+    entry["size"] = size.into();
+    entry["mtime_ns"] = mtime_ns.into();
+    std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+}
+
+/// A cache hit must be trusted without reading the file: same-size corruption
+/// with the recorded hash pointed at the file's *current* stat passes verify
+/// and is never repaired — proving the bytes were never hashed.
+#[tokio::test]
+async fn md5_cache_trusts_recorded_hash_without_reread() {
+    let base = std::env::temp_dir().join(format!("kuro-md5cache-trust-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let game = setup_game(&base);
+
+    let good = b"FILE-C-CONTENT";
+    std::fs::write(game.join("Client/Content/Paks/fileC.pak"), good).unwrap();
+
+    let server = common::spawn_http_server(vec![(
+        "/zip/Client/Content/Paks/fileC.pak".into(),
+        good.to_vec(),
+    )])
+    .await;
+    let full_index = PatchIndex {
+        resource: vec![res("Client/Content/Paks/fileC.pak", good)],
+        delete_files: vec![],
+        group_infos: vec![],
+        apply_types: vec![],
+    };
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let report = mgr.sync_inner(&full_index, &[server.as_str()], "zip").await.unwrap();
+    assert_eq!(report.ok, 1);
+    assert_eq!(report.repaired, 0);
+
+    // Corrupt in place with the same size (only a hash can see it), then teach
+    // the cache that its recorded hash is current by pointing the entry at the
+    // file's new stat. If verify re-read the file it would repair it.
+    let corrupt = vec![b'X'; good.len()];
+    let p = game.join("Client/Content/Paks/fileC.pak");
+    std::fs::write(&p, &corrupt).unwrap();
+    patch_cache_entry(
+        &game,
+        "Client/Content/Paks/fileC.pak",
+        corrupt.len() as u64,
+        file_mtime_ns(&p),
+    );
+
+    let report = mgr.sync_inner(&full_index, &[server.as_str()], "zip").await.unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(report.repaired, 0, "cache hit must skip hashing: {report:?}");
+    assert_eq!(report.ok, 1);
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        corrupt,
+        "bytes must have been trusted untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A stale cache entry is never trusted: a stat mismatch forces a re-hash,
+/// which catches same-size corruption and repairs it.
+#[tokio::test]
+async fn md5_cache_rehashes_when_stat_is_stale() {
+    let base = std::env::temp_dir().join(format!("kuro-md5cache-stale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let game = setup_game(&base);
+
+    let good = b"FILE-C-CONTENT";
+    std::fs::write(game.join("Client/Content/Paks/fileC.pak"), good).unwrap();
+
+    let server = common::spawn_http_server(vec![(
+        "/zip/Client/Content/Paks/fileC.pak".into(),
+        good.to_vec(),
+    )])
+    .await;
+    let full_index = PatchIndex {
+        resource: vec![res("Client/Content/Paks/fileC.pak", good)],
+        delete_files: vec![],
+        group_infos: vec![],
+        apply_types: vec![],
+    };
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let report = mgr.sync_inner(&full_index, &[server.as_str()], "zip").await.unwrap();
+    assert_eq!(report.ok, 1);
+
+    // Same-size corruption, cache entry left claiming a bogus mtime: the stat
+    // mismatch forces the re-hash that catches the corruption.
+    let corrupt = vec![b'X'; good.len()];
+    let p = game.join("Client/Content/Paks/fileC.pak");
+    std::fs::write(&p, &corrupt).unwrap();
+    patch_cache_entry(
+        &game,
+        "Client/Content/Paks/fileC.pak",
+        corrupt.len() as u64,
+        1,
+    );
+
+    let report = mgr.sync_inner(&full_index, &[server.as_str()], "zip").await.unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(report.repaired, 1, "stale entry must re-hash and repair: {report:?}");
+    assert_eq!(std::fs::read(&p).unwrap(), good.to_vec());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
