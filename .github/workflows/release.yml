@@ -1,0 +1,142 @@
+# Build, package, and publish kuro on GitHub -- the host the README's install
+# line (curl .../releases/latest/download/kuro) points at. Nothing built those
+# releases automatically until this file.
+#
+# Three things trigger it:
+#
+#   * a tag v*   -> a GitHub Release shaped like the ones already there:
+#     title "kuro vX.Y.Z" and the bare `kuro` asset the README curl names. A
+#     kuro-<ver>-x86_64-linux.tar.zst bundle (binary + README + LICENSE) and a
+#     SHA256SUMS ride along.
+#   * a push to master -> test, build, replace the rolling `continuous`
+#     prerelease. It is a prerelease on purpose: `releases/latest` must keep
+#     resolving to the newest stable tag, or the README curl starts handing
+#     people master builds.
+#   * a pull_request -> the same build and test, no publishing. Both publish
+#     steps are ref-gated below, so a Dependabot PR gets a verdict instead of
+#     being merged blind.
+#
+# The forgejo side (.forgejo/workflows/package.yml) is untouched and keeps
+# feeding the vendored-component registry the ansible restore reads; this is
+# GitHub only. Three of its choices carry over deliberately:
+#
+#   * rustup is pinned to 1.98.1: a toolchain bump should be a deliberate act
+#     with a green run behind it, not whatever the release channel served that
+#     morning.
+#   * cargo runs WITHOUT --locked: the committed Cargo.lock is honored anyway,
+#     and a lock that has drifted from Cargo.toml should not be the thing that
+#     reddens the publish.
+#   * LZMA_API_STATIC is set so liblzma-sys compiles its vendored xz instead of
+#     probing pkg-config for a system liblzma >= 5.8.0. The forgejo job
+#     container installs no liblzma-dev and gets that same build; pinning it
+#     here keeps the artifact from following whichever -dev packages a runner
+#     image happens to ship.
+#
+# actions/checkout IS used here -- unlike the forgejo workflow, whose whole
+# point is to never touch github.com, these jobs already run on GitHub's own
+# runners.
+
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Two rapid master pushes must not race to replace the rolling release.
+  # Queued, never cancelled: a publish step should not die halfway through.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Force liblzma-sys down its vendored-xz path; see the header.
+  LZMA_API_STATIC: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the pinned toolchain
+        run: |
+          set -eux
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          rustc --version
+          cargo --version
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build the release binary
+        run: |
+          set -eux
+          cargo build --release
+          bin=target/release/kuro
+          [ -x "$bin" ] || { echo "build produced no $bin" >&2; exit 1; }
+          echo "built kuro ($(stat -c '%s' "$bin") bytes)"
+          # What it ended up linking -- liblzma should NOT be in there.
+          ldd "$bin" || true
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
+            *) version="continuous" ;;
+          esac
+          name="kuro-$version-x86_64-linux"
+
+          # The bare `kuro` asset is what the README curl downloads by name;
+          # the tarball is the grab-the-whole-thing form.
+          stage="$RUNNER_TEMP/pkg/$name"
+          install -Dm755 target/release/kuro "$stage/kuro"
+          install -m 0644 README.md LICENSE "$stage/"
+          mkdir -p dist
+          cp "$stage/kuro" dist/kuro
+          tar --zstd -cf "dist/$name.tar.zst" -C "$RUNNER_TEMP/pkg" "$name"
+          (cd dist && sha256sum kuro "$name.tar.zst" > SHA256SUMS)
+          ls -l dist
+
+      - name: Publish the tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          # Idempotent on purpose: re-running the job re-uploads the assets
+          # (--clobber) instead of failing on an already-created release, so a
+          # partial publish is repairable by re-running the job.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber dist/*
+          else
+            gh release create "$tag" --title "kuro $tag" --generate-notes dist/*
+          fi
+
+      - name: Publish the rolling build
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Delete + recreate rather than --clobber upload: it refreshes the
+          # notes and target SHA so the release says which commit it is. The
+          # tag is deleted too so nothing goes stale behind the release.
+          # Prerelease, so `releases/latest` still resolves to the newest
+          # stable tag and the README curl keeps handing people stable.
+          gh release delete continuous --yes --cleanup-tag || true
+          gh release create continuous --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "kuro (master)" \
+            --notes "Rolling build of master at $GITHUB_SHA." \
+            dist/*

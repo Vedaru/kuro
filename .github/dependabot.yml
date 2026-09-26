@@ -1,0 +1,16 @@
+# Dependabot keeps the two things this repo pins from drifting silently: the
+# Rust crates in Cargo.lock and the action versions the workflows reference.
+# The pull_request trigger in release.yml builds and tests each PR, so these
+# arrive with a verdict instead of being merged blind.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
