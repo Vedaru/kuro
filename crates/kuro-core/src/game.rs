@@ -952,8 +952,8 @@ impl GameManager {
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let nodes = cdn_nodes(&self.api, &index)?;
         let cfg = &index.default.config;
-        let full_index = self.api.fetch_manifest(&nodes, &cfg.index_file).await?;
-        self.sync_inner_with_progress(&full_index, &nodes, &cfg.base_url, tx)
+        let full_index = Arc::new(self.api.fetch_manifest(&nodes, &cfg.index_file).await?);
+        self.sync_inner_with_progress(full_index, &nodes, &cfg.base_url, tx)
             .await
     }
 
@@ -964,19 +964,19 @@ impl GameManager {
         cdn_nodes: &[&str],
         base: &str,
     ) -> Result<SyncReport> {
-        self.sync_inner_with_progress(full_index, cdn_nodes, base, None).await
+        self.sync_inner_with_progress(Arc::new(full_index.clone()), cdn_nodes, base, None)
+            .await
     }
 
     /// Sync core with progress events.
     pub async fn sync_inner_with_progress(
         &self,
-        full_index: &PatchIndex,
+        full_index: Arc<PatchIndex>,
         cdn_nodes: &[&str],
         base: &str,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<SyncReport> {
-        let items = full_index.resource.clone();
-        let total_files = items.len() as u64;
+        let total_files = full_index.resource.len() as u64;
 
         if let Some(tx) = &tx {
             let _ = tx
@@ -984,17 +984,28 @@ impl GameManager {
                 .await;
         }
 
-        // verify phase — hash the whole tree in parallel off the async runtime
+        // verify phase — hash the whole tree in parallel off the async runtime.
+        // Collect only the entries that need repair. The previous version built
+        // a `Vec<(ResourceItem, bool)>` across every manifest item, i.e. a
+        // second full copy of the manifest held alongside the fetched one for
+        // the whole verify; on a large (WuWa-sized) manifest that roughly
+        // doubles peak RSS, and glibc never returns the freed copy to the OS,
+        // so the process stays fat for the rest of the run. A `filter_map`
+        // keeps just the broken items; `checked`/`ok` fall out of the counts.
+        // The manifest is borrowed through the `Arc` (never cloned) and only
+        // broken items are cloned out, so verify holds one copy, not two.
         let game_folder = self.game_folder.clone();
         let verify_tx = tx.clone();
         let checked = Arc::new(AtomicUsize::new(0));
         let cache = crate::md5_cache::Md5Cache::load(&self.game_folder);
         let verify_cache = cache.clone();
-        let checks: Vec<(ResourceItem, bool)> = tokio::task::spawn_blocking(move || {
+        let index = Arc::clone(&full_index);
+        let to_fix: Vec<ResourceItem> = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
-            items
+            index
+                .resource
                 .par_iter()
-                .map(|item| {
+                .filter_map(|item| {
                     let n = checked.fetch_add(1, Ordering::SeqCst) + 1;
                     if n.is_multiple_of(256) {
                         if let Some(tx) = &verify_tx {
@@ -1014,25 +1025,23 @@ impl GameManager {
                         }
                         _ => false,
                     };
-                    (item.clone(), ok)
+                    if ok {
+                        None
+                    } else {
+                        Some(item.clone())
+                    }
                 })
                 .collect()
         })
         .await
         .map_err(|e| Error::Patch(format!("verify task join: {e}")))?;
 
+        let checked_total = total_files as usize;
         let mut report = SyncReport {
-            checked: checks.len(),
+            checked: checked_total,
+            ok: checked_total - to_fix.len(),
             ..Default::default()
         };
-        let mut to_fix: Vec<ResourceItem> = Vec::new();
-        for (item, ok) in checks {
-            if ok {
-                report.ok += 1;
-            } else {
-                to_fix.push(item);
-            }
-        }
 
         let total: u64 = to_fix.iter().map(|i| i.size).sum();
         if let Some(tx) = &tx {
@@ -1321,7 +1330,12 @@ pub fn find_game_exe(folder: &Path) -> Option<String> {
 }
 
 fn is_krpdiff(dest: &str) -> bool {
-    dest.to_ascii_lowercase().ends_with(".krpdiff")
+    // Suffix compare on bytes instead of lowercasing the whole path: this runs
+    // once per manifest entry, and a fresh `String` per entry (the manifest
+    // lists every file) is pure garbage. Working on bytes also avoids a slice
+    // that could panic mid-UTF-8.
+    let b = dest.as_bytes();
+    b.len() >= 8 && b[b.len() - 8..].eq_ignore_ascii_case(b".krpdiff")
 }
 
 /// Manifest paths are CDN paths: forward slashes, no drive prefix, relative to
@@ -1617,6 +1631,16 @@ mod tests {
             from_folder: from_folder.map(str::to_string),
             chunk_infos: vec![],
         }
+    }
+
+    #[test]
+    fn krpdiff_suffix_is_case_insensitive_and_bounded() {
+        assert!(is_krpdiff("Client/a/foo.krpdiff"));
+        assert!(is_krpdiff("Client/a/foo.KRPDIFF"));
+        assert!(is_krpdiff(".krpdiff"));
+        assert!(!is_krpdiff("foo.krpdiff.bak"));
+        assert!(!is_krpdiff("krpdiff"));
+        assert!(!is_krpdiff(""));
     }
 
     /// Everything the client writes for itself must survive a sweep — these are
