@@ -4,7 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use kuro_api::{FileRef, GroupInfo, LocalConfig, PatchConfig, PatchIndex, ResourceItem};
-use kuro_core::GameManager;
+use kuro_core::{GameManager, ProgressEvent};
+use tokio::sync::mpsc;
 
 fn md5_bytes(data: &[u8]) -> String {
     format!("{:x}", md5::compute(data))
@@ -316,6 +317,104 @@ async fn apply_without_predownload_errors_cleanly() {
     assert!(
         err.to_string().contains("predownload"),
         "expected a predownload hint, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The TUI draws the apply progress bar only when it receives a `SetTotal`
+/// with a non-zero byte count (`TaskUi::total_bytes` in kuro-tui). Before this
+/// fix `apply` had no progress-capable entry point, the TUI called the silent
+/// `apply()`, `total_bytes` stayed 0 and the bar was never drawn. Guard the
+/// plumbing: a real apply must announce the total and emit the per-group
+/// completions that advance the bar.
+#[tokio::test]
+async fn apply_reports_progress_events() {
+    let base = std::env::temp_dir().join(format!("kuro-apply-progress-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let game = setup_game(&base);
+    let newtree = setup_new_tree(&base);
+
+    let diff_path = base.join("progress.krpdiff");
+    kuro_patch::create_krdiff(&game, &newtree, &diff_path).unwrap();
+    let inc = game.join(".incremental_download");
+    std::fs::create_dir_all(&inc).unwrap();
+    std::fs::copy(&diff_path, inc.join("group_1.krpdiff")).unwrap();
+
+    let new_pak = b"PAK-NEW-DATA".repeat(1200);
+    let expected_total: u64 =
+        (new_pak.len() + b"dll-new".len() + b"{\"v\":2}".len() + b"new-file".len()) as u64;
+
+    let group = GroupInfo {
+        dest: "group_1.krpdiff".to_string(),
+        src_files: vec![
+            file_ref("Client/Content/Paks/pakchunk0.pak", &b"PAK-OLD-DATA".repeat(1000)),
+            file_ref("Client/Binaries/Win64/game.dll", b"dll-old"),
+            file_ref("config.json", b"{\"v\":1}"),
+        ],
+        dst_files: vec![
+            file_ref("Client/Content/Paks/pakchunk0.pak", &new_pak),
+            file_ref("Client/Binaries/Win64/game.dll", b"dll-new"),
+            file_ref("config.json", b"{\"v\":2}"),
+            file_ref("added.bin", b"new-file"),
+        ],
+    };
+    let patch_index = PatchIndex {
+        resource: vec![ResourceItem {
+            dest: "group_1.krpdiff".to_string(),
+            md5: md5_file(&diff_path),
+            size: std::fs::metadata(&diff_path).unwrap().len(),
+            from_folder: None,
+            chunk_infos: vec![],
+        }],
+        delete_files: vec![],
+        group_infos: vec![group],
+        apply_types: vec![],
+    };
+
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let report = mgr
+        .apply_inner_with_progress(
+            &patch_index,
+            &["https://cdn.invalid"],
+            &PatchConfig {
+                version: "0.9.0".to_string(),
+                index_file: String::new(),
+                base_url: String::new(),
+            },
+            "1.0.0",
+            Some(tx),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.merged, 1);
+
+    let mut total: Option<u64> = None;
+    let mut saw_start = false;
+    let mut group_done_bytes: u64 = 0;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            ProgressEvent::SetTotal { bytes } => total = Some(bytes),
+            ProgressEvent::GroupStart { name } if name == "group_1.krpdiff" => saw_start = true,
+            ProgressEvent::GroupDone { name, bytes } if name == "group_1.krpdiff" => {
+                group_done_bytes += bytes;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        total,
+        Some(expected_total),
+        "apply must announce the total bytes it will merge so the TUI can draw a bar"
+    );
+    assert!(saw_start, "apply must emit GroupStart for the group it merges");
+    assert_eq!(
+        group_done_bytes, expected_total,
+        "per-group GroupDone bytes must add up to the announced total"
     );
 
     let _ = std::fs::remove_dir_all(&base);

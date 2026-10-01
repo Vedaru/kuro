@@ -677,7 +677,10 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
             let mgr = GameManager::open(PathBuf::from(path)).await.map_err(|e| e.to_string())?;
             match kind {
                 TaskKind::Apply => {
-                    let report = mgr.apply().await.map_err(|e| e.to_string())?;
+                    let report = mgr
+                        .apply_with_progress(ptx.take())
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok(format!(
                         "apply complete — merged {}, skipped {}, fallback {}, swapped {}, deleted {}",
                         report.merged,

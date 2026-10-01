@@ -420,7 +420,14 @@ impl GameManager {
 
     /// Apply a downloaded incremental update: merge krpdiffs natively, verify,
     /// then atomically swap into the game folder. The game must not be running.
-    pub async fn apply(&self) -> Result<ApplyReport> {
+    ///
+    /// Progress events (per-group merge, per-file fallback downloads) are
+    /// reported on `tx` when supplied; pass `None` for a silent run. Mirrors
+    /// [`Self::sync_with_progress`].
+    pub async fn apply_with_progress(
+        &self,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<ApplyReport> {
         let from_version = self
             .local_version()?
             .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
@@ -440,7 +447,8 @@ impl GameManager {
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
         let patch_index = self.api.fetch_manifest(&nodes, &patch_cfg.index_file).await?;
 
-        self.apply_inner(&patch_index, &nodes, patch_cfg, &remote).await
+        self.apply_inner_with_progress(&patch_index, &nodes, patch_cfg, &remote, tx)
+            .await
     }
 
     /// The apply pipeline, testable with a synthetic `PatchIndex`.
@@ -459,6 +467,19 @@ impl GameManager {
         cdn_nodes: &[&str],
         patch_cfg: &PatchConfig,
         to_version: &str,
+    ) -> Result<ApplyReport> {
+        self.apply_inner_with_progress(patch_index, cdn_nodes, patch_cfg, to_version, None)
+            .await
+    }
+
+    /// [`Self::apply_inner`] with progress events on `tx`.
+    pub async fn apply_inner_with_progress(
+        &self,
+        patch_index: &PatchIndex,
+        cdn_nodes: &[&str],
+        patch_cfg: &PatchConfig,
+        to_version: &str,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<ApplyReport> {
         let inc = incremental_dir(&self.game_folder);
         if !inc.exists() {
@@ -480,6 +501,29 @@ impl GameManager {
             .map(|r| r.dest.clone())
             .collect();
 
+        // Progress total: every byte this apply writes into the target tree —
+        // the merged group outputs. Complete files staged by predownload are
+        // swapped by rename without a byte bar, so they are excluded (see the
+        // complete-file pass) to keep the bar able to reach 100%.
+        let progress_total: u64 = patch_index
+            .group_infos
+            .iter()
+            .flat_map(|g| g.dst_files.iter())
+            .filter(|d| !complete_dests.contains(&d.dest))
+            .map(|d| d.size)
+            .sum();
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(ProgressEvent::Log(format!(
+                    "applying {} → {} ({} groups)",
+                    patch_cfg.version,
+                    to_version,
+                    patch_index.group_infos.len()
+                )))
+                .await;
+            let _ = tx.send(ProgressEvent::SetTotal { bytes: progress_total }).await;
+        }
+
         // ---- merge phase ----
         let mut groups: Vec<GroupInfo> = patch_index.group_infos.clone();
         // biggest groups first (like ww-manager)
@@ -487,10 +531,29 @@ impl GameManager {
 
         let sem = Arc::new(tokio::sync::Semaphore::new(MERGE_CONCURRENCY));
         let mut handles = Vec::with_capacity(groups.len());
+        // Per-group output bytes, in spawn order: handles resolve in the same
+        // order they were pushed, so this index maps a completed handle to the
+        // bytes it contributed.
+        let mut group_bytes: Vec<(String, u64)> = Vec::with_capacity(groups.len());
         for (idx, group) in groups.into_iter().enumerate() {
             let sem = sem.clone();
             let game_folder = self.game_folder.clone();
             let inc = inc.clone();
+            let name = group.dest.clone();
+            // The merge is one opaque KrDiff call, so a group is the finest
+            // granularity this phase can report.
+            if let Some(tx) = &tx {
+                let _ = tx.send(ProgressEvent::GroupStart { name: name.clone() }).await;
+            }
+            group_bytes.push((
+                name,
+                group
+                    .dst_files
+                    .iter()
+                    .filter(|d| !complete_dests.contains(&d.dest))
+                    .map(|d| d.size)
+                    .sum(),
+            ));
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 merge_one_group(&game_folder, &inc, &group, idx).await
@@ -499,13 +562,26 @@ impl GameManager {
 
         let mut outcomes: Vec<(String, GroupOutcome)> = Vec::with_capacity(handles.len());
         let mut fallback_dests: Vec<FileRef> = Vec::new();
-        for h in handles {
+        for (i, h) in handles.into_iter().enumerate() {
             let (name, outcome) = h
                 .await
                 .map_err(|e| Error::Patch(format!("merge task join: {e}")))??;
-            match &outcome {
-                GroupOutcome::Fallback(files) => fallback_dests.extend(files.iter().cloned()),
-                GroupOutcome::Merged | GroupOutcome::Skipped => {}
+            if let GroupOutcome::Fallback(files) = &outcome {
+                fallback_dests.extend(files.iter().cloned());
+            }
+            if let Some(tx) = &tx {
+                // Merged/Skipped deliver their bytes here; a Fallback reports 0
+                // now and its bytes arrive from the download phase below, so no
+                // byte is ever counted twice.
+                let bytes = match &outcome {
+                    GroupOutcome::Merged | GroupOutcome::Skipped => {
+                        group_bytes.get(i).map(|(_, b)| *b).unwrap_or(0)
+                    }
+                    GroupOutcome::Fallback(_) => 0,
+                };
+                let _ = tx
+                    .send(ProgressEvent::GroupDone { name: name.clone(), bytes })
+                    .await;
             }
             outcomes.push((name, outcome));
         }
@@ -540,8 +616,19 @@ impl GameManager {
             let http = self.http.clone();
             let budget = self.budget.clone();
             let sem = sem.clone();
+            let tx = tx.clone();
             handles.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
+                if let Some(tx) = &tx {
+                    let _ = tx.send(ProgressEvent::GroupStart { name: name.clone() }).await;
+                    let _ = tx
+                        .send(ProgressEvent::FileProgress {
+                            name: name.clone(),
+                            bytes: 0,
+                            total: size,
+                        })
+                        .await;
+                }
                 if chunks.is_empty() {
                     download_single(
                         &http,
@@ -550,7 +637,7 @@ impl GameManager {
                         Some(size),
                         Some(dst_md5.as_str()),
                         &name,
-                        None,
+                        tx.as_ref(),
                         &budget,
                     )
                     .await?;
@@ -563,12 +650,15 @@ impl GameManager {
                         Some(md5.as_str()),
                         CHUNK_CONCURRENCY,
                         &name,
-                        None,
+                        tx.as_ref(),
                         &budget,
                     )
                     .await?;
                 }
                 std::fs::rename(&tmp, &staged)?;
+                if let Some(tx) = &tx {
+                    let _ = tx.send(ProgressEvent::GroupDone { name, bytes: size }).await;
+                }
                 Ok::<_, Error>(())
             });
         }
@@ -606,6 +696,15 @@ impl GameManager {
                 .count(),
             ..Default::default()
         };
+
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(ProgressEvent::Log(format!(
+                    "merge done — swapping {} file(s) into the game folder…",
+                    staged_outputs.len()
+                )))
+                .await;
+        }
 
         for (dest, staged) in &staged_outputs {
             let game_path = self.game_folder.join(normalise_dest(dest));
