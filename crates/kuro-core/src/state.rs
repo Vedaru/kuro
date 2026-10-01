@@ -18,6 +18,11 @@ pub const MD5_CACHE_FILE: &str = "md5.json";
 /// `launcherDownloadConfig.json` because that file is the official launcher's
 /// and gets overwritten by it.
 pub const QUALITY_FILE: &str = "quality.json";
+/// Process group of the game kuro last launched for this install, inside
+/// [`CACHE_DIR`] (see `launch`). Lets a later `kuro kill` find a client that
+/// hung on shutdown — kuro exits right after spawning, so the pid cannot be
+/// held in memory across runs.
+pub const GAME_PID_FILE: &str = "game.pid";
 
 pub fn incremental_dir(game_folder: &Path) -> PathBuf {
     game_folder.join(INCREMENTAL_DIR)
@@ -30,6 +35,11 @@ pub fn cache_dir(game_folder: &Path) -> PathBuf {
 /// Path of the persisted quality selection.
 pub fn quality_file(game_folder: &Path) -> PathBuf {
     cache_dir(game_folder).join(QUALITY_FILE)
+}
+
+/// Path of the last-launched game's process-group id.
+pub fn game_pid_file(game_folder: &Path) -> PathBuf {
+    cache_dir(game_folder).join(GAME_PID_FILE)
 }
 
 /// Staged path of a downloaded krpdiff file.

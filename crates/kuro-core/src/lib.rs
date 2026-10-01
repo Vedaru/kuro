@@ -11,6 +11,7 @@
 pub mod atomic;
 pub mod download;
 pub mod game;
+pub mod launch;
 pub mod md5_cache;
 pub mod quality;
 pub mod state;
@@ -21,6 +22,7 @@ pub use game::{
     ProgressEvent, SyncReport,
 };
 pub use kuro_api::{Error, Game, Result, Server};
+pub use launch::{KillReport, LaunchPlan};
 pub use quality::{PackInfo, Quality, QualityInfo};
 pub use steam::{default_game_dir, detect_steam, SteamInfo};
 pub use game::{detect_game, find_game_exe};
