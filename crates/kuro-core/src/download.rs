@@ -119,6 +119,12 @@ async fn download_single_once(
             })
             .await;
     }
+    // Hash the bytes as they stream instead of re-reading the finished file:
+    // a full-file verify here meant a second pass over a multi-GB pak, pure
+    // disk I/O on top of the download. Only allocate the hasher when a digest
+    // is actually expected.
+    let want_md5 = expected_md5.is_some_and(|m| !m.is_empty());
+    let mut hasher = want_md5.then(md5::Context::new);
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
     let mut done: u64 = 0;
@@ -126,6 +132,9 @@ async fn download_single_once(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         file.write_all(&chunk).await?;
+        if let Some(h) = hasher.as_mut() {
+            h.consume(&chunk);
+        }
         done += chunk.len() as u64;
         if let Some(tx) = progress {
             if done - last_report >= (1 << 20) || done >= total {
@@ -142,7 +151,45 @@ async fn download_single_once(
     }
     file.flush().await?;
     drop(file);
-    verify_file(dest, expected_size, expected_md5).await
+    verify_streamed(dest, done, hasher, expected_size, expected_md5)
+}
+
+/// Verify a just-downloaded file against the bytes we counted while streaming
+/// (size) and the digest we fed from the same stream. `verify_file` re-hashes
+/// the file from disk; this is the no-re-read equivalent for `download_single`,
+/// where chunked downloads already hash per range as they arrive.
+fn verify_streamed(
+    path: &Path,
+    streamed: u64,
+    hasher: Option<md5::Context>,
+    expected_size: Option<u64>,
+    expected_md5: Option<&str>,
+) -> Result<()> {
+    if let Some(size) = expected_size {
+        if streamed != size {
+            return Err(Error::ChecksumMismatch {
+                path: path.display().to_string(),
+                expected: size.to_string(),
+                actual: streamed.to_string(),
+            });
+        }
+    }
+    if let Some(md5) = expected_md5 {
+        if !md5.is_empty() {
+            let actual = match hasher {
+                Some(h) => format!("{:x}", h.finalize()),
+                None => String::new(),
+            };
+            if actual != md5 {
+                return Err(Error::ChecksumMismatch {
+                    path: path.display().to_string(),
+                    expected: md5.to_string(),
+                    actual,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Download a file in parallel byte ranges (`chunkInfos` from the manifest).
@@ -374,6 +421,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn verify_streamed_checks_size_and_digest() {
+        let p = PathBuf::from("/nonexistent");
+        // size match, nothing to hash
+        assert!(verify_streamed(&p, 4, None, Some(4), None).is_ok());
+        // size mismatch
+        assert!(matches!(
+            verify_streamed(&p, 3, None, Some(4), None),
+            Err(Error::ChecksumMismatch { .. })
+        ));
+        // digest match (md5("abcd"))
+        let mut h = md5::Context::new();
+        h.consume(b"abcd");
+        assert!(verify_streamed(
+            &p,
+            4,
+            Some(h),
+            Some(4),
+            Some("e2fc714c4727ee9395f324cd2e7f331f")
+        )
+        .is_ok());
+        // digest mismatch
+        let mut h = md5::Context::new();
+        h.consume(b"abc");
+        assert!(matches!(
+            verify_streamed(
+                &p,
+                4,
+                Some(h),
+                Some(4),
+                Some("e2fc714c4727ee9395f324cd2e7f331f")
+            ),
+            Err(Error::ChecksumMismatch { .. })
+        ));
     }
 
     #[tokio::test]
