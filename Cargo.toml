@@ -16,12 +16,38 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/vedaru/kuro"
 
-# Smaller release binaries (strip symbols; behavior unchanged).
+# Smaller release binaries (behavior unchanged). Size-tuned globally, since
+# most of `.text` is UI/HTTP/CLI glue where unrolling and inlining buy nothing
+# but bytes.
 [profile.release]
 strip = true
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
+opt-level = "s"
+
+# The one exception: hashing and patch decode run over multi-GB game files, so
+# they stay at full speed while the rest of the binary is size-tuned. Hashing
+# is the hot loop of verify/sync; a size-optimized build measurably slows it.
+[profile.release.package.md5]
+opt-level = 3
+[profile.release.package.md-5]
+opt-level = 3
+[profile.release.package.digest]
+opt-level = 3
+[profile.release.package.sha1]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
+[profile.release.package.crc32fast]
+opt-level = 3
+[profile.release.package.xxhash-rust]
+opt-level = 3
+[profile.release.package.hdiffpatch-rs]
+opt-level = 3
+
 [workspace.dependencies]
 kuro-api = { path = "crates/kuro-api" }
 kuro-patch = { path = "crates/kuro-patch" }
