@@ -18,6 +18,17 @@ pub enum Game {
     Pgr,
 }
 
+impl Game {
+    /// Whether the client selects assets by a `-krqlv=<SD|HD|UHD>` argument
+    /// and downloads them into `Client/Content/<TIER>/`.
+    ///
+    /// WuWa (UE) does; PGR (Unity) keeps its assets in `PGR_Data/` and takes
+    /// no tier argument, so quality selection does not apply to it.
+    pub fn uses_quality_tiers(self) -> bool {
+        matches!(self, Game::WuWa)
+    }
+}
+
 impl fmt::Display for Game {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

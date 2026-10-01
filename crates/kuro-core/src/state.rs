@@ -14,6 +14,10 @@ pub const INCREMENTAL_DIR: &str = ".incremental_download";
 pub const CACHE_DIR: &str = ".kuro_cache";
 /// Persistent MD5 hash cache file, inside [`CACHE_DIR`] (see `md5_cache`).
 pub const MD5_CACHE_FILE: &str = "md5.json";
+/// Selected quality preset, inside [`CACHE_DIR`] (see `quality`). Kept out of
+/// `launcherDownloadConfig.json` because that file is the official launcher's
+/// and gets overwritten by it.
+pub const QUALITY_FILE: &str = "quality.json";
 
 pub fn incremental_dir(game_folder: &Path) -> PathBuf {
     game_folder.join(INCREMENTAL_DIR)
@@ -21,6 +25,11 @@ pub fn incremental_dir(game_folder: &Path) -> PathBuf {
 
 pub fn cache_dir(game_folder: &Path) -> PathBuf {
     game_folder.join(CACHE_DIR)
+}
+
+/// Path of the persisted quality selection.
+pub fn quality_file(game_folder: &Path) -> PathBuf {
+    cache_dir(game_folder).join(QUALITY_FILE)
 }
 
 /// Staged path of a downloaded krpdiff file.
