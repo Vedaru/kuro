@@ -1453,7 +1453,7 @@ fn sweep_orphans(game_folder: &Path, manifest: &[ResourceItem]) -> Result<usize>
     // collect orphans first, delete after — mutating the tree while walking it
     // is a recipe for skipped entries on some platforms
     let mut orphans: Vec<PathBuf> = Vec::new();
-    for entry in walk_files(game_folder)? {
+    for entry in walk_files(game_folder) {
         let rel = entry
             .strip_prefix(game_folder)
             .map_err(|e| Error::Patch(format!("orphan walk prefix: {e}")))?
@@ -1521,10 +1521,16 @@ fn prune_empty_dirs(root: &Path) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
     for entry in rd.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let name = entry.file_name();
+        // Same symlink and cache hazards as `walk_files`: `is_dir()` would
+        // follow `.kuro_cache`'s Wine `z:` → `/` and try to prune directories
+        // across the whole filesystem. Only ever descend real directories, and
+        // never into the cache or predownload staging.
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_dir() {
             continue;
         }
-        if path == root {
+        if name == state::INCREMENTAL_DIR || name == state::CACHE_DIR {
             continue;
         }
         prune_empty_dirs(&path);
@@ -1540,29 +1546,49 @@ fn is_dir_empty(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Recursive file walker that does not follow the protected `.incremental_download`
-/// directory (we never want to touch predownload staging from sync).
-fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
-    fn recurse(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(root)? {
-            let entry = entry?;
+/// Recursive file walker that never follows symlinks and skips the protected
+/// `.incremental_download/` (predownload staging) and `.kuro_cache/` (our own
+/// state, including the Wine prefix) directories.
+///
+/// Best-effort: a directory we cannot read (a Proton prefix's root-owned or
+/// mode-000 subdir, typically) is skipped rather than failing the walk. The
+/// walk only feeds the orphan sweep, so an entry we can't see just isn't
+/// considered for deletion — the file stays, which is always the safe outcome.
+/// Propagating the error instead aborted an otherwise-clean sync with
+/// `orphan walk: Permission denied` *after* every file had verified.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    fn recurse(root: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in rd.flatten() {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if path.is_dir() {
-                if name == ".incremental_download" {
+            // Never follow a symlink: the launcher's Wine prefix puts
+            // `dosdevices/z:` → `/` (and friends) under `.kuro_cache`, so
+            // following one walks the whole filesystem and, through the game
+            // folder it re-enters, recurses without bound. `file_type()` is the
+            // readdir entry's own type, so this costs no extra syscall.
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if name == state::INCREMENTAL_DIR || name == state::CACHE_DIR {
                     continue;
                 }
-                recurse(&path, out)?;
-            } else {
+                recurse(&path, out);
+            } else if ft.is_file() {
                 out.push(path);
             }
         }
-        Ok(())
     }
     let mut out = Vec::new();
-    recurse(root, &mut out).map_err(|e| Error::Patch(format!("orphan walk: {e}")))?;
-    Ok(out)
+    recurse(root, &mut out);
+    out
 }
 
 /// Files the sweep must never delete, whatever the manifest says.
@@ -1711,6 +1737,51 @@ mod tests {
             "Client/Content/Paks/OldLocale/en-US/old.bin",
             &dirs
         ));
+    }
+
+    /// Regression: an unreadable subdirectory must not abort the sweep. A live
+    /// install hit this via a Proton prefix holding a root-owned / mode-000
+    /// directory — verification passed, then the orphan walk returned
+    /// `Permission denied` and failed the whole sync. The walk is best-effort
+    /// now: entries it can see are swept, an unreadable directory is skipped.
+    #[test]
+    fn sweep_survives_unreadable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("kuro-sweeperm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paks = root.join("Client/Content/Paks");
+        std::fs::create_dir_all(paks.join("locked")).unwrap();
+
+        // a stale artifact we can see, and one hidden inside the locked dir
+        std::fs::write(paks.join("pakchunk18-WindowsNoEditor.pak"), b"STALE").unwrap();
+        std::fs::write(
+            paks.join("locked/pakchunk19-WindowsNoEditor.pak"),
+            b"HIDDEN",
+        )
+        .unwrap();
+
+        let manifest = vec![res("Client/Content/Paks/pakchunk0.pak", 10, None)];
+
+        let locked = paks.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = sweep_orphans(&root, &manifest);
+        // chmod does not block reads as root; that only makes the test weaker
+        // (the locked dir is walked), never wrong — the sweep must still be Ok.
+        let locked_readable = std::fs::read_dir(&locked).is_ok();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_ok(), "unreadable dir must not fail the sweep: {result:?}");
+        assert_eq!(result.unwrap(), 1, "the visible stale pak is swept");
+        assert!(!paks.join("pakchunk18-WindowsNoEditor.pak").exists());
+        if !locked_readable {
+            assert!(
+                paks.join("locked/pakchunk19-WindowsNoEditor.pak").exists(),
+                "a file we could not see is left alone"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

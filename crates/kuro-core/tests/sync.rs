@@ -200,6 +200,93 @@ async fn sync_removes_files_not_in_manifest() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Regression: the orphan sweep must never follow symlinks. The launcher's Wine
+/// prefix lives under the game folder at `.kuro_cache/wineprefix` and contains
+/// `pfx/dosdevices/z:` → `/`, so a sweep that followed links walked the whole
+/// filesystem and — re-entering the game folder through it — recursed without
+/// bound, the runaway heap that OOM'd a live sync. A link out of the install
+/// must also never let the sweep delete outside its root, and nothing under
+/// `.kuro_cache` is the sweep's to touch.
+#[cfg(unix)]
+#[tokio::test]
+async fn sync_does_not_follow_symlinks_in_the_orphan_sweep() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(format!("kuro-sync-symlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let game = setup_game(&base);
+
+    // the one manifest file, present and correct
+    let file_a = b"FILE-A-CONTENT";
+    std::fs::write(game.join("Client/Content/Paks/fileA.pak"), file_a).unwrap();
+
+    // a real stale artifact inside the install -> the one thing swept
+    std::fs::write(
+        game.join("Client/Content/Paks/pakchunk18-WindowsNoEditor.pak"),
+        b"STALE",
+    )
+    .unwrap();
+
+    // outside the install: a same-named artifact the manifest would call stale,
+    // reached only through a symlink. Following that link would sweep it.
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let outside_pak = outside.join("pakchunk19-WindowsNoEditor.pak");
+    std::fs::write(&outside_pak, b"OUTSIDE").unwrap();
+    symlink(&outside, game.join("Client/Content/Paks/escape")).unwrap();
+
+    // a cycle: following this recurses without bound
+    symlink(&game, game.join("Client/Content/Paks/self")).unwrap();
+
+    // the launcher's Wine prefix: `.kuro_cache/.../z: -> /`
+    let dosdevices = game.join(".kuro_cache/wineprefix/pfx/dosdevices");
+    std::fs::create_dir_all(&dosdevices).unwrap();
+    symlink("/", dosdevices.join("z:")).unwrap();
+    std::fs::write(
+        dosdevices.join("pakchunk20-WindowsNoEditor.pak"),
+        b"CACHE",
+    )
+    .unwrap();
+
+    let server = common::spawn_http_server(vec![(
+        "/zip/Client/Content/Paks/fileA.pak".into(),
+        file_a.to_vec(),
+    )])
+    .await;
+
+    let full_index = PatchIndex {
+        resource: vec![res("Client/Content/Paks/fileA.pak", file_a)],
+        delete_files: vec![],
+        group_infos: vec![],
+        apply_types: vec![],
+    };
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let report = mgr.sync_inner(&full_index, &[server.as_str()], "zip").await.unwrap();
+
+    assert_eq!(report.checked, 1);
+    assert!(report.failed.is_empty(), "no failures: {report:?}");
+    assert_eq!(
+        report.orphans_removed, 1,
+        "only the in-tree stale pak is swept: {report:?}"
+    );
+    assert!(!game.join("Client/Content/Paks/pakchunk18-WindowsNoEditor.pak").exists());
+    assert!(
+        outside_pak.exists(),
+        "a symlink out of the install must not be followed (or swept)"
+    );
+    assert!(
+        dosdevices.join("pakchunk20-WindowsNoEditor.pak").exists(),
+        ".kuro_cache must be skipped entirely"
+    );
+    // the links themselves are left alone
+    assert!(game.join("Client/Content/Paks/escape").exists());
+    assert!(game.join("Client/Content/Paks/self").exists());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 fn file_mtime_ns(p: &Path) -> u64 {
     std::fs::metadata(p)
         .unwrap()
