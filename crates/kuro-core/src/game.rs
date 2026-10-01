@@ -1329,6 +1329,14 @@ pub fn find_game_exe(folder: &Path) -> Option<String> {
     None
 }
 
+/// Which Kuro title lives in this folder, from the official launcher's
+/// `launcherDownloadConfig.json` (`appId` maps back to game+server). `None`
+/// when there is no config or its appId is unknown.
+pub fn detect_game(folder: &Path) -> Option<Game> {
+    let cfg = state::read_local_config(folder).ok().flatten()?;
+    game_server_by_app_id(&cfg.app_id).map(|(game, _)| game)
+}
+
 fn is_krpdiff(dest: &str) -> bool {
     // Suffix compare on bytes instead of lowercasing the whole path: this runs
     // once per manifest entry, and a fresh `String` per entry (the manifest
