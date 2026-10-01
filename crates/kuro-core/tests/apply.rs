@@ -208,6 +208,85 @@ async fn apply_refuses_to_record_a_version_it_did_not_install() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// An update can introduce a directory the install has never had (WuWa 3.7.0
+/// adds `Client/Content/HD`). The swap must create it first — the staged output
+/// only made it under `.incremental_download`, and renaming into a missing
+/// directory fails with ENOENT ("I/O error: No such file or directory").
+#[tokio::test]
+async fn apply_creates_new_target_directories() {
+    let base = std::env::temp_dir().join(format!("kuro-apply-newdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let game = setup_game(&base);
+    let newtree = setup_new_tree(&base);
+    std::fs::create_dir_all(newtree.join("Client/Content/HD")).unwrap();
+    let hd_pak = b"HD-NEW-DATA".repeat(500);
+    std::fs::write(newtree.join("Client/Content/HD/pakchunk1-HD.pak"), &hd_pak).unwrap();
+    assert!(
+        !game.join("Client/Content/HD").exists(),
+        "target directory must be absent before apply"
+    );
+
+    let diff_path = base.join("newdir.krpdiff");
+    kuro_patch::create_krdiff(&game, &newtree, &diff_path).unwrap();
+    let inc = game.join(".incremental_download");
+    std::fs::create_dir_all(&inc).unwrap();
+    std::fs::copy(&diff_path, inc.join("group_1.krpdiff")).unwrap();
+
+    let group = GroupInfo {
+        dest: "group_1.krpdiff".to_string(),
+        src_files: vec![
+            file_ref("Client/Content/Paks/pakchunk0.pak", &b"PAK-OLD-DATA".repeat(1000)),
+            file_ref("Client/Binaries/Win64/game.dll", b"dll-old"),
+            file_ref("config.json", b"{\"v\":1}"),
+        ],
+        dst_files: vec![
+            file_ref("Client/Content/Paks/pakchunk0.pak", &b"PAK-NEW-DATA".repeat(1200)),
+            file_ref("Client/Binaries/Win64/game.dll", b"dll-new"),
+            file_ref("config.json", b"{\"v\":2}"),
+            file_ref("added.bin", b"new-file"),
+            file_ref("Client/Content/HD/pakchunk1-HD.pak", &hd_pak),
+        ],
+    };
+    let patch_index = PatchIndex {
+        resource: vec![ResourceItem {
+            dest: "group_1.krpdiff".to_string(),
+            md5: md5_file(&diff_path),
+            size: std::fs::metadata(&diff_path).unwrap().len(),
+            from_folder: None,
+            chunk_infos: vec![],
+        }],
+        delete_files: vec![],
+        group_infos: vec![group],
+        apply_types: vec![],
+    };
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let report = mgr
+        .apply_inner(
+            &patch_index,
+            &["https://cdn.invalid"],
+            &PatchConfig {
+                version: "0.9.0".to_string(),
+                index_file: String::new(),
+                base_url: String::new(),
+            },
+            "1.0.0",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.swapped, 5, "all five targets swapped");
+    assert_eq!(
+        md5_file(&game.join("Client/Content/HD/pakchunk1-HD.pak")),
+        md5_bytes(&hd_pak),
+        "file in the newly-created directory landed"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[tokio::test]
 async fn apply_without_predownload_errors_cleanly() {
     let base = std::env::temp_dir().join(format!("kuro-apply-notest-{}", std::process::id()));

@@ -17,7 +17,16 @@ pub fn backup_path(path: &Path) -> PathBuf {
 
 /// Replace `dest` with `src` atomically-ish. `src` must be fully written and
 /// verified by the caller before this is called.
+///
+/// The destination's parent directory is created if missing: an update or
+/// checkout can introduce a directory the install has never had (e.g.
+/// `Client/Content/HD`), and `rename` into a non-existent directory fails with
+/// ENOENT. Doing it here — the single choke point for every swap, in apply,
+/// sync, checkout and install — means no call site has to remember it.
 pub fn safe_replace(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let backup = backup_path(dest);
 
     // 1. move the current file aside (if any)
@@ -70,6 +79,24 @@ mod tests {
         std::fs::rename(&dest, backup_path(&dest)).unwrap();
         recover_backup(&dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"old2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_creates_missing_destination_parent() {
+        let dir = std::env::temp_dir().join("kuro-atomic-newdir-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, b"new").unwrap();
+
+        // destination two levels down, none of which exist yet
+        let dest = dir.join("Client/Content/HD/pakchunk1-HD.pak");
+        assert!(!dest.parent().unwrap().exists());
+
+        safe_replace(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -609,6 +609,8 @@ impl GameManager {
 
         for (dest, staged) in &staged_outputs {
             let game_path = self.game_folder.join(normalise_dest(dest));
+            // `safe_replace` creates the parent directory, so a group that adds
+            // a directory the install never had (e.g. Client/Content/HD) is fine.
             recover_backup(&game_path)?;
             safe_replace(staged, &game_path)?;
             report.swapped += 1;
