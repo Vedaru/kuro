@@ -1369,28 +1369,31 @@ fn status_box_lines(
     quality: Option<Quality>,
 ) -> Vec<Line<'_>> {
     match s {
-        Some(Ok(s)) => vec![
-            Line::raw(format!("game:    {}", s.game)),
-            Line::raw(format!("server:  {}", s.server)),
-            Line::raw(format!("local:   {}", s.local_version.as_deref().unwrap_or("none"))),
-            Line::raw(format!("remote:  {}", s.remote_version)),
-            Line::raw(format!(
-                "quality: {}",
-                quality
-                    .map(|q| format!("{} ({})", q.as_arg(), q.label()))
-                    .unwrap_or_else(|| "not set".to_string())
-            )),
-            if busy {
-                Line::styled(
-                    "updating…",
-                    Style::default().fg(Color::Yellow),
-                )
+        Some(Ok(s)) => {
+            let mut lines = vec![
+                Line::raw(format!("game:    {}", s.game)),
+                Line::raw(format!("server:  {}", s.server)),
+                Line::raw(format!("local:   {}", s.local_version.as_deref().unwrap_or("none"))),
+                Line::raw(format!("remote:  {}", s.remote_version)),
+            ];
+            // PGR (Unity) takes no `-krqlv=` tier, so it gets no quality line.
+            if s.game.uses_quality_tiers() {
+                lines.push(Line::raw(format!(
+                    "quality: {}",
+                    quality
+                        .map(|q| format!("{} ({})", q.as_arg(), q.label()))
+                        .unwrap_or_else(|| "not set".to_string())
+                )));
+            }
+            lines.push(if busy {
+                Line::styled("updating…", Style::default().fg(Color::Yellow))
             } else if s.update_available {
                 Line::styled("UPDATE AVAILABLE", Style::default().fg(Color::Yellow))
             } else {
                 Line::styled("up to date", Style::default().fg(Color::Green))
-            },
-        ],
+            });
+            lines
+        }
         Some(Err(e)) => vec![Line::styled(
             format!("error: {e}"),
             Style::default().fg(Color::Red),
@@ -1467,7 +1470,7 @@ mod tests {
         parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, UiState,
         DEFAULT_GAME_DIR,
     };
-    use kuro_core::{quality, Game, Quality};
+    use kuro_core::{quality, Game, GameStatus, Quality, Server};
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1592,5 +1595,28 @@ mod tests {
             parse_quality_arg(&args(&["--quality"])),
             Err("--quality needs a value (sd|hd|uhd)")
         );
+    }
+
+    /// PGR takes no `-krqlv=` tier, so its box shows no quality line; WuWa's
+    /// still does. (PGR used to render a meaningless "quality: not set".)
+    #[test]
+    fn status_quality_line_is_wuwa_only() {
+        let state = |game, server| UiState {
+            paths: vec!["/games/x".into()],
+            statuses: vec![Some(Ok(GameStatus {
+                game,
+                server,
+                local_version: Some("1.0.0".into()),
+                remote_version: "1.0.0".into(),
+                update_available: false,
+            }))],
+            ..UiState::default()
+        };
+
+        let pgr = render_to_string(&state(Game::Pgr, Server::Global), 60, 20);
+        assert!(!pgr.contains("quality:"), "PGR box shows a quality line:\n{pgr}");
+
+        let wuwa = render_to_string(&state(Game::WuWa, Server::Cn), 60, 20);
+        assert!(wuwa.contains("quality: not set"), "WuWa box lost its quality line:\n{wuwa}");
     }
 }
