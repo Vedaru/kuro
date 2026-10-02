@@ -14,6 +14,7 @@ use kuro_api::{
 
 use crate::atomic::{recover_backup, safe_replace};
 use crate::download::{download_chunked, download_single, Budget};
+use crate::quality::{self, Quality};
 use crate::state::{self, incremental_dir};
 
 /// Events emitted during long operations (for the TUI / progress UI).
@@ -92,6 +93,41 @@ const FILE_CONCURRENCY: usize = 8;
 /// Parallel krpdiff merges during apply (CPU-bound, native engine).
 const MERGE_CONCURRENCY: usize = 4;
 
+/// Which resource bodies a run is allowed to fetch, out of everything the
+/// channel's manifest describes.
+///
+/// The client mounts exactly one `Client/Content/<SD|HD|UHD>` pak set, picked
+/// with `-krqlv=` (see [`crate::quality`]), and the manifest a channel serves
+/// carries the base chunk paks plus one or more of those bodies — WuWa 3.7.0
+/// ships `Client/Content/HD` at ~42.6 GiB inside the same manifest. So the
+/// choice is what makes "install this quality" real: without it kuro fetched
+/// every body offered, and the quality preset only ever changed the launch
+/// argument. PGR (Unity) has no bodies, so its manifests are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyChoice {
+    /// Fetch everything the channel serves — the historical behaviour, and
+    /// what an install with no saved preset gets.
+    All,
+    /// Fetch only this body. A body the channel does not serve is an error,
+    /// which is what an explicit `--quality` from the command line means.
+    Only(Quality),
+    /// Fetch this body when the channel serves it, else everything. Used for a
+    /// *saved* preset, so a repair run cannot fail just because that preset is
+    /// currently unserved.
+    Prefer(Quality),
+}
+
+impl BodyChoice {
+    /// `(body to keep, strict)` as [`quality::narrow_to_body`] wants them.
+    fn policy(self) -> (Option<Quality>, bool) {
+        match self {
+            BodyChoice::All => (None, false),
+            BodyChoice::Only(q) => (Some(q), true),
+            BodyChoice::Prefer(q) => (Some(q), false),
+        }
+    }
+}
+
 pub struct GameManager {
     pub game_folder: PathBuf,
     pub game: Game,
@@ -100,6 +136,8 @@ pub struct GameManager {
     http: reqwest::Client,
     /// Run-wide connection budget shared by every download this manager starts.
     budget: Budget,
+    /// Which bodies the next full install / sync may fetch (see [`BodyChoice`]).
+    body: BodyChoice,
 }
 
 impl GameManager {
@@ -112,6 +150,13 @@ impl GameManager {
             game_server_by_app_id(&cfg.app_id).ok_or_else(|| Error::UnknownAppId(cfg.app_id.clone()))?;
         let api = ApiClient::new()?;
         let http = build_client()?;
+        // The saved quality preset is what this install tracks, so it narrows
+        // the *download* too — but only best-effort: a preset the channel does
+        // not serve must not break a repair run (see `BodyChoice`).
+        let body = match quality::selected(&game_folder) {
+            Some(q) => BodyChoice::Prefer(q),
+            None => BodyChoice::All,
+        };
         Ok(Self {
             game_folder,
             game,
@@ -119,7 +164,18 @@ impl GameManager {
             api,
             http,
             budget: Budget::new(DOWNLOAD_CONCURRENCY),
+            body,
         })
+    }
+
+    /// Replace the body choice for this run (install / sync read it).
+    pub fn set_body(&mut self, body: BodyChoice) {
+        self.body = body;
+    }
+
+    /// The body choice this manager will apply.
+    pub fn body(&self) -> BodyChoice {
+        self.body
     }
 
     pub fn server_entry(&self) -> &'static ServerEntry {
@@ -800,7 +856,19 @@ impl GameManager {
     /// write `launcherDownloadConfig.json` (remote version + appId), then
     /// sync the full client. Works for any Kuro game in the registry.
     pub async fn install(game: Game, server: Server, game_folder: PathBuf) -> Result<InstallReport> {
-        Self::install_with_progress(game, server, game_folder, None).await
+        Self::install_with_progress(game, server, game_folder, BodyChoice::All, None).await
+    }
+
+    /// `install`, but fetching only the chosen quality pack's body
+    /// (`BodyChoice::Only` — an explicit choice, so a body the channel does not
+    /// serve fails loudly instead of quietly installing the whole client).
+    pub async fn install_with_body(
+        game: Game,
+        server: Server,
+        game_folder: PathBuf,
+        body: BodyChoice,
+    ) -> Result<InstallReport> {
+        Self::install_with_progress(game, server, game_folder, body, None).await
     }
 
     /// Install with progress events (used by the TUI).
@@ -808,6 +876,7 @@ impl GameManager {
         game: Game,
         server: Server,
         game_folder: PathBuf,
+        body: BodyChoice,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<InstallReport> {
         let entry = server_entry(game, server)
@@ -830,7 +899,8 @@ impl GameManager {
         };
         state::write_local_config(&game_folder, &cfg)?;
 
-        let mgr = Self::open(game_folder.clone()).await?;
+        let mut mgr = Self::open(game_folder.clone()).await?;
+        mgr.set_body(body);
         let sync = match mgr.sync_with_progress(tx).await {
             Ok(report) => report,
             Err(e) => {
@@ -952,8 +1022,26 @@ impl GameManager {
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let nodes = cdn_nodes(&self.api, &index)?;
         let cfg = &index.default.config;
-        let full_index = Arc::new(self.api.fetch_manifest(&nodes, &cfg.index_file).await?);
-        self.sync_inner_with_progress(full_index, &nodes, &cfg.base_url, tx)
+        let mut full_index = self.api.fetch_manifest(&nodes, &cfg.index_file).await?;
+
+        // Narrow to the body this install tracks *here*, before the manifest is
+        // handed on: one in-place `retain`, so verify / repair / the orphan
+        // sweep all see the same view and no second copy of the manifest is
+        // held for the run (see the peak-RSS note in
+        // `sync_inner_with_progress`).
+        let (want, strict) = self.body.policy();
+        let dropped = quality::narrow_to_body(&mut full_index, want, strict)?;
+        if let (Some(tx), Some(q)) = (&tx, want) {
+            let _ = tx
+                .send(ProgressEvent::Log(format!(
+                    "quality body {}: fetching Client/Content/{} — {dropped} entries of other bodies left alone",
+                    q.as_arg(),
+                    q.dir_name()
+                )))
+                .await;
+        }
+
+        self.sync_inner_with_progress(Arc::new(full_index), &nodes, &cfg.base_url, tx)
             .await
     }
 

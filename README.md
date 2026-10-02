@@ -48,6 +48,12 @@ the wine dependency is removed by applying patches via
   (size, mtime) like `make`/`git`, so re-verify costs one stat per file. Pure
   I/O savings — delete `.kuro_cache/` any time to force a full re-hash
 - **install** — from-zero client download for any supported game
+- **download options (quality packs)** — a channel's manifest carries the base
+  paks plus one or more `Client/Content/<SD|HD|UHD>` bodies (WuWa 3.7.0 ships
+  `HD` at ~42.6 GiB inside the same manifest), so `--quality sd|hd|uhd` picks
+  which body an install/sync fetches instead of taking everything the channel
+  serves. A body the channel does not serve is refused by name, not silently
+  skipped. PGR (Unity) has no quality packs, so the option is WuWa-only
 - **checkout** — CN ⇄ Bilibili channel switch for WuWa (diff-file swap + appId)
 - Resumable, MD5-verified downloads with per-file progress bars
 
@@ -97,9 +103,20 @@ cp target/release/kuro ~/.local/bin/
 kuro                    # TUI — auto-detects installed games in Steam libraries
 kuro <folder>...        # or point at game folders explicitly
 kuro status <folder>    # CLI: print local/remote versions
-kuro sync <folder>      # CLI: verify + repair
-kuro install <wuwa|pgr> <cn|bilibili|global> <folder>   # CLI: fresh install
+kuro sync <folder> [--quality <sd|hd|uhd>]              # CLI: verify + repair
+kuro install <wuwa|pgr> <cn|bilibili|global> <folder> [--quality <sd|hd|uhd>]
+kuro quality <folder> [sd|hd|uhd]                       # CLI: which pack the client mounts
 ```
+
+`--quality` on `install` / `sync` is the **download** side of that choice: only
+the named `Client/Content/<TIER>` body is fetched, together with the base paks
+and binaries every install needs. It defaults to everything the channel serves,
+and a body the channel does not serve is an error naming what it does serve —
+so "sd" on an HD-only channel tells you instead of quietly installing 42 GiB of
+HD. The saved preset (`kuro quality <folder> hd`) is what a plain `sync` follows
+afterwards, best-effort: if the channel currently serves no such body, the run
+falls back to the full manifest rather than failing. PGR has no quality packs at
+all, so there `--quality` is refused rather than ignored.
 
 ### TUI keys
 
@@ -113,7 +130,7 @@ kuro install <wuwa|pgr> <cn|bilibili|global> <folder>   # CLI: fresh install
 | `a` | apply predownloaded update |
 | `s` | sync / repair files |
 | `c` | checkout server (CN ⇄ Bilibili) |
-| `i` | install a new game |
+| `i` | install a new game (`w`/`p` game · `c`/`b`/`g` server · `f` quality pack · `t` path · `s` Steam default) |
 | `h` / `?` | help overlay |
 | `q` | quit |
 
@@ -178,6 +195,15 @@ cargo run -p kuro-core --example pgr_proof   # live CDN smoke test (PGR)
   is derived from the shared launcher platform, not yet confirmed against a
   live session
 - ACE anti-cheat doesn't run under Proton (see above)
+- Quality packs are a *download* choice for the bodies a channel serves, and they
+  only cover `install` / `sync`: `predownload` / `apply` still stage the whole
+  patch set for a version, because a partially-applied patch would record a
+  version the install does not actually hold. A pack the channel does not serve
+  cannot be installed at all — the client mounts a directory that was never
+  downloaded without complaint from the CDN
+- PGR has no quality packs to choose from: it is a Unity title whose assets live
+  under `PGR_Data/` and whose client takes no `-krqlv` tier, so `--quality` is
+  refused for it rather than pretended at
 - The CDN manifest describes the base client only, so it is **not** an inventory
   of a WuWa install: the game's own resource channel (`Client/Saved/**`, i.e.
   Video/Lang/Resource packs — not the `Client/Content/Paks` base paks) is
