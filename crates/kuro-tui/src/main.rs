@@ -14,8 +14,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{init, restore, Frame, Terminal};
 
 use kuro_core::{
-    default_game_dir, detect_game, detect_steam, launch, quality, Game, GameManager, GameStatus,
-    ProgressEvent, Quality, QualityInfo, Server, SteamInfo,
+    default_game_dir, detect_game, detect_steam, launch, quality, BodyChoice, Game, GameManager,
+    GameStatus, ProgressEvent, Quality, QualityInfo, Server, SteamInfo,
 };
 
 /// Default game folder (the user's known install).
@@ -101,6 +101,9 @@ struct InstallDraft {
     target: String,
     /// True while typing the target path.
     edit_target: bool,
+    /// Which quality pack's body to fetch. WuWa only — PGR (Unity) has no
+    /// `Client/Content/<TIER>` bodies, so it stays on `All`.
+    body: BodyChoice,
 }
 
 impl InstallDraft {
@@ -110,7 +113,34 @@ impl InstallDraft {
             server: Server::Cn,
             target,
             edit_target: false,
+            body: BodyChoice::All,
         }
+    }
+
+    /// Cycle the pack this install fetches: all → sd → hd → uhd → all.
+    ///
+    /// PGR has no bodies at all, so there is nothing to cycle and the choice
+    /// stays `All` — picking one would only earn a manifest that cannot serve
+    /// it (see `body_choice`).
+    fn cycle_body(&mut self) {
+        if !self.game.uses_quality_tiers() {
+            self.body = BodyChoice::All;
+            return;
+        }
+        self.body = match self.body {
+            BodyChoice::All | BodyChoice::Prefer(_) => BodyChoice::Only(Quality::Sd),
+            BodyChoice::Only(Quality::Sd) => BodyChoice::Only(Quality::Hd),
+            BodyChoice::Only(Quality::Hd) => BodyChoice::Only(Quality::Uhd),
+            BodyChoice::Only(Quality::Uhd) => BodyChoice::All,
+        };
+    }
+}
+
+/// How a body choice reads in the UI.
+fn body_label(body: BodyChoice) -> String {
+    match body {
+        BodyChoice::All => "all (whatever the channel serves)".to_string(),
+        BodyChoice::Only(q) | BodyChoice::Prefer(q) => q.as_arg().to_ascii_lowercase(),
     }
 }
 
@@ -174,8 +204,7 @@ async fn main() -> std::io::Result<()> {
             return cli_status(&folder).await;
         }
         Some("sync") => {
-            let folder = args.get(1).cloned().unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
-            return cli_sync(&folder).await;
+            return cli_sync(&args).await;
         }
         Some("quality") => {
             return cli_quality(&args);
@@ -224,9 +253,9 @@ fn print_usage() {
         "kuro {ver} — Kuro Games launcher (Wuthering Waves / Punishing: Gray Raven)
 
 usage: kuro [game-folder ...]            launch the TUI (default: auto-detect)
-       kuro install <wuwa|pgr> <cn|bilibili|global> <folder>
+       kuro install <wuwa|pgr> <cn|bilibili|global> <folder> [--quality sd|hd|uhd]
        kuro status [folder]
-       kuro sync [folder]
+       kuro sync [folder] [--quality sd|hd|uhd]
        kuro quality <folder> [sd|hd|uhd]
        kuro play <folder> [--quality <sd|hd|uhd>]
        kuro kill <folder>
@@ -234,6 +263,29 @@ usage: kuro [game-folder ...]            launch the TUI (default: auto-detect)
        kuro --version | -V",
         ver = env!("CARGO_PKG_VERSION")
     );
+}
+
+/// Resolve `--quality <sd|hd|uhd>` (or the bare positional form) into the body
+/// choice an install / sync should make.
+///
+/// Games without quality packs (PGR) have no `Client/Content/<TIER>` bodies at
+/// all, so asking for one there is a mistake rather than a no-op: say so and
+/// stop, instead of quietly downloading the whole client.
+fn body_choice(game: Option<Game>, rest: &[String]) -> Result<BodyChoice, String> {
+    let asked = parse_quality_arg(rest)?;
+    let Some(raw) = asked else {
+        return Ok(BodyChoice::All);
+    };
+    if game.is_some_and(|g| !g.uses_quality_tiers()) {
+        let name = game.map(pretty_game).unwrap_or("this game");
+        return Err(format!(
+            "{name} has no quality packs — drop --quality (its manifest has no Client/Content/<SD|HD|UHD> bodies)"
+        ));
+    }
+    match Quality::parse(raw) {
+        Some(q) => Ok(BodyChoice::Only(q)),
+        None => Err(format!("unknown quality `{raw}` (use sd|hd|uhd)")),
+    }
 }
 
 async fn cli_install(args: &[String]) -> std::io::Result<()> {
@@ -258,8 +310,15 @@ async fn cli_install(args: &[String]) -> std::io::Result<()> {
         println!("missing folder");
         return Ok(());
     };
+    let body = match body_choice(Some(game), args.get(4..).unwrap_or(&[])) {
+        Ok(b) => b,
+        Err(msg) => {
+            println!("{msg}");
+            return Ok(());
+        }
+    };
 
-    match GameManager::install(game, server, folder.into()).await {
+    match GameManager::install_with_progress(game, server, folder.into(), body, None).await {
         Ok(r) => println!(
             "installed v{}: checked={} ok={} repaired={} failed={}",
             r.version,
@@ -287,19 +346,39 @@ async fn cli_status(folder: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn cli_sync(folder: &str) -> std::io::Result<()> {
-    match GameManager::open(PathBuf::from(folder)).await {
-        Ok(m) => match m.sync().await {
-            Ok(r) => println!(
-                "checked={} ok={} repaired={} stale_removed={} failed={}",
-                r.checked,
-                r.ok,
-                r.repaired,
-                r.orphans_removed,
-                r.failed.len()
-            ),
-            Err(e) => println!("sync error: {e}"),
-        },
+/// `kuro sync [folder] [--quality <sd|hd|uhd>]` — verify + repair, optionally
+/// against a body other than the saved preset's.
+///
+/// With no flag the saved preset stands as the body this install tracks
+/// (`BodyChoice::Prefer` from `open`, so an unserved preset falls back to
+/// everything); an explicit `--quality` replaces it for this run and, being
+/// explicit, fails loudly when the channel does not serve that body.
+async fn cli_sync(args: &[String]) -> std::io::Result<()> {
+    let (folder, rest) = split_play_args(args);
+    let body = match body_choice(None, &rest) {
+        Ok(b) => b,
+        Err(msg) => {
+            println!("{msg}");
+            return Ok(());
+        }
+    };
+    match GameManager::open(PathBuf::from(&folder)).await {
+        Ok(mut m) => {
+            if body != BodyChoice::All {
+                m.set_body(body);
+            }
+            match m.sync().await {
+                Ok(r) => println!(
+                    "checked={} ok={} repaired={} stale_removed={} failed={}",
+                    r.checked,
+                    r.ok,
+                    r.repaired,
+                    r.orphans_removed,
+                    r.failed.len()
+                ),
+                Err(e) => println!("sync error: {e}"),
+            }
+        }
         Err(e) => println!("open error: {e}"),
     }
     Ok(())
@@ -391,11 +470,12 @@ fn parse_quality_arg(rest: &[String]) -> Result<Option<&str>, &'static str> {
     Ok(found)
 }
 
-/// Split `play`'s arguments into the install folder and the rest (the quality
-/// argument). The folder is optional — `kuro play` falls back to the default —
-/// so this must never index past the end (a bare `args[2..]` panicked on
-/// `kuro play`). A leading `--flag` is a flag, not a folder, so
-/// `kuro play --quality hd` reads as "default folder, quality hd".
+/// Split a subcommand's arguments into the install folder and the rest (the
+/// quality/body flag). Shared by `play` and `sync`. The folder is optional —
+/// `kuro play` / `kuro sync` fall back to the default — so this must never
+/// index past the end (a bare `args[2..]` panicked on `kuro play`). A leading
+/// `--flag` is a flag, not a folder, so `kuro play --quality hd` reads as
+/// "default folder, quality hd".
 fn split_play_args(args: &[String]) -> (String, Vec<String>) {
     let rest = args.get(1..).unwrap_or(&[]);
     match rest.first() {
@@ -539,7 +619,7 @@ async fn run(
                     continue;
                 }
 
-                let mut start_install: Option<(Game, Server, String)> = None;
+                let mut start_install: Option<(Game, Server, String, BodyChoice)> = None;
                 if let Some(draft) = state.install.as_mut() {
                     if draft.edit_target {
                         // typing the target path
@@ -555,10 +635,18 @@ async fn run(
                     }
                     match key.code {
                         KeyCode::Char('w') => draft.game = Game::WuWa,
-                        KeyCode::Char('p') => draft.game = Game::Pgr,
+                        KeyCode::Char('p') => {
+                            // PGR has no quality packs: whatever was picked for
+                            // WuWa must not follow the selection over, or the
+                            // install would ask for a body PGR's manifest cannot
+                            // serve and fail before downloading anything.
+                            draft.game = Game::Pgr;
+                            draft.body = BodyChoice::All;
+                        }
                         KeyCode::Char('c') => draft.server = Server::Cn,
                         KeyCode::Char('b') => draft.server = Server::Bilibili,
                         KeyCode::Char('g') => draft.server = Server::Global,
+                        KeyCode::Char('f') => draft.cycle_body(),
                         KeyCode::Char('s') => {
                             if let Some(steam) = &state.steam {
                                 draft.target =
@@ -568,7 +656,7 @@ async fn run(
                         KeyCode::Char('t') => draft.edit_target = true,
                         KeyCode::Enter => {
                             start_install =
-                                Some((draft.game, draft.server, draft.target.clone()));
+                                Some((draft.game, draft.server, draft.target.clone(), draft.body));
                         }
                         KeyCode::Esc => state.install = None,
                         _ => {}
@@ -578,7 +666,7 @@ async fn run(
                         continue;
                     }
                 }
-                if let Some((game, server, target)) = start_install {
+                if let Some((game, server, target, body)) = start_install {
                     state.install = None;
                     if !state.busy {
                         state.busy = true;
@@ -588,9 +676,19 @@ async fn run(
                         });
                         push_log(
                             &mut state,
-                            format!("installing {} ({}) into {target}", pretty_game(game), server),
+                            match body {
+                                BodyChoice::All => {
+                                    format!("installing {} ({}) into {target}", pretty_game(game), server)
+                                }
+                                _ => format!(
+                                    "installing {} ({}) into {target} — quality pack {}",
+                                    pretty_game(game),
+                                    server,
+                                    body_label(body)
+                                ),
+                            },
                         );
-                        spawn_install(&tx, &target, game, server);
+                        spawn_install(&tx, &target, game, server, body);
                     }
                 }
 
@@ -975,7 +1073,13 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
     });
 }
 
-fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game, server: Server) {
+fn spawn_install(
+    tx: &tokio::sync::mpsc::Sender<UiEvent>,
+    path: &str,
+    game: Game,
+    server: Server,
+    body: BodyChoice,
+) {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -987,7 +1091,8 @@ fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game
             }
         });
         let folder = PathBuf::from(path);
-        let result = match GameManager::install_with_progress(game, server, folder, Some(ptx)).await {
+        let result =
+            match GameManager::install_with_progress(game, server, folder, body, Some(ptx)).await {
             Ok(r) => {
                 let exe = r
                     .game_exe
@@ -1255,10 +1360,11 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw("  Tab focus   <-/-> game   Up/Down scroll log   q quit"),
             Line::raw(""),
             Line::raw("Install dialog"),
-            Line::raw("  w/p game   c/b/g server   t path   s Steam   Enter go"),
+            Line::raw("  w/p game   c/b/g server   f pack   t path   s Steam   Enter go"),
             Line::raw(""),
             Line::raw("From a shell"),
-            Line::raw("  kuro install wuwa cn ~/Games/WutheringWaves"),
+            Line::raw("  kuro install wuwa cn ~/Games/WutheringWaves --quality hd"),
+            Line::raw("  kuro sync ~/Games/WutheringWaves --quality uhd"),
             Line::raw("  kuro install pgr global ~/PGR"),
             Line::raw(""),
             Line::raw("h / ? / Esc to close"),
@@ -1327,6 +1433,14 @@ fn ui(f: &mut Frame, state: &UiState) {
                 "  server  [c] cn  [b] bilibili  [g] global  → {}",
                 draft.server
             )),
+            Line::raw(if draft.game.uses_quality_tiers() {
+                format!(
+                    "  pack    [f] all / sd / hd / uhd          → {}",
+                    body_label(draft.body)
+                )
+            } else {
+                format!("  pack    n/a — {} has no quality packs", pretty_game(draft.game))
+            }),
             Line::raw(if draft.edit_target {
                 "  target  [typing — Enter/Esc to stop]"
             } else {
@@ -1349,7 +1463,12 @@ fn ui(f: &mut Frame, state: &UiState) {
             Style::default().fg(Color::Cyan),
         ));
         modal_lines.push(Line::raw(""));
-        modal_lines.push(Line::raw("  Game files only — about 85 GB (wuwa) / 64 GB (pgr)."));
+        modal_lines.push(Line::raw(
+            "  Game files only. `all` takes every pack the channel serves; a single",
+        ));
+        modal_lines.push(Line::raw(
+            "  pack (sd/hd/uhd) fetches just that body — the channel must serve it.",
+        ));
         let area = centered_rect(70, 48, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
@@ -1464,10 +1583,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, UiState,
+        body_choice, parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, UiState,
         DEFAULT_GAME_DIR,
     };
-    use kuro_core::{quality, Game, Quality};
+    use kuro_core::{quality, BodyChoice, Game, Quality};
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1592,5 +1711,48 @@ mod tests {
             parse_quality_arg(&args(&["--quality"])),
             Err("--quality needs a value (sd|hd|uhd)")
         );
+    }
+
+    #[test]
+    fn body_choice_maps_the_flag_to_the_pack_an_install_fetches() {
+        // No flag: everything the channel serves (the historical behaviour).
+        assert_eq!(body_choice(Some(Game::WuWa), &args(&[])), Ok(BodyChoice::All));
+        assert_eq!(
+            body_choice(Some(Game::WuWa), &args(&["--quality", "hd"])),
+            Ok(BodyChoice::Only(Quality::Hd))
+        );
+        let err = body_choice(Some(Game::WuWa), &args(&["--quality", "medium"])).unwrap_err();
+        assert!(err.contains("unknown quality `medium`"), "{err}");
+    }
+
+    #[test]
+    fn body_choice_refuses_quality_packs_for_pgr() {
+        // PGR's manifest has no Client/Content/<TIER> bodies — asking for one
+        // must not quietly install the whole client instead.
+        let err = body_choice(Some(Game::Pgr), &args(&["--quality", "hd"])).unwrap_err();
+        assert!(err.contains("no quality packs"), "{err}");
+        assert!(err.contains("Punishing: Gray Raven"), "{err}");
+        // Without the flag PGR installs normally.
+        assert_eq!(body_choice(Some(Game::Pgr), &args(&[])), Ok(BodyChoice::All));
+    }
+
+    #[test]
+    fn install_dialog_cycles_packs_and_pgr_has_none() {
+        let mut draft = InstallDraft::new("/tmp/kuro-demo".into());
+        assert_eq!(draft.body, BodyChoice::All);
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::Only(Quality::Sd));
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::Only(Quality::Hd));
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::Only(Quality::Uhd));
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::All);
+
+        // Switching the dialog to PGR resets the pack: PGR can serve none.
+        draft.cycle_body();
+        draft.game = Game::Pgr;
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::All);
     }
 }

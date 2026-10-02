@@ -17,12 +17,12 @@ pub mod quality;
 pub mod state;
 pub mod steam;
 
+pub use game::{detect_game, find_game_exe};
 pub use game::{
-    ApplyReport, CheckoutReport, GameManager, GameStatus, InstallReport, PendingGroup,
+    ApplyReport, BodyChoice, CheckoutReport, GameManager, GameStatus, InstallReport, PendingGroup,
     ProgressEvent, SyncReport,
 };
 pub use kuro_api::{Error, Game, Result, Server};
 pub use launch::{KillReport, LaunchPlan};
 pub use quality::{PackInfo, Quality, QualityInfo};
 pub use steam::{default_game_dir, detect_steam, SteamInfo};
-pub use game::{detect_game, find_game_exe};
