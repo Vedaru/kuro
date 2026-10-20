@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::retry;
-use crate::types::{CdnNode, LauncherIndex, PatchConfig, PatchIndex};
+use crate::types::{CdnNode, LauncherIndex, PackCdnNode, PackConfig, PatchConfig, PatchIndex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Bound on the connect + TLS handshake. A stalled edge handshake was
@@ -75,7 +75,10 @@ impl ApiClient {
             return Err(Error::NoCdnNode);
         }
         let total: u64 = nodes.iter().map(|n| n.p).sum();
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         let mut roll = nanos % total;
         for node in &nodes {
             if roll < node.p {
@@ -116,6 +119,23 @@ impl ApiClient {
     /// This is the only way a remote manifest should enter the process: it is
     /// where `validate_manifest_paths` runs.
     pub async fn fetch_manifest(&self, cdn_bases: &[&str], index_file: &str) -> Result<PatchIndex> {
+        self.fetch_manifest_verified(cdn_bases, index_file, "").await
+    }
+
+    /// [`fetch_manifest`](Self::fetch_manifest), also checking the bytes
+    /// against the digest the channel published for that manifest.
+    ///
+    /// A truncated manifest from a sick CDN edge still parses often enough to
+    /// reach the caller, and the cost of not noticing is a whole tier
+    /// downloaded against the wrong file list. `expected` is the pack config's
+    /// `indexFileMd5`; empty means the channel published none, so the check is
+    /// skipped.
+    pub async fn fetch_manifest_verified(
+        &self,
+        cdn_bases: &[&str],
+        index_file: &str,
+        expected: &str,
+    ) -> Result<PatchIndex> {
         let urls: Vec<String> = cdn_bases
             .iter()
             .map(|base| format!("{}/{}", base.trim_end_matches('/'), index_file.trim_start_matches('/')))
@@ -128,6 +148,15 @@ impl ApiClient {
             })
         })
         .await?;
+        if !expected.is_empty() {
+            let actual = format!("{:x}", md5::compute(&bytes));
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(Error::Patch(format!(
+                    "manifest `{index_file}` is {actual}, but the channel published {expected} — \
+                     refusing to install from it"
+                )));
+            }
+        }
         let index: PatchIndex = serde_json::from_slice(&bytes)?;
         validate_manifest_paths(&index)?;
         Ok(index)
@@ -151,6 +180,53 @@ impl ApiClient {
             from_folder.trim_matches('/'),
             dest.trim_start_matches('/')
         )
+    }
+
+    /// Fetch the channel's quality-pack document ([`PackConfig`]) from the
+    /// first URL in `urls` that answers with one.
+    ///
+    /// A body that parses but carries no `resourcePacks` is *not* accepted:
+    /// the channel is expected to serve this endpoint, and a 200 with an
+    /// unrelated document (an error page JSON, an older launcher's reply) must
+    /// not be mistaken for "this channel has no packs" — that would silently
+    /// turn an installed tier into "unsupported".
+    pub async fn fetch_pack_config(&self, urls: &[&str]) -> Result<PackConfig> {
+        if urls.is_empty() {
+            return Err(Error::Unimplemented("this channel does not publish quality packs"));
+        }
+        let client = &self.http;
+        let mut last: Option<Error> = None;
+        for url in urls {
+            let attempt: Result<PackConfig> = retry::retry(retry::ATTEMPTS, |_| {
+                Box::pin(async move {
+                    let resp = client.get(*url).send().await?.error_for_status()?;
+                    Ok(serde_json::from_slice::<PackConfig>(&resp.bytes().await?)?)
+                })
+            })
+            .await;
+            match attempt {
+                Ok(cfg) if !cfg.resource_packs.is_empty() => return Ok(cfg),
+                Ok(_) => last = Some(Error::Patch(format!("{url} answered without any resourcePacks"))),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or(Error::NoCdnNode))
+    }
+
+    /// Pack CDN edges that are enabled, best first.
+    ///
+    /// Same shape as [`ApiClient::cdn_candidates`] but over the pack document's
+    /// own list, which is a different set of hosts from the game CDN (pack
+    /// traffic is served by `pcdownload-*`, game files by the gamestarter
+    /// hosts). The launcher's `K1`/`K2` flags gate a node per service, so a
+    /// node that is enabled for the game CDN is not necessarily enabled here.
+    pub fn pack_cdn_candidates(config: &PackConfig) -> Result<Vec<&PackCdnNode>> {
+        let mut nodes: Vec<&PackCdnNode> = config.cdn_list.iter().filter(|n| n.enabled()).collect();
+        if nodes.is_empty() {
+            return Err(Error::NoCdnNode);
+        }
+        nodes.sort_by_key(|n| std::cmp::Reverse(n.p));
+        Ok(nodes)
     }
 }
 
@@ -259,10 +335,7 @@ mod tests {
     #[test]
     fn rejects_escaping_delete_and_group_paths() {
         let idx = index(vec![], vec!["../../important".to_string()]);
-        assert!(matches!(
-            validate_manifest_paths(&idx),
-            Err(Error::UnsafePath(_))
-        ));
+        assert!(matches!(validate_manifest_paths(&idx), Err(Error::UnsafePath(_))));
 
         let mut idx = index(vec![], vec![]);
         idx.group_infos = vec![GroupInfo {
@@ -275,6 +348,9 @@ mod tests {
                 chunk_infos: vec![],
             }],
         }];
-        assert!(validate_manifest_paths(&idx).is_ok(), "leading / is stripped, not flagged");
+        assert!(
+            validate_manifest_paths(&idx).is_ok(),
+            "leading / is stripped, not flagged"
+        );
     }
 }

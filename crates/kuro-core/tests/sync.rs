@@ -25,11 +25,7 @@ fn res(dest: &str, data: &[u8]) -> ResourceItem {
 fn setup_game(base: &Path) -> PathBuf {
     let game = base.join("game");
     std::fs::create_dir_all(game.join("Client/Content/Paks")).unwrap();
-    let cfg = LocalConfig {
-        version: "3.6.0".to_string(),
-        app_id: "10003".to_string(),
-        group: "default".to_string(),
-    };
+    let cfg = LocalConfig::new("3.6.0", "10003");
     std::fs::write(
         game.join("launcherDownloadConfig.json"),
         serde_json::to_string_pretty(&cfg).unwrap(),

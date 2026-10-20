@@ -7,11 +7,7 @@ async fn main() {
     let dir = std::env::temp_dir().join("kuro-pgr-proof");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let cfg = LocalConfig {
-        version: "4.6.0".to_string(),
-        app_id: "50015".to_string(), // PGR global
-        group: "default".to_string(),
-    };
+    let cfg = LocalConfig::new("4.6.0", "50015"); // PGR global
     std::fs::write(
         dir.join("launcherDownloadConfig.json"),
         serde_json::to_string_pretty(&cfg).unwrap(),

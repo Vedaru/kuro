@@ -1,7 +1,8 @@
 //! `kuro` — ratatui terminal UI.
 //!
 //! Keys: `r` refresh status · `p` play (launch) · `d` predownload · `a` apply ·
-//! `s` sync · `c` checkout CN<->bilibili · `Q` quality preset · `q` quit
+//! `s` sync · `c` checkout CN<->bilibili · `Q` quality preset (+ install) ·
+//! `q` quit
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,8 +15,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{init, restore, Frame, Terminal};
 
 use kuro_core::{
-    default_game_dir, detect_game, detect_steam, launch, quality, BodyChoice, Game, GameManager,
-    GameStatus, ProgressEvent, Quality, QualityInfo, Server, SteamInfo,
+    default_game_dir, detect_game, detect_steam, launch, quality, BodyChoice, Game, GameManager, GameStatus,
+    ProgressEvent, Quality, QualityInfo, Server, SteamInfo,
 };
 
 /// Default game folder (the user's known install).
@@ -163,7 +164,8 @@ fn pretty_game(game: Game) -> &'static str {
 /// Turn known raw errors into friendly, human-readable messages.
 fn friendly_error(raw: &str) -> String {
     if raw.contains("no channel files could be swapped") || raw.contains("checkout:") {
-        "checkout isn't possible for this server — its channel files aren't in the manifest; your install is unchanged".to_string()
+        "checkout isn't possible for this server — its channel files aren't in the manifest; your install is unchanged"
+            .to_string()
     } else if raw.contains("patchConfig entry") {
         "already on the latest version — nothing to do".to_string()
     } else if raw.contains("run predownload first") || raw.contains("incremental_download") {
@@ -208,6 +210,9 @@ async fn main() -> std::io::Result<()> {
         }
         Some("quality") => {
             return cli_quality(&args);
+        }
+        Some("pack") => {
+            return cli_pack(&args).await;
         }
         Some("play") => {
             return cli_play(&args);
@@ -257,6 +262,7 @@ usage: kuro [game-folder ...]            launch the TUI (default: auto-detect)
        kuro status [folder]
        kuro sync [folder] [--quality sd|hd|uhd]
        kuro quality <folder> [sd|hd|uhd]
+       kuro pack [folder] <sd|hd|uhd> [--check]   install a quality pack
        kuro play <folder> [--quality <sd|hd|uhd>]
        kuro kill <folder>
        kuro help | --help | -h
@@ -388,10 +394,7 @@ async fn cli_sync(args: &[String]) -> std::io::Result<()> {
 /// choice, what is on disk and the prefix it will launch in; with a preset,
 /// save it.
 fn cli_quality(args: &[String]) -> std::io::Result<()> {
-    let folder = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
+    let folder = args.get(1).cloned().unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
     let path = std::path::Path::new(&folder);
     let info = quality::info(path);
 
@@ -410,23 +413,37 @@ fn cli_quality(args: &[String]) -> std::io::Result<()> {
         println!("folder:   {folder}");
         println!(
             "selected: {}",
-            info.selected.map(|q| q.as_arg().to_string()).unwrap_or_else(|| "none".to_string())
+            info.selected
+                .map(|q| q.as_arg().to_string())
+                .unwrap_or_else(|| "none".to_string())
         );
         for q in Quality::ALL {
+            // Files on disk and the launcher's records are two different
+            // questions: a tier the launcher does not know about offers
+            // "repair game" even with every pak present, so both are shown.
+            let state = kuro_core::pack::state_of(path, q);
             match info.pack(q) {
                 Some(p) if p.present => println!(
-                    "  {:<3} {:<9} {} paks, {}",
+                    "  {:<3} {:<9} {} paks, {}{}",
                     q.dir_name(),
                     q.label(),
                     p.files,
-                    fmt_bytes(p.bytes)
+                    fmt_bytes(p.bytes),
+                    if state.registered() {
+                        ", launcher: registered".to_string()
+                    } else if state.marker.is_some() || state.in_bundles {
+                        ", launcher: partially recorded (run `kuro pack` to fix)".to_string()
+                    } else {
+                        String::new()
+                    }
                 ),
                 _ => println!("  {:<3} {:<9} not installed", q.dir_name(), q.label()),
             }
         }
         println!("prefix:   {}", launch::resolve_prefix(path).display());
         println!("\nusage: kuro quality <folder> <sd|hd|uhd>  to set");
-        println!("       kuro play [folder] [sd|hd|uhd]     to launch");
+        println!("       kuro pack [folder] <sd|hd|uhd>       to install the paks");
+        println!("       kuro play [folder] [sd|hd|uhd]       to launch");
         return Ok(());
     };
 
@@ -437,6 +454,109 @@ fn cli_quality(args: &[String]) -> std::io::Result<()> {
             preset.as_arg().to_ascii_lowercase()
         ),
         Err(e) => println!("could not save preset: {e}"),
+    }
+    Ok(())
+}
+
+/// `kuro pack [folder] [--quality <sd|hd|uhd>] [--check]` — install a quality
+/// pack from the launcher's pack document, then register it with the launcher.
+///
+/// This is the only way to get SD or UHD on WuWa 3.7: the channel manifests
+/// carry `Client/Content/HD` and nothing else, so `sync --quality sd` has
+/// nothing to fetch (see [`kuro_core::pack`]). `--check` verifies without
+/// downloading and without writing the launcher records.
+async fn cli_pack(args: &[String]) -> std::io::Result<()> {
+    let (folder, rest) = split_play_args(args);
+    let check_only = rest.iter().any(|a| a == "--check");
+    let rest: Vec<String> = rest.into_iter().filter(|a| a != "--check").collect();
+    let tier = match parse_quality_arg(&rest) {
+        Ok(Some(s)) => match Quality::parse(s) {
+            Some(q) => q,
+            None => {
+                println!("unknown quality `{s}` (use sd|hd|uhd)");
+                return Ok(());
+            }
+        },
+        Ok(None) => {
+            println!("usage: kuro pack [folder] <sd|hd|uhd> [--check]");
+            return Ok(());
+        }
+        Err(msg) => {
+            println!("{msg}");
+            return Ok(());
+        }
+    };
+    let mgr = match GameManager::open(PathBuf::from(&folder)).await {
+        Ok(m) => m,
+        Err(e) => {
+            println!("open error: {e}");
+            return Ok(());
+        }
+    };
+    if !mgr.game.uses_quality_tiers() {
+        println!("{} has no quality packs", pretty_game(mgr.game));
+        return Ok(());
+    }
+    match mgr.sync_pack(tier, !check_only, None).await {
+        Ok(report) => {
+            for part in &report.parts {
+                println!(
+                    "  {:<6} {:<9} {} files{}",
+                    part.name,
+                    part.version,
+                    part.files,
+                    if part.skipped > 0 {
+                        format!(", {} channel-specific skipped", part.skipped)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            if check_only {
+                if report.broken.is_empty() {
+                    println!(
+                        "{} -> OK ({} files, {})",
+                        tier.as_arg(),
+                        report.parts.iter().map(|p| p.files).sum::<usize>(),
+                        fmt_bytes(report.bytes())
+                    );
+                } else {
+                    println!(
+                        "{} -> {} file(s) need download ({})",
+                        tier.as_arg(),
+                        report.broken.len(),
+                        fmt_bytes(report.bytes())
+                    );
+                    for b in report.broken.iter().take(5) {
+                        println!("  {b}");
+                    }
+                }
+                return Ok(());
+            }
+            println!(
+                "{} installed — {} file(s) written, {}{}",
+                tier.as_arg(),
+                report.parts.iter().map(|p| p.downloaded).sum::<usize>(),
+                fmt_bytes(report.bytes()),
+                if report.pruned > 0 {
+                    format!(", {} stale file(s) removed", report.pruned)
+                } else {
+                    String::new()
+                }
+            );
+            if report.registered {
+                println!(
+                    "launcher records in place — `kuro play \"{folder}\" {}` to start",
+                    tier.as_arg()
+                );
+            } else {
+                println!("NOT registered — {} pack file(s) failed:", report.broken.len());
+                for b in report.broken.iter().take(10) {
+                    println!("  {b}");
+                }
+            }
+        }
+        Err(e) => println!("pack error: {e}"),
     }
     Ok(())
 }
@@ -539,10 +659,7 @@ fn cli_play(args: &[String]) -> std::io::Result<()> {
 /// `kuro kill [folder]` — SIGKILL the game kuro last launched for `folder`.
 /// For a client that hangs on shutdown and never lets go of the prefix.
 fn cli_kill(args: &[String]) -> std::io::Result<()> {
-    let folder = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
+    let folder = args.get(1).cloned().unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
     match launch::kill(std::path::Path::new(&folder)) {
         Ok(r) if r.was_running => println!("killed game process group {}", r.pid),
         Ok(r) => println!("no running game (group {} already exited)", r.pid),
@@ -583,9 +700,7 @@ async fn run(
                 // modal shortcuts take priority
                 if state.show_help {
                     match key.code {
-                        KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Esc => {
-                            state.show_help = false
-                        }
+                        KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Esc => state.show_help = false,
                         KeyCode::Char('q') => break,
                         _ => {}
                     }
@@ -595,23 +710,48 @@ async fn run(
                 // quality-preset modal
                 if state.quality_modal.is_some() {
                     let mut close = false;
+                    let mut install: Option<Quality> = None;
                     match key.code {
-                        KeyCode::Char('s') => {
-                            state.quality_modal.as_mut().unwrap().choice = Quality::Sd
-                        }
-                        KeyCode::Char('h') => {
-                            state.quality_modal.as_mut().unwrap().choice = Quality::Hd
-                        }
-                        KeyCode::Char('u') => {
-                            state.quality_modal.as_mut().unwrap().choice = Quality::Uhd
+                        KeyCode::Char('s') => state.quality_modal.as_mut().unwrap().choice = Quality::Sd,
+                        KeyCode::Char('h') => state.quality_modal.as_mut().unwrap().choice = Quality::Hd,
+                        KeyCode::Char('u') => state.quality_modal.as_mut().unwrap().choice = Quality::Uhd,
+                        // `i` downloads the highlighted tier's paks without
+                        // leaving the modal, so the status column updates in
+                        // place and Enter can then apply it.
+                        KeyCode::Char('i') => {
+                            install = Some(state.quality_modal.as_ref().unwrap().choice);
                         }
                         KeyCode::Enter => {
                             let choice = state.quality_modal.as_ref().unwrap().choice;
                             apply_quality(&mut state, &path, choice);
+                            // Selecting a tier whose paks are not on disk is the
+                            // common case (SD/UHD are not part of any channel
+                            // manifest) — install it instead of saving a preset
+                            // that `play` will then refuse.
+                            if !quality::info(std::path::Path::new(&path)).is_installed(choice) {
+                                install = Some(choice);
+                            }
                             close = true;
                         }
                         KeyCode::Esc => close = true,
                         _ => {}
+                    }
+                    if let Some(tier) = install {
+                        if !state.busy {
+                            state.busy = true;
+                            state.task = Some(TaskUi {
+                                kind: format!("pack-{}", tier.as_arg().to_ascii_lowercase()),
+                                ..Default::default()
+                            });
+                            state.focus = Focus::Task;
+                            push_log(
+                                &mut state,
+                                format!("installing {} paks — the game must be closed", tier.as_arg()),
+                            );
+                            spawn_simple(&tx, &path, TaskKind::Pack(tier));
+                        } else {
+                            push_log(&mut state, "busy — wait for the current task to finish");
+                        }
                     }
                     if close {
                         state.quality_modal = None;
@@ -649,14 +789,12 @@ async fn run(
                         KeyCode::Char('f') => draft.cycle_body(),
                         KeyCode::Char('s') => {
                             if let Some(steam) = &state.steam {
-                                draft.target =
-                                    default_game_dir(steam, draft.game).to_string_lossy().into_owned();
+                                draft.target = default_game_dir(steam, draft.game).to_string_lossy().into_owned();
                             }
                         }
                         KeyCode::Char('t') => draft.edit_target = true,
                         KeyCode::Enter => {
-                            start_install =
-                                Some((draft.game, draft.server, draft.target.clone(), draft.body));
+                            start_install = Some((draft.game, draft.server, draft.target.clone(), draft.body));
                         }
                         KeyCode::Esc => state.install = None,
                         _ => {}
@@ -697,8 +835,7 @@ async fn run(
                     KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
                     KeyCode::Char('i') => {
                         if !state.busy {
-                            state.install =
-                                Some(InstallDraft::new(state.paths[state.active].clone()));
+                            state.install = Some(InstallDraft::new(state.paths[state.active].clone()));
                         }
                     }
                     KeyCode::Char('p') => {
@@ -715,10 +852,7 @@ async fn run(
                             } else {
                                 push_log(
                                     &mut state,
-                                    format!(
-                                        "{} has no quality tiers — it launches as-is",
-                                        pretty_game(game)
-                                    ),
+                                    format!("{} has no quality tiers — it launches as-is", pretty_game(game)),
                                 );
                             }
                         }
@@ -781,25 +915,15 @@ async fn run(
                             spawn_simple(&tx, &path, TaskKind::Checkout);
                         }
                     }
-                    KeyCode::Up => {
-                        if state.focus == Focus::Log {
-                            state.log_scroll += 1;
-                        }
+                    // Scrolling belongs to the log pane; the guard keeps the
+                    // other panes from silently swallowing these keys.
+                    KeyCode::Up if state.focus == Focus::Log => state.log_scroll += 1,
+                    KeyCode::Down if state.focus == Focus::Log => {
+                        state.log_scroll = state.log_scroll.saturating_sub(1);
                     }
-                    KeyCode::Down => {
-                        if state.focus == Focus::Log {
-                            state.log_scroll = state.log_scroll.saturating_sub(1);
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        if state.focus == Focus::Log {
-                            state.log_scroll += 10;
-                        }
-                    }
-                    KeyCode::PageDown => {
-                        if state.focus == Focus::Log {
-                            state.log_scroll = state.log_scroll.saturating_sub(10);
-                        }
+                    KeyCode::PageUp if state.focus == Focus::Log => state.log_scroll += 10,
+                    KeyCode::PageDown if state.focus == Focus::Log => {
+                        state.log_scroll = state.log_scroll.saturating_sub(10);
                     }
                     _ => {}
                 }
@@ -857,7 +981,11 @@ async fn run(
                                     f.done = bytes;
                                     f.total = total;
                                 }
-                                None => t.files.push(FileState { name, done: bytes, total }),
+                                None => t.files.push(FileState {
+                                    name,
+                                    done: bytes,
+                                    total,
+                                }),
                             }
                         }
                     }
@@ -914,11 +1042,11 @@ fn switch_game(state: &mut UiState, tx: &tokio::sync::mpsc::Sender<UiEvent>, del
     if state.active < state.statuses.len() {
         state.statuses[state.active] = None;
     }
-    let name = state.paths[state.active]
-        .rsplit('/')
-        .next()
-        .unwrap_or("game");
-    push_log(state, format!("→ {name} (game {}/{})", state.active + 1, state.paths.len()));
+    let name = state.paths[state.active].rsplit('/').next().unwrap_or("game");
+    push_log(
+        state,
+        format!("→ {name} (game {}/{})", state.active + 1, state.paths.len()),
+    );
     spawn_status(tx, &state.paths[state.active], state.active);
 }
 
@@ -950,7 +1078,11 @@ fn apply_quality(state: &mut UiState, folder: &str, choice: Quality) {
     match quality::set_selected(std::path::Path::new(folder), choice) {
         Ok(()) => push_log(
             state,
-            format!("quality: set {} ({}) — press 'p' to play", choice.as_arg(), choice.label()),
+            format!(
+                "quality: set {} ({}) — press 'p' to play",
+                choice.as_arg(),
+                choice.label()
+            ),
         ),
         Err(e) => push_log(state, format!("quality save failed: {e}")),
     }
@@ -975,7 +1107,10 @@ fn play(state: &mut UiState, folder: &str) {
         .or(info.selected)
         .unwrap_or_else(|| info.default_choice());
     if game.uses_quality_tiers() && !info.is_installed(quality) {
-        push_log(state, format!("cannot play: {} paks are not installed", quality.as_arg()));
+        push_log(
+            state,
+            format!("cannot play: {} paks are not installed", quality.as_arg()),
+        );
         return;
     }
     match launch::plan(p, game, quality) {
@@ -991,9 +1126,7 @@ fn play(state: &mut UiState, folder: &str) {
 /// process group, for a client that hangs on shutdown.
 fn kill_game(state: &mut UiState, folder: &str) {
     match launch::kill(std::path::Path::new(folder)) {
-        Ok(r) if r.was_running => {
-            push_log(state, format!("force-killed game (group {})", r.pid))
-        }
+        Ok(r) if r.was_running => push_log(state, format!("force-killed game (group {})", r.pid)),
         Ok(r) => push_log(state, format!("no running game (group {} already exited)", r.pid)),
         Err(e) => push_log(state, format!("kill: {e}")),
     }
@@ -1044,7 +1177,9 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
     let path = path.to_string();
     tokio::spawn(async move {
         let result = async {
-            let mgr = GameManager::open(PathBuf::from(path)).await.map_err(|e| e.to_string())?;
+            let mgr = GameManager::open(PathBuf::from(path))
+                .await
+                .map_err(|e| e.to_string())?;
             let plan = mgr.plan_predownload().await.map_err(|e| e.to_string())?;
             let (ptx, mut prx) = tokio::sync::mpsc::channel(256);
             let tx2 = tx.clone();
@@ -1053,7 +1188,11 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
                     let _ = tx2.send(UiEvent::Progress(ev)).await;
                 }
             });
-            let _ = ptx.send(ProgressEvent::SetTotal { bytes: plan.total_bytes }).await;
+            let _ = ptx
+                .send(ProgressEvent::SetTotal {
+                    bytes: plan.total_bytes,
+                })
+                .await;
             mgr.predownload(&plan, ptx).await.map_err(|e| e.to_string())?;
             if plan.total_bytes == 0 {
                 Ok::<_, String>("already up to date — nothing to download".to_string())
@@ -1073,13 +1212,7 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
     });
 }
 
-fn spawn_install(
-    tx: &tokio::sync::mpsc::Sender<UiEvent>,
-    path: &str,
-    game: Game,
-    server: Server,
-    body: BodyChoice,
-) {
+fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game, server: Server, body: BodyChoice) {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1091,13 +1224,9 @@ fn spawn_install(
             }
         });
         let folder = PathBuf::from(path);
-        let result =
-            match GameManager::install_with_progress(game, server, folder, body, Some(ptx)).await {
+        let result = match GameManager::install_with_progress(game, server, folder, body, Some(ptx)).await {
             Ok(r) => {
-                let exe = r
-                    .game_exe
-                    .map(|e| format!(" — exe: {e}"))
-                    .unwrap_or_default();
+                let exe = r.game_exe.map(|e| format!(" — exe: {e}")).unwrap_or_default();
                 Ok(format!(
                     "install complete — {} v{} (game files){exe} · press 'p' to play",
                     pretty_game(game),
@@ -1114,6 +1243,8 @@ enum TaskKind {
     Apply,
     Sync,
     Checkout,
+    /// Install one quality pack (files + launcher records).
+    Pack(Quality),
 }
 
 fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskKind) {
@@ -1130,13 +1261,12 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
         });
         let mut ptx = Some(ptx);
         let result = async {
-            let mgr = GameManager::open(PathBuf::from(path)).await.map_err(|e| e.to_string())?;
+            let mgr = GameManager::open(PathBuf::from(path))
+                .await
+                .map_err(|e| e.to_string())?;
             match kind {
                 TaskKind::Apply => {
-                    let report = mgr
-                        .apply_with_progress(ptx.take())
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    let report = mgr.apply_with_progress(ptx.take()).await.map_err(|e| e.to_string())?;
                     Ok(format!(
                         "apply complete — merged {}, skipped {}, fallback {}, swapped {}, deleted {}",
                         report.merged,
@@ -1147,10 +1277,7 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                     ))
                 }
                 TaskKind::Sync => {
-                    let report = mgr
-                        .sync_with_progress(ptx.take())
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    let report = mgr.sync_with_progress(ptx.take()).await.map_err(|e| e.to_string())?;
                     let failed = if report.failed.is_empty() {
                         String::new()
                     } else {
@@ -1163,6 +1290,33 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                         report.ok,
                         report.orphans_removed
                     ))
+                }
+                TaskKind::Pack(tier) => {
+                    let report = mgr.sync_pack(tier, true, ptx.take()).await.map_err(|e| e.to_string())?;
+                    let failed = report.broken.len();
+                    Ok(if report.registered {
+                        format!(
+                            "{} pack installed — {} file(s), {:.1} GiB, launcher records in place{}{}",
+                            tier.as_arg(),
+                            report.parts.iter().map(|p| p.downloaded).sum::<usize>(),
+                            report.bytes() as f64 / (1 << 30) as f64,
+                            if failed > 0 {
+                                format!(", {failed} failed")
+                            } else {
+                                String::new()
+                            },
+                            if report.pruned > 0 {
+                                format!(", {} stale removed", report.pruned)
+                            } else {
+                                String::new()
+                            }
+                        )
+                    } else {
+                        format!(
+                            "{} pack incomplete — {failed} file(s) failed, launcher records NOT written",
+                            tier.as_arg()
+                        )
+                    })
                 }
                 TaskKind::Checkout => {
                     // toggle between cn and bilibili
@@ -1238,17 +1392,17 @@ fn ui(f: &mut Frame, state: &UiState) {
                 state.busy,
                 state.quality_sel.first().copied().flatten(),
             ))
-                .wrap(Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("status")
-                        .border_style(Style::default().fg(if state.focus == Focus::Status {
-                            Color::Yellow
-                        } else {
-                            Color::Reset
-                        })),
-                ),
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("status")
+                    .border_style(Style::default().fg(if state.focus == Focus::Status {
+                        Color::Yellow
+                    } else {
+                        Color::Reset
+                    })),
+            ),
             chunks[0],
         );
     }
@@ -1289,18 +1443,16 @@ fn ui(f: &mut Frame, state: &UiState) {
         }
     };
     f.render_widget(
-        Paragraph::new(task_lines)
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("task")
-                    .border_style(Style::default().fg(if state.focus == Focus::Task {
-                        Color::Yellow
-                    } else {
-                        Color::Reset
-                    })),
-            ),
+        Paragraph::new(task_lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("task")
+                .border_style(Style::default().fg(if state.focus == Focus::Task {
+                    Color::Yellow
+                } else {
+                    Color::Reset
+                })),
+        ),
         chunks[1],
     );
 
@@ -1319,29 +1471,23 @@ fn ui(f: &mut Frame, state: &UiState) {
         .map(|l| Line::raw(l.as_str()))
         .collect();
     f.render_widget(
-        Paragraph::new(log_lines)
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("log (↑/↓ PgUp/PgDn)")
-                    .border_style(Style::default().fg(if state.focus == Focus::Log {
-                        Color::Yellow
-                    } else {
-                        Color::Reset
-                    })),
-            ),
+        Paragraph::new(log_lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("log (↑/↓ PgUp/PgDn)")
+                .border_style(Style::default().fg(if state.focus == Focus::Log {
+                    Color::Yellow
+                } else {
+                    Color::Reset
+                })),
+        ),
         chunks[2],
     );
 
     let footer = format!(
         "{} | p: play  k: kill  r: refresh  s: sync  i: install  Q: quality  h: help  q: quit{}",
         if state.paths.len() > 1 {
-            format!(
-                "Tab: focus  ←/→: game ({}/{})",
-                state.active + 1,
-                state.paths.len()
-            )
+            format!("Tab: focus  ←/→: game ({}/{})", state.active + 1, state.paths.len())
         } else {
             "Tab: focus".to_string()
         },
@@ -1365,6 +1511,7 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw("From a shell"),
             Line::raw("  kuro install wuwa cn ~/Games/WutheringWaves --quality hd"),
             Line::raw("  kuro sync ~/Games/WutheringWaves --quality uhd"),
+            Line::raw("  kuro pack ~/Games/WutheringWaves uhd"),
             Line::raw("  kuro install pgr global ~/PGR"),
             Line::raw(""),
             Line::raw("h / ? / Esc to close"),
@@ -1406,7 +1553,11 @@ fn ui(f: &mut Frame, state: &UiState) {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "  [s] [h] [u] choose      Enter apply      Esc cancel",
+            "  [s] [h] [u] pick     [i] install",
+            Style::default().fg(Color::Cyan),
+        ));
+        lines.push(Line::styled(
+            "  Enter pick + install     Esc close",
             Style::default().fg(Color::Cyan),
         ));
         let area = centered_rect(68, 46, f.area());
@@ -1451,10 +1602,7 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw(""),
         ];
         match &state.steam {
-            Some(steam) => modal_lines.push(Line::raw(format!(
-                "  Steam:  {}",
-                steam.steam_root.display()
-            ))),
+            Some(steam) => modal_lines.push(Line::raw(format!("  Steam:  {}", steam.steam_root.display()))),
             None => modal_lines.push(Line::raw("  Steam:  not detected")),
         }
         modal_lines.push(Line::raw(""));
@@ -1482,11 +1630,7 @@ fn ui(f: &mut Frame, state: &UiState) {
 
 /// Lines for a per-game status box. `busy` marks the active game's box while
 /// a task is running, so "up to date" never lies about in-flight work.
-fn status_box_lines(
-    s: Option<&Result<GameStatus, String>>,
-    busy: bool,
-    quality: Option<Quality>,
-) -> Vec<Line<'_>> {
+fn status_box_lines(s: Option<&Result<GameStatus, String>>, busy: bool, quality: Option<Quality>) -> Vec<Line<'_>> {
     match s {
         Some(Ok(s)) => {
             let mut lines = vec![
@@ -1513,10 +1657,7 @@ fn status_box_lines(
             });
             lines
         }
-        Some(Err(e)) => vec![Line::styled(
-            format!("error: {e}"),
-            Style::default().fg(Color::Red),
-        )],
+        Some(Err(e)) => vec![Line::styled(format!("error: {e}"), Style::default().fg(Color::Red))],
         None => vec![Line::raw("loading...")],
     }
 }
@@ -1586,8 +1727,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, UiState,
-        DEFAULT_GAME_DIR,
+        body_choice, parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, UiState, DEFAULT_GAME_DIR,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, Quality, Server};
 
@@ -1674,7 +1814,10 @@ mod tests {
         });
         let q = render_to_string(&state, 100, 34);
         assert!(q.contains("not installed"), "quality panel missing plain status:\n{q}");
-        assert!(q.contains("Enter apply"), "quality panel missing action hint:\n{q}");
+        assert!(
+            q.contains("Enter pick + install"),
+            "quality panel missing the install hint:\n{q}"
+        );
         assert!(!q.contains("-krqlv"), "quality panel leaks the raw flag:\n{q}");
     }
 
@@ -1736,7 +1879,10 @@ mod tests {
         assert!(!pgr.contains("quality:"), "PGR box shows a quality line:\n{pgr}");
 
         let wuwa = render_to_string(&state(Game::WuWa, Server::Cn), 60, 20);
-        assert!(wuwa.contains("quality: not set"), "WuWa box lost its quality line:\n{wuwa}");
+        assert!(
+            wuwa.contains("quality: not set"),
+            "WuWa box lost its quality line:\n{wuwa}"
+        );
     }
 
     #[test]

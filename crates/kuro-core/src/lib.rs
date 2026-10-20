@@ -7,22 +7,25 @@
 //! * `apply`       — merge (native), verify, atomic swap
 //! * `sync`        — full-tree MD5 verify/repair
 //! * `checkout`    — server switch (CN <-> Bilibili <-> global)
+//! * `pack`        — quality pack (SD/HD/UHD) install + launcher registration
 
 pub mod atomic;
 pub mod download;
 pub mod game;
 pub mod launch;
 pub mod md5_cache;
+pub mod pack;
 pub mod quality;
 pub mod state;
 pub mod steam;
 
 pub use game::{detect_game, find_game_exe};
 pub use game::{
-    ApplyReport, BodyChoice, CheckoutReport, GameManager, GameStatus, InstallReport, PendingGroup,
-    ProgressEvent, SyncReport,
+    ApplyReport, BodyChoice, CheckoutReport, GameManager, GameStatus, InstallReport, PendingGroup, ProgressEvent,
+    SyncReport,
 };
 pub use kuro_api::{Error, Game, Result, Server};
 pub use launch::{KillReport, LaunchPlan};
+pub use pack::{PackMarker, PackPartReport, PackRecord, PackReport, PackState};
 pub use quality::{PackInfo, Quality, QualityInfo};
 pub use steam::{default_game_dir, detect_steam, SteamInfo};

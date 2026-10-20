@@ -48,12 +48,15 @@ the wine dependency is removed by applying patches via
   (size, mtime) like `make`/`git`, so re-verify costs one stat per file. Pure
   I/O savings — delete `.kuro_cache/` any time to force a full re-hash
 - **install** — from-zero client download for any supported game
-- **download options (quality packs)** — a channel's manifest carries the base
-  paks plus one or more `Client/Content/<SD|HD|UHD>` bodies (WuWa 3.7.0 ships
-  `HD` at ~42.6 GiB inside the same manifest), so `--quality sd|hd|uhd` picks
-  which body an install/sync fetches instead of taking everything the channel
-  serves. A body the channel does not serve is refused by name, not silently
-  skipped. PGR (Unity) has no quality packs, so the option is WuWa-only
+- **quality packs (SD / HD / UHD)** — WuWa's channel manifest carries the base
+  paks plus one `Client/Content/HD` body and nothing else, so SD and UHD cannot
+  come from `sync`. `kuro pack <folder> <sd|hd|uhd>` installs the tier from the
+  launcher's own pack document (`common` + `sd`/`hd`/`uhd`, each with its own
+  version, manifest and CDN) and then writes the two records the official
+  launcher reads, so the tier counts as installed instead of as "repair game".
+  `--check` verifies without downloading. `--quality` on `install` / `sync`
+  stays the narrower thing: it picks which body those fetch from the channel.
+  PGR (Unity) has no quality packs, so this is WuWa-only
 - **checkout** — CN ⇄ Bilibili channel switch for WuWa (diff-file swap + appId)
 - Resumable, MD5-verified downloads with per-file progress bars
 
@@ -106,6 +109,7 @@ kuro status <folder>    # CLI: print local/remote versions
 kuro sync <folder> [--quality <sd|hd|uhd>]              # CLI: verify + repair
 kuro install <wuwa|pgr> <cn|bilibili|global> <folder> [--quality <sd|hd|uhd>]
 kuro quality <folder> [sd|hd|uhd]                       # CLI: which pack the client mounts
+kuro pack [folder] <sd|hd|uhd> [--check]                # CLI: install the paks + register them
 ```
 
 `--quality` on `install` / `sync` is the **download** side of that choice: only
@@ -117,6 +121,18 @@ HD. The saved preset (`kuro quality <folder> hd`) is what a plain `sync` follows
 afterwards, best-effort: if the channel currently serves no such body, the run
 falls back to the full manifest rather than failing. PGR has no quality packs at
 all, so there `--quality` is refused rather than ignored.
+
+Getting a tier the channel does not serve is `kuro pack`'s job. It is
+idempotent — a rerun verifies by MD5 and downloads only what is missing — and it
+writes the launcher records only after every file of the tier verifies, because
+a record for a pack the disk does not have is exactly what makes the launcher
+answer "repair game". The records are withdrawn before the first byte of a
+reinstall for the same reason: an interrupted run must read as "not installed",
+not as a broken install. `common` is reconciled against the channel: where the
+two disagree about a file (the 69 channel-SDK binaries, CN vs Bilibili), the
+channel wins and the pack's copy is left alone. The manifest is also checked
+against the `indexFileMd5` the pack document publishes, and an offered version
+older than the installed one is refused rather than rolled back.
 
 ### TUI keys
 
@@ -131,6 +147,7 @@ all, so there `--quality` is refused rather than ignored.
 | `s` | sync / repair files |
 | `c` | checkout server (CN ⇄ Bilibili) |
 | `i` | install a new game (`w`/`p` game · `c`/`b`/`g` server · `f` quality pack · `t` path · `s` Steam default) |
+| `Q` | quality preset (`s`/`h`/`u` pick · `i` install that tier's paks · Enter pick + install · saved for `p`) |
 | `h` / `?` | help overlay |
 | `q` | quit |
 
@@ -195,12 +212,14 @@ cargo run -p kuro-core --example pgr_proof   # live CDN smoke test (PGR)
   is derived from the shared launcher platform, not yet confirmed against a
   live session
 - ACE anti-cheat doesn't run under Proton (see above)
-- Quality packs are a *download* choice for the bodies a channel serves, and they
-  only cover `install` / `sync`: `predownload` / `apply` still stage the whole
-  patch set for a version, because a partially-applied patch would record a
-  version the install does not actually hold. A pack the channel does not serve
-  cannot be installed at all — the client mounts a directory that was never
-  downloaded without complaint from the CDN
+- `--quality` on `install` / `sync` only covers the bodies a channel serves:
+  `predownload` / `apply` still stage the whole patch set for a version,
+  because a partially-applied patch would record a version the install does not
+  actually hold. Tiers the channel does not serve come from `kuro pack`
+- `kuro pack` installs one tier at a time; nothing switches between installed
+  tiers on disk. Each tier is a disjoint ~20–62 GiB body, so keeping more than
+  one installed is a disk-space decision, and the `-krqlv=` argument is what
+  picks which is mounted
 - PGR has no quality packs to choose from: it is a Unity title whose assets live
   under `PGR_Data/` and whose client takes no `-krqlv` tier, so `--quality` is
   refused for it rather than pretended at

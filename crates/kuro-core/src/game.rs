@@ -7,9 +7,8 @@ use std::sync::Arc;
 
 use kuro_api::config::ServerEntry;
 use kuro_api::{
-    build_client, game_server_by_app_id, index_url, server_entry, ApiClient, ChunkInfo, Error,
-    FileRef, Game, GroupInfo, LauncherIndex, LocalConfig, PatchConfig, PatchIndex, ResourceItem,
-    Server, Result,
+    build_client, game_server_by_app_id, index_url, server_entry, ApiClient, Error, FileRef, Game,
+    GroupInfo, LauncherIndex, LocalConfig, PatchConfig, PatchIndex, ResourceItem, Result, Server,
 };
 
 use crate::atomic::{recover_backup, safe_replace};
@@ -21,15 +20,28 @@ use crate::state::{self, incremental_dir};
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
     Log(String),
-    GroupStart { name: String },
+    GroupStart {
+        name: String,
+    },
     /// Periodic per-file byte progress while downloading.
-    FileProgress { name: String, bytes: u64, total: u64 },
-    GroupDone { name: String, bytes: u64 },
+    FileProgress {
+        name: String,
+        bytes: u64,
+        total: u64,
+    },
+    GroupDone {
+        name: String,
+        bytes: u64,
+    },
     /// Total bytes of the operation, known once planning/verification is done.
-    SetTotal { bytes: u64 },
+    SetTotal {
+        bytes: u64,
+    },
     /// Number of items queued for repair/download (replaces a per-item
     /// GroupStart flood for large manifests — one event, not N).
-    SetQueued { count: usize },
+    SetQueued {
+        count: usize,
+    },
     Done,
 }
 
@@ -144,8 +156,7 @@ impl GameManager {
     /// Open a game folder, auto-detecting game + server from
     /// `launcherDownloadConfig.json` (same file the official launcher writes).
     pub async fn open(game_folder: PathBuf) -> Result<Self> {
-        let cfg = state::read_local_config(&game_folder)?
-            .ok_or_else(|| Error::NoLocalConfig(game_folder.clone()))?;
+        let cfg = state::read_local_config(&game_folder)?.ok_or_else(|| Error::NoLocalConfig(game_folder.clone()))?;
         let (game, server) =
             game_server_by_app_id(&cfg.app_id).ok_or_else(|| Error::UnknownAppId(cfg.app_id.clone()))?;
         let api = ApiClient::new()?;
@@ -178,13 +189,34 @@ impl GameManager {
         self.body
     }
 
+    /// The launcher API client (index / manifest / pack-config fetches).
+    pub(crate) fn api_client(&self) -> &ApiClient {
+        &self.api
+    }
+
+    /// The HTTP client every download in this run shares.
+    pub(crate) fn http_client(&self) -> reqwest::Client {
+        self.http.clone()
+    }
+
+    /// The connection budget every download in this run shares.
+    pub(crate) fn download_budget(&self) -> Budget {
+        self.budget.clone()
+    }
+
     pub fn server_entry(&self) -> &'static ServerEntry {
         server_entry(self.game, self.server).expect("registry covers all known servers")
     }
 
     /// Local version from `launcherDownloadConfig.json`.
     pub fn local_version(&self) -> Result<Option<String>> {
-        Ok(state::read_local_config(&self.game_folder)?.map(|c| c.version))
+        Ok(self.local_config()?.map(|c| c.version))
+    }
+
+    /// The whole local config, including the keys kuro does not model — the
+    /// `bundles` records live there (see [`LocalConfig`]).
+    pub fn local_config(&self) -> Result<Option<LocalConfig>> {
+        state::read_local_config(&self.game_folder)
     }
 
     /// Remote (current) version + whether an update is available.
@@ -237,21 +269,13 @@ impl GameManager {
 
     /// Build a plan from an already-fetched patch manifest (no network, so it
     /// is directly testable).
-    fn plan_from_patch_index(
-        &self,
-        patch_index: &PatchIndex,
-        from_version: &str,
-        to_version: &str,
-    ) -> PredownloadPlan {
+    fn plan_from_patch_index(&self, patch_index: &PatchIndex, from_version: &str, to_version: &str) -> PredownloadPlan {
         let mut patch_groups = Vec::new();
         let mut full_files = Vec::new();
         let mut total = 0u64;
 
-        let res_by_dest: std::collections::HashMap<&str, &ResourceItem> = patch_index
-            .resource
-            .iter()
-            .map(|r| (r.dest.as_str(), r))
-            .collect();
+        let res_by_dest: std::collections::HashMap<&str, &ResourceItem> =
+            patch_index.resource.iter().map(|r| (r.dest.as_str(), r)).collect();
 
         for group in &patch_index.group_infos {
             if group_already_target(&self.game_folder, group) {
@@ -338,11 +362,8 @@ impl GameManager {
             .find(|p| p.version == plan.from_version)
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
         let patch_index = self.api.fetch_manifest(&nodes, &patch_cfg.index_file).await?;
-        let res_by_dest: std::collections::HashMap<&str, &ResourceItem> = patch_index
-            .resource
-            .iter()
-            .map(|r| (r.dest.as_str(), r))
-            .collect();
+        let res_by_dest: std::collections::HashMap<&str, &ResourceItem> =
+            patch_index.resource.iter().map(|r| (r.dest.as_str(), r)).collect();
 
         // Both passes run across FILES in parallel, each file bounded by the
         // shared connection budget. Sequentially, one file's slow tail left the
@@ -374,8 +395,7 @@ impl GameManager {
                         total: size,
                     })
                     .await;
-                download_single(&http, &urls, &tmp, Some(size), None, &name, Some(&tx), &budget)
-                    .await?;
+                download_single(&http, &urls, &tmp, Some(size), None, &name, Some(&tx), &budget).await?;
                 std::fs::rename(&tmp, &staged)?;
                 let _ = tx.send(ProgressEvent::GroupDone { name, bytes: size }).await;
                 Ok::<_, Error>(())
@@ -397,15 +417,8 @@ impl GameManager {
             // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
             // ranges so big paks download over parallel connections (the CDN
             // rate-limits per connection). Whole-file MD5 is still verified.
-            let chunk_infos = if res.chunk_infos.is_empty() && res.size > SYNTH_CHUNK_SIZE {
-                let n = (res.size + SYNTH_CHUNK_SIZE - 1) / SYNTH_CHUNK_SIZE;
-                (0..n)
-                    .map(|i| ChunkInfo {
-                        start: i * SYNTH_CHUNK_SIZE,
-                        end: ((i + 1) * SYNTH_CHUNK_SIZE - 1).min(res.size - 1),
-                        md5: String::new(),
-                    })
-                    .collect::<Vec<_>>()
+            let chunk_infos = if res.chunk_infos.is_empty() {
+                crate::download::chunk_plan(res.size, SYNTH_CHUNK_SIZE)
             } else {
                 res.chunk_infos.clone()
             };
@@ -455,19 +468,13 @@ impl GameManager {
                     .await?;
                 }
                 std::fs::rename(&tmp, &staged)?;
-                let _ = tx
-                    .send(ProgressEvent::GroupDone {
-                        name,
-                        bytes: item_size,
-                    })
-                    .await;
+                let _ = tx.send(ProgressEvent::GroupDone { name, bytes: item_size }).await;
                 Ok::<_, Error>(())
             });
         }
 
         while let Some(joined) = handles.join_next().await {
-            joined
-                .map_err(|e| Error::Patch(format!("predownload join: {e}")))??;
+            joined.map_err(|e| Error::Patch(format!("predownload join: {e}")))??;
         }
 
         let _ = tx.send(ProgressEvent::Done).await;
@@ -539,9 +546,7 @@ impl GameManager {
     ) -> Result<ApplyReport> {
         let inc = incremental_dir(&self.game_folder);
         if !inc.exists() {
-            return Err(Error::MissingField(
-                ".incremental_download — run predownload first",
-            ));
+            return Err(Error::MissingField(".incremental_download — run predownload first"));
         }
 
         let res_by_dest: HashMap<String, ResourceItem> = patch_index
@@ -619,9 +624,7 @@ impl GameManager {
         let mut outcomes: Vec<(String, GroupOutcome)> = Vec::with_capacity(handles.len());
         let mut fallback_dests: Vec<FileRef> = Vec::new();
         for (i, h) in handles.into_iter().enumerate() {
-            let (name, outcome) = h
-                .await
-                .map_err(|e| Error::Patch(format!("merge task join: {e}")))??;
+            let (name, outcome) = h.await.map_err(|e| Error::Patch(format!("merge task join: {e}")))??;
             if let GroupOutcome::Fallback(files) = &outcome {
                 fallback_dests.extend(files.iter().cloned());
             }
@@ -630,13 +633,14 @@ impl GameManager {
                 // now and its bytes arrive from the download phase below, so no
                 // byte is ever counted twice.
                 let bytes = match &outcome {
-                    GroupOutcome::Merged | GroupOutcome::Skipped => {
-                        group_bytes.get(i).map(|(_, b)| *b).unwrap_or(0)
-                    }
+                    GroupOutcome::Merged | GroupOutcome::Skipped => group_bytes.get(i).map(|(_, b)| *b).unwrap_or(0),
                     GroupOutcome::Fallback(_) => 0,
                 };
                 let _ = tx
-                    .send(ProgressEvent::GroupDone { name: name.clone(), bytes })
+                    .send(ProgressEvent::GroupDone {
+                        name: name.clone(),
+                        bytes,
+                    })
                     .await;
             }
             outcomes.push((name, outcome));
@@ -652,11 +656,9 @@ impl GameManager {
             }
             let res = res_by_dest.get(&dst.dest);
             let (from, chunks, md5) = match res {
-                Some(r) if r.from_folder.is_some() => (
-                    r.from_folder.clone().unwrap(),
-                    r.chunk_infos.clone(),
-                    r.md5.clone(),
-                ),
+                Some(r) if r.from_folder.is_some() => {
+                    (r.from_folder.clone().unwrap(), r.chunk_infos.clone(), r.md5.clone())
+                }
                 _ => {
                     // fall back to the patch's zip base
                     (patch_cfg.base_url.clone(), vec![], String::new())
@@ -719,8 +721,7 @@ impl GameManager {
             });
         }
         while let Some(joined) = handles.join_next().await {
-            joined
-                .map_err(|e| Error::Patch(format!("fallback download join: {e}")))??;
+            joined.map_err(|e| Error::Patch(format!("fallback download join: {e}")))??;
         }
 
         // ---- migration phase: verify everything is staged, then swap ----
@@ -823,12 +824,7 @@ impl GameManager {
             }
         }
         if !not_installed.is_empty() {
-            let sample = not_installed
-                .iter()
-                .take(3)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
+            let sample = not_installed.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
             return Err(Error::Patch(format!(
                 "refusing to record {to_version} as installed: {} target file(s) are not at \
                  the target revision (e.g. {sample}) — the update is not applied yet; \
@@ -838,11 +834,12 @@ impl GameManager {
         }
 
         // ---- finish: bump version, clean staging ----
-        let cfg = LocalConfig {
-            version: to_version.to_string(),
-            app_id: self.server_entry().app_id.to_string(),
-            group: "default".to_string(),
-        };
+        // Read-modify-write, not a fresh struct: `launcherDownloadConfig.json`
+        // also carries the launcher's `bundles` records, and an apply that
+        // dropped them would un-register an installed quality pack.
+        let cfg = state::read_local_config(&self.game_folder)?
+            .unwrap_or_else(|| LocalConfig::new(to_version, self.server_entry().app_id))
+            .retargeted(to_version, self.server_entry().app_id);
         state::write_local_config(&self.game_folder, &cfg)?;
         // Best-effort: the version is already recorded, so failing the whole
         // apply because staging was busy/locked would report failure for a
@@ -879,8 +876,7 @@ impl GameManager {
         body: BodyChoice,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<InstallReport> {
-        let entry = server_entry(game, server)
-            .ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
+        let entry = server_entry(game, server).ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
         let api = ApiClient::new()?;
         let index = api.fetch_index(&index_url(game, server)?).await?;
         let version = index.default.version.clone();
@@ -892,11 +888,11 @@ impl GameManager {
         // previous bytes and put them back on failure.
         let cfg_path = game_folder.join(state::LOCAL_CONFIG_FILE);
         let prev_cfg = std::fs::read(&cfg_path).ok();
-        let cfg = LocalConfig {
-            version: version.clone(),
-            app_id: entry.app_id.to_string(),
-            group: "default".to_string(),
-        };
+        // A reinstall into an existing folder must keep the launcher's own keys
+        // (`bundles` among them); a first install starts from nothing.
+        let cfg = state::read_local_config(&game_folder)?
+            .unwrap_or_else(|| LocalConfig::new(version.clone(), entry.app_id))
+            .retargeted(version.clone(), entry.app_id);
         state::write_local_config(&game_folder, &cfg)?;
 
         let mut mgr = Self::open(game_folder.clone()).await?;
@@ -936,11 +932,7 @@ impl GameManager {
     }
 
     /// Checkout core, testable with `api_url` pointed at a local server.
-    pub async fn checkout_inner(
-        &self,
-        target: Server,
-        api_url: Option<&str>,
-    ) -> Result<CheckoutReport> {
+    pub async fn checkout_inner(&self, target: Server, api_url: Option<&str>) -> Result<CheckoutReport> {
         let entry = server_entry(self.game, target).expect("registry covers all known servers");
         let api_url = match api_url {
             Some(u) => u.to_string(),
@@ -979,8 +971,7 @@ impl GameManager {
             let sem = sem.clone();
             handles.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                download_single(&http, &urls, &tmp, None, Some(md5.as_str()), &name, None, &budget)
-                    .await?;
+                download_single(&http, &urls, &tmp, None, Some(md5.as_str()), &name, None, &budget).await?;
                 safe_replace(&tmp, &game_path)?;
                 Ok::<_, Error>(())
             });
@@ -992,15 +983,15 @@ impl GameManager {
 
         if swapped == 0 {
             return Err(Error::Patch(
-                "checkout: no channel files could be swapped (missing from target manifest) — config left unchanged".into(),
+                "checkout: no channel files could be swapped (missing from target manifest) — config left unchanged"
+                    .into(),
             ));
         }
 
-        let cfg = LocalConfig {
-            version: to_version.clone(),
-            app_id: entry.app_id.to_string(),
-            group: "default".to_string(),
-        };
+        let cfg = self
+            .local_config()?
+            .unwrap_or_else(|| LocalConfig::new(to_version.clone(), entry.app_id))
+            .retargeted(to_version.clone(), entry.app_id);
         state::write_local_config(&self.game_folder, &cfg)?;
 
         Ok(CheckoutReport {
@@ -1015,10 +1006,7 @@ impl GameManager {
     }
 
     /// Sync with optional progress events (used by install and the TUI).
-    pub async fn sync_with_progress(
-        &self,
-        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
-    ) -> Result<SyncReport> {
+    pub async fn sync_with_progress(&self, tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>) -> Result<SyncReport> {
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let nodes = cdn_nodes(&self.api, &index)?;
         let cfg = &index.default.config;
@@ -1046,12 +1034,7 @@ impl GameManager {
     }
 
     /// Sync core, testable with a synthetic index + local HTTP server.
-    pub async fn sync_inner(
-        &self,
-        full_index: &PatchIndex,
-        cdn_nodes: &[&str],
-        base: &str,
-    ) -> Result<SyncReport> {
+    pub async fn sync_inner(&self, full_index: &PatchIndex, cdn_nodes: &[&str], base: &str) -> Result<SyncReport> {
         self.sync_inner_with_progress(Arc::new(full_index.clone()), cdn_nodes, base, None)
             .await
     }
@@ -1135,10 +1118,7 @@ impl GameManager {
         if let Some(tx) = &tx {
             if to_fix.is_empty() {
                 let _ = tx
-                    .send(ProgressEvent::Log(format!(
-                        "all {} files ok",
-                        report.checked
-                    )))
+                    .send(ProgressEvent::Log(format!("all {} files ok", report.checked)))
                     .await;
             } else {
                 let _ = tx
@@ -1154,11 +1134,7 @@ impl GameManager {
 
         // repair phase — parallel downloads, verified before swap
         if let Some(tx) = &tx {
-            let _ = tx
-                .send(ProgressEvent::SetQueued {
-                    count: to_fix.len(),
-                })
-                .await;
+            let _ = tx.send(ProgressEvent::SetQueued { count: to_fix.len() }).await;
         }
         let sem = Arc::new(tokio::sync::Semaphore::new(FILE_CONCURRENCY));
         let mut handles = tokio::task::JoinSet::new();
@@ -1183,15 +1159,8 @@ impl GameManager {
                 // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
                 // ranges so big paks download over parallel connections (the
                 // CDN rate-limits per connection). Whole-file MD5 still verified.
-                let chunk_infos = if item.chunk_infos.is_empty() && item.size > SYNTH_CHUNK_SIZE {
-                    let n = (item.size + SYNTH_CHUNK_SIZE - 1) / SYNTH_CHUNK_SIZE;
-                    (0..n)
-                        .map(|i| ChunkInfo {
-                            start: i * SYNTH_CHUNK_SIZE,
-                            end: ((i + 1) * SYNTH_CHUNK_SIZE - 1).min(item.size - 1),
-                            md5: String::new(),
-                        })
-                        .collect::<Vec<_>>()
+                let chunk_infos = if item.chunk_infos.is_empty() {
+                    crate::download::chunk_plan(item.size, SYNTH_CHUNK_SIZE)
                 } else {
                     item.chunk_infos.clone()
                 };
@@ -1229,8 +1198,8 @@ impl GameManager {
         // GroupDone in completion order, not spawn order: a slow first file
         // must not stall progress reporting for every file after it.
         while let Some(joined) = handles.join_next().await {
-            let inner: std::result::Result<(String, u64), Error> = joined
-                .map_err(|e| Error::Patch(format!("repair join: {e}")))?;
+            let inner: std::result::Result<(String, u64), Error> =
+                joined.map_err(|e| Error::Patch(format!("repair join: {e}")))?;
             match inner {
                 Ok((dest, size)) => {
                     report.repaired += 1;
@@ -1473,18 +1442,12 @@ fn tmp_sibling(path: &Path, tag: &str) -> PathBuf {
 /// the patch's own base URL — the same fallback `sync` uses for the full
 /// manifest.
 fn resource_base(res: &ResourceItem, patch_cfg: &PatchConfig) -> String {
-    res.from_folder
-        .clone()
-        .unwrap_or_else(|| patch_cfg.base_url.clone())
+    res.from_folder.clone().unwrap_or_else(|| patch_cfg.base_url.clone())
 }
 
 /// CDN base URLs to try for this run, best edge first (borrows from `index`).
 fn cdn_nodes<'a>(api: &ApiClient, index: &'a LauncherIndex) -> Result<Vec<&'a str>> {
-    Ok(api
-        .cdn_candidates(index)?
-        .iter()
-        .map(|n| n.url.as_str())
-        .collect())
+    Ok(api.cdn_candidates(index)?.iter().map(|n| n.url.as_str()).collect())
 }
 
 /// Build one resource's URL on every candidate CDN edge, best first.
@@ -1498,9 +1461,7 @@ fn node_urls<S: AsRef<str>>(nodes: &[S], build: impl Fn(&str) -> String) -> Vec<
 
 fn file_matches(path: &Path, size: u64, md5: &str) -> bool {
     match std::fs::metadata(path) {
-        Ok(m) if m.len() == size && !md5.is_empty() => {
-            kuro_patch::md5_file(path).map(|a| a == md5).unwrap_or(false)
-        }
+        Ok(m) if m.len() == size && !md5.is_empty() => kuro_patch::md5_file(path).map(|a| a == md5).unwrap_or(false),
         Ok(m) if m.len() == size => true,
         _ => false,
     }
@@ -1614,7 +1575,9 @@ fn is_stale_artifact(rel: &str, dir_exts: &HashMap<String, HashSet<String>>) -> 
 /// itself. Best-effort: IO errors are ignored because the worst case is
 /// leaving an empty directory behind, not corrupting data.
 fn prune_empty_dirs(root: &Path) {
-    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         let name = entry.file_name();
@@ -1722,15 +1685,7 @@ fn is_protected(rel: &str) -> bool {
     }
     // Runtime artefacts by extension: logs, crash dumps, local databases,
     // per-machine hashes, local saves.
-    const RUNTIME_SUFFIXES: &[&str] = &[
-        ".log",
-        ".dmp",
-        ".dmp.gz",
-        ".db",
-        ".db-journal",
-        ".hash",
-        ".sav",
-    ];
+    const RUNTIME_SUFFIXES: &[&str] = &[".log", ".dmp", ".dmp.gz", ".db", ".db-journal", ".hash", ".sav"];
     if RUNTIME_SUFFIXES.iter().any(|suf| lower.ends_with(suf)) {
         return true;
     }
@@ -1815,10 +1770,7 @@ mod tests {
         ));
 
         // foreign extension in a manifest directory -> kept
-        assert!(!is_stale_artifact(
-            "Client/Binaries/Win64/KDData-data.db",
-            &dirs
-        ));
+        assert!(!is_stale_artifact("Client/Binaries/Win64/KDData-data.db", &dirs));
         assert!(!is_stale_artifact(
             "Client/Binaries/Win64/cdbe868d_unique_id_kurodata",
             &dirs
@@ -1829,10 +1781,7 @@ mod tests {
             "Client/Saved/Resources/Video/Paks/272_1/Video_272_1-WindowsNoEditor.pak",
             &dirs
         ));
-        assert!(!is_stale_artifact(
-            "Client/Content/Paks/OldLocale/en-US/old.bin",
-            &dirs
-        ));
+        assert!(!is_stale_artifact("Client/Content/Paks/OldLocale/en-US/old.bin", &dirs));
     }
 
     /// Regression: an unreadable subdirectory must not abort the sweep. A live
@@ -1851,11 +1800,7 @@ mod tests {
 
         // a stale artifact we can see, and one hidden inside the locked dir
         std::fs::write(paks.join("pakchunk18-WindowsNoEditor.pak"), b"STALE").unwrap();
-        std::fs::write(
-            paks.join("locked/pakchunk19-WindowsNoEditor.pak"),
-            b"HIDDEN",
-        )
-        .unwrap();
+        std::fs::write(paks.join("locked/pakchunk19-WindowsNoEditor.pak"), b"HIDDEN").unwrap();
 
         let manifest = vec![res("Client/Content/Paks/pakchunk0.pak", 10, None)];
 
@@ -1903,10 +1848,7 @@ mod tests {
             resource_base(&res("Client/a.dll", 1, None), &patch_cfg),
             patch_cfg.base_url
         );
-        assert_eq!(
-            resource_base(&res("Client/a.dll", 1, Some("zip")), &patch_cfg),
-            "zip"
-        );
+        assert_eq!(resource_base(&res("Client/a.dll", 1, Some("zip")), &patch_cfg), "zip");
     }
 
     /// Regression: a patch manifest with no `fromFolder` (the live WuWa CN
@@ -1916,15 +1858,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kuro-plan-nofrom-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        state::write_local_config(
-            &dir,
-            &LocalConfig {
-                version: "3.6.0".to_string(),
-                app_id: "10003".to_string(),
-                group: "default".to_string(),
-            },
-        )
-        .unwrap();
+        state::write_local_config(&dir, &LocalConfig::new("3.6.0".to_string(), "10003".to_string())).unwrap();
 
         let patch_index = PatchIndex {
             resource: vec![

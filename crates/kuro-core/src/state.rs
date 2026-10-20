@@ -64,6 +64,17 @@ pub fn read_local_config(game_folder: &Path) -> Result<Option<LocalConfig>> {
 pub fn write_local_config(game_folder: &Path, cfg: &LocalConfig) -> Result<()> {
     let path = game_folder.join(LOCAL_CONFIG_FILE);
     let data = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(path, data)?;
-    Ok(())
+    write_atomic(&path, &data)
+}
+
+/// Replace `path` with `data` without ever leaving a half-written file: this
+/// file is the install's identity, and a truncated `launcherDownloadConfig.json`
+/// makes both the launcher and kuro treat the install as broken.
+pub fn write_atomic(path: &Path, data: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data)?;
+    crate::atomic::safe_replace(&tmp, path)
 }

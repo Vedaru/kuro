@@ -5,23 +5,33 @@
 # workflow that used to re-tar whatever `kuro` was already installed on the
 # runner -- a snapshot of a machine, not a build.
 #
-# runs-on: glibc names a LABEL, and the label names an image. The Forgejo
-# SERVER's runner carries it, mapped to a glibc image:
+# runs-on: glibc-amd64 names a LABEL, and the label names an image. The x86_64
+# runner carries it, mapped to a glibc image:
 #
 #   runner:
 #     labels:
-#       - "glibc:docker://ubuntu:26.04"
+#       - "glibc-amd64:docker://ubuntu:26.04"
 #
-# so this job gets a throwaway ubuntu:26.04 container of its own, on the server.
-# That runner also sets `container.network: host`, which is the only reason the
-# loopback URLs below resolve: the instance listens on the host's 127.0.0.1:3000
-# and the job container shares the host's network namespace.
+# so this job gets a throwaway ubuntu:26.04 container of its own, on that host.
+# The runner also sets `container.network: host`, which is the only reason the
+# loopback URLs below resolve: an frp stcp visitor on the x86_64 runner binds
+# 127.0.0.1:3000 to the Forgejo instance on the Oracle server, and the job
+# container shares the host's network namespace.
+#
+# The label is architecture-specific on purpose. Both runners used to exist, and
+# `glibc` (the Oracle server, aarch64) and `glibc-amd64` (the home laptop,
+# x86_64) are the labels that tell them apart. The published bundle has to be an
+# x86_64 binary -- it is installed on desktop machines -- so a job that runs on
+# the aarch64 server produces an aarch64 binary under a version the restore then
+# uses everywhere. That is a silent wrong-architecture publish, not a build
+# error, so the architecture is pinned by label rather than left to whichever
+# runner picks the job up. Vedaru/Hyprland's hyprbuntu job hit exactly this:
+# run 37 landed on the server and died at the first host tool with `Exec format
+# error`.
 #
 # A per-job `container:` block does NOT work on this runner -- it ignores it and
 # the job dies at container setup. The image must come from the runner's own
-# label, and the workflow only asks for the label. Vedaru/Hyprland's hyprbuntu
-# job is the same shape; its header carries the long version of this, including
-# why an Alpine image cannot be used for a glibc binary.
+# label, and the workflow only asks for the label.
 #
 # Nothing from the host is mounted. The runner permits exactly one host path as
 # a job volume (/home/vedaru/Downloads, from `valid_volumes`) and this job uses
@@ -42,8 +52,9 @@
 #     there was simultaneously the install on the server and the bundle input.
 #     Nothing is installed anywhere now.
 #   * the label was disjoint from `ubuntu-latest` on purpose, because two
-#     runners claimed that one and a job could land on the wrong host. There is
-#     no second runner any more, so `glibc` is now only a name for the image.
+#     runners claimed that one and a job could land on the wrong host. That
+#     still holds: `ubuntu-latest` is claimed by both, so this job asks for the
+#     architecture-specific label instead of the shared one.
 #
 # HOME is set to /home/vedaru below, and that needs its own explanation,
 # because it is the one place a reader would reasonably assume a host
@@ -62,7 +73,9 @@
 # next ansible restore, like every other machine's.
 #
 # Everything talks to the instance over loopback (127.0.0.1:3000), not
-# https://git.vedaru.cn. The public name resolves through Cloudflare, which
+# https://git.vedaru.cn. From the x86_64 runner that address is an frp stcp
+# visitor tunnelled to the server, so a link flap resets an in-flight clone;
+# the clone step retries for that reason. The public name resolves through Cloudflare, which
 # completes TCP on its IPv6 addresses and then drops the TLS ClientHello, and
 # which has answered 502/524 on the large PUTs publish.sh makes; the clone and
 # every upload used to carry a credential helper plus an http.curloptResolve
@@ -92,7 +105,9 @@ env:
 
 jobs:
   package:
-    runs-on: glibc
+    # x86_64 runner only -- the published binary must be x86_64, and the label
+    # is what selects the architecture (see the header).
+    runs-on: glibc-amd64
     steps:
       - name: Install the build toolchain
         # The job container is a bare ubuntu:26.04, so everything the build and
@@ -140,10 +155,21 @@ jobs:
           command -v cargo >/dev/null || { echo "cargo not on PATH" >&2; exit 1; }
           helper='!f() { echo "username=x"; printf "password=%s\n" "$FORGEJO_TOKEN"; }; f'
           src="$RUNNER_TEMP/kuro-src"
-          rm -rf "$src"
-          git -c credential.helper= -c "credential.helper=$helper" \
-              clone --quiet --depth 1 \
-              http://127.0.0.1:3000/Vedaru/kuro.git "$src"
+          # The frp tunnel from the x86_64 runner reconnects when that host's
+          # uplink changes address, which resets an in-flight clone.
+          cloned=0
+          for attempt in 1 2 3 4 5; do
+              rm -rf "$src"
+              if git -c credential.helper= -c "credential.helper=$helper" \
+                  clone --quiet --depth 1 \
+                  http://127.0.0.1:3000/Vedaru/kuro.git "$src"; then
+                  cloned=1
+                  break
+              fi
+              echo "clone failed, retry $attempt/5"
+              sleep 3
+          done
+          [ "$cloned" = 1 ] || { echo "clone of kuro.git failed" >&2; exit 1; }
           echo "building kuro at $(git -C "$src" rev-parse --short HEAD)"
           # Not --locked: the committed Cargo.lock is honored anyway, and a lock
           # that has drifted from Cargo.toml should not be the thing that
