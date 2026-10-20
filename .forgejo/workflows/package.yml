@@ -13,6 +13,10 @@
 #       - "glibc-amd64:docker://ubuntu:26.04"
 #
 # so this job gets a throwaway ubuntu:26.04 container of its own, on that host.
+# Register that runner at OWNER scope (a user registration token), never at
+# repo scope: a repo-scoped runner only ever receives jobs from its own repo,
+# so a job pinned to this label queues in "Waiting to run" forever everywhere
+# else -- the label matches, but the task is never created for it.
 # The runner also sets `container.network: host`, which is the only reason the
 # loopback URLs below resolve: an frp stcp visitor on the x86_64 runner binds
 # 127.0.0.1:3000 to the Forgejo instance on the Oracle server, and the job
