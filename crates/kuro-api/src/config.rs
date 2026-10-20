@@ -70,7 +70,37 @@ pub struct ServerEntry {
     pub app_id: &'static str,
     /// Files that are channel-specific and must be swapped when switching.
     pub diff_files: &'static [&'static str],
+    /// Where the 3.0+ launcher publishes the channel's optional quality packs
+    /// ([`PackConfig`](crate::PackConfig)), if the channel has any. More than
+    /// one URL is a failover list for the same document.
+    ///
+    /// This is not part of the game-version protocol: the channel `index.json`
+    /// and its manifests describe the base client, and a tier body
+    /// (`Client/Content/<TIER>/`) may be absent from them entirely. Only the
+    /// launcher's own pack document lists those files, so a tier can only be
+    /// installed from here.
+    ///
+    /// CN and Bilibili share the CN document (verified 2026-10: the same
+    /// `resourcePacks`/`bundles`, and the tier manifests are byte-identical
+    /// across both channels — the channel-specific files all live in `common`,
+    /// which is the base client, not a tier). Global serves no such document
+    /// yet: no path under `G153/50004_<token>/` answers, so it is empty rather
+    /// than a guess that would fail at runtime with a 404.
+    pub pack_config_urls: &'static [&'static str],
 }
+
+/// Where the CN launcher publishes WuWa's quality packs, best host first.
+///
+/// All three serve the same document (verified 2026-10, byte-identical); they
+/// are listed because the document's URL is the one request in the pack flow
+/// that has no failover of its own — the CDN list it returns is what every
+/// later request uses. A dead edge here would otherwise fail the whole
+/// operation before it starts.
+pub const WUWA_PACK_CONFIG_URLS: &[&str] = &[
+    "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
+    "https://prod-volcdn-gamestarter.kurogame.xyz/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
+    "https://prod-tencentcdn-gamestarter.kurogame.com/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
+];
 
 pub const WUWA_DIFF_FILES: &[&str] = &[
     "Client/Binaries/Win64/kuro_login.dll",
@@ -86,6 +116,7 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                     api_url: "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/index.json",
                     app_id: "10003",
                     diff_files: WUWA_DIFF_FILES,
+                    pack_config_urls: WUWA_PACK_CONFIG_URLS,
                 },
             ),
             (
@@ -97,6 +128,7 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                         "Client/Binaries/Win64/bilibili_sdk.dll",
                         "Client/Content/Paks/pakchunk1-Bilibili-Win64-Shipping.pak",
                     ],
+                    pack_config_urls: WUWA_PACK_CONFIG_URLS,
                 },
             ),
             (
@@ -105,6 +137,7 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                     api_url: "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/G153/50004_obOHXFrFanqsaIEOmuKroCcbZkQRBC7c/index.json",
                     app_id: "50004",
                     diff_files: WUWA_DIFF_FILES,
+                    pack_config_urls: &[],
                 },
             ),
         ],
@@ -116,6 +149,7 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                     api_url: "",
                     app_id: "50015",
                     diff_files: &[],
+                    pack_config_urls: &[],
                 },
             ),
             (
@@ -125,6 +159,7 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                     api_url: "",
                     app_id: "10012",
                     diff_files: &[],
+                    pack_config_urls: &[],
                 },
             ),
         ],
@@ -171,8 +206,7 @@ pub mod pgr_meta {
 pub fn index_url(game: Game, server: Server) -> Result<String> {
     match (game, server) {
         (Game::WuWa, server) => {
-            let entry = server_entry(game, server)
-                .ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
+            let entry = server_entry(game, server).ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
             Ok(entry.api_url.to_string())
         }
         (Game::Pgr, Server::Global) => {

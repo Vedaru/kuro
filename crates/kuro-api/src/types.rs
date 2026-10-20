@@ -133,8 +133,93 @@ pub struct ChunkInfo {
     pub md5: String,
 }
 
+/// The 3.0+ launcher's quality-pack document (`…/<appId>_<token>/G<id>/official/index.json`).
+///
+/// This is a *different* endpoint from [`LauncherIndex`]: not the game version
+/// (which the channel's `index.json` + `patchConfig` describes) but the set of
+/// optional resource packs, one per [`Quality`] tier. Each pack carries its own
+/// version, manifest and CDN — and, crucially, its own file list, which the
+/// channel's full manifest does not have to include.
+///
+/// Verified 2026-10 against WuWa CN 3.7.1: `resourcePacks` is `{uhd, sd, hd,
+/// common}` at ~66.0 / 22.0 / 45.7 / 40.7 GB, and the three tier manifests are
+/// 100 files each under `Client/Content/<TIER>/`, disjoint from `common`'s 816.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackConfig {
+    #[serde(default)]
+    pub cdn_list: Vec<PackCdnNode>,
+    /// Keyed by lowercase pack name (`common`, `sd`, `hd`, `uhd`).
+    #[serde(default)]
+    pub resource_packs: std::collections::BTreeMap<String, PackEntry>,
+    /// Keyed by UPPERCASE tier (`SD`, `HD`, `UHD`): which packs that tier is
+    /// made of. `HD` -> `[common, hd]`, and so on.
+    #[serde(default)]
+    pub bundles: std::collections::BTreeMap<String, PackBundle>,
+}
+
+/// One CDN edge from a [`PackConfig`].
+///
+/// `K1`/`K2` are the launcher's enable flags; a node with either at 0 is not
+/// serving pack traffic. `P` is the weight, as in [`CdnNode`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackCdnNode {
+    #[serde(rename = "P", default)]
+    pub p: u64,
+    pub url: String,
+    /// Absent means "not disabled": only an explicit 0 excludes the edge.
+    #[serde(rename = "K1", default)]
+    pub k1: Option<u8>,
+    #[serde(rename = "K2", default)]
+    pub k2: Option<u8>,
+}
+
+impl PackCdnNode {
+    pub fn enabled(&self) -> bool {
+        self.p > 0 && self.k1.unwrap_or(1) != 0 && self.k2.unwrap_or(1) != 0
+    }
+}
+
+/// One quality pack: its version, manifest and download root.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackEntry {
+    #[serde(default)]
+    pub version: String,
+    /// CDN-relative path of the pack's manifest, a [`PatchIndex`].
+    #[serde(default)]
+    pub index_file: String,
+    /// CDN-relative root the pack's files are served from.
+    #[serde(default)]
+    pub base_url: String,
+    /// Total packed size, as the launcher reports it.
+    #[serde(default)]
+    pub size: u64,
+    /// MD5 of the manifest itself; informational (the manifest's own entries
+    /// carry the per-file hashes that are actually enforced).
+    #[serde(default)]
+    pub index_file_md5: String,
+}
+
+/// A tier's composition, e.g. `HD -> {resourcePacks: [common, hd]}`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackBundle {
+    #[serde(default)]
+    pub resource_packs: Vec<String>,
+}
+
 /// `launcherDownloadConfig.json` — written by the official launcher and by us;
 /// the single source of truth for the locally installed version/server.
+///
+/// This file belongs to the official launcher, and it holds more than the three
+/// fields below: at minimum `bundles` (which quality packs that launcher
+/// considers installed) and whatever the launcher adds next. Rewriting it from
+/// this struct alone would drop those, and dropping `bundles` is not cosmetic —
+/// the launcher then reports the pack as missing / offers "repair". So every
+/// unknown key round-trips in `extra`, and callers must serialise the whole
+/// struct rather than build a fresh one from a version string.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalConfig {
@@ -142,4 +227,30 @@ pub struct LocalConfig {
     pub app_id: String,
     #[serde(default)]
     pub group: String,
+    /// Every key we do not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl LocalConfig {
+    /// A fresh config for a first install, with no keys to preserve.
+    pub fn new(version: impl Into<String>, app_id: impl Into<String>) -> Self {
+        Self {
+            version: version.into(),
+            app_id: app_id.into(),
+            group: "default".to_string(),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// The same config with the version/appId of a different run, keeping every
+    /// key we do not model (see the type-level note on `bundles`).
+    pub fn retargeted(&self, version: impl Into<String>, app_id: impl Into<String>) -> Self {
+        Self {
+            version: version.into(),
+            app_id: app_id.into(),
+            group: "default".to_string(),
+            extra: self.extra.clone(),
+        }
+    }
 }

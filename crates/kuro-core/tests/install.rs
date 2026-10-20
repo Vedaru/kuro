@@ -44,11 +44,7 @@ async fn install_flow_writes_config_and_downloads_everything() {
 
     // 1. like install(): write the local config for the target version
     std::fs::create_dir_all(&folder).unwrap();
-    let cfg = LocalConfig {
-        version: "1.0.0".to_string(),
-        app_id: "50015".to_string(), // PGR global appId
-        group: "default".to_string(),
-    };
+    let cfg = LocalConfig::new("1.0.0", "50015"); // PGR global appId
     std::fs::write(
         folder.join("launcherDownloadConfig.json"),
         serde_json::to_string_pretty(&cfg).unwrap(),

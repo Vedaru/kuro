@@ -27,11 +27,7 @@ fn setup_game(base: &Path) -> PathBuf {
     std::fs::write(game.join("config.json"), b"{\"v\":1}").unwrap();
     std::fs::write(game.join("obsolete.txt"), b"bye").unwrap();
 
-    let cfg = LocalConfig {
-        version: "0.9.0".to_string(),
-        app_id: "10003".to_string(),
-        group: "default".to_string(),
-    };
+    let cfg = LocalConfig::new("0.9.0", "10003");
     std::fs::write(
         game.join("launcherDownloadConfig.json"),
         serde_json::to_string_pretty(&cfg).unwrap(),

@@ -63,6 +63,28 @@ impl Budget {
     }
 }
 
+/// Fixed-size ranges covering `0..size`, for a manifest that ships no
+/// `chunkInfos`.
+///
+/// The Kuro CDN rate-limits per connection, so a whole-file GET is the slow
+/// path; the live CN 3.6.0 patch manifests and every pack manifest carry no
+/// chunk list. Whole-file MD5 is still what verifies the result. Files at or
+/// below `chunk` plan no range (`download_single` is cheaper than one range
+/// plus its bookkeeping).
+pub fn chunk_plan(size: u64, chunk: u64) -> Vec<ChunkInfo> {
+    if size <= chunk || chunk == 0 {
+        return Vec::new();
+    }
+    let n = size.div_ceil(chunk);
+    (0..n)
+        .map(|i| ChunkInfo {
+            start: i * chunk,
+            end: ((i + 1) * chunk - 1).min(size - 1),
+            md5: String::new(),
+        })
+        .collect()
+}
+
 /// Download a whole file to `dest` (temp file semantics: caller renames on
 /// success). Verifies size and MD5 when provided. Emits per-file progress if
 /// a sender is given.
@@ -237,8 +259,7 @@ pub async fn download_chunked(
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
     // Bytes written per chunk, index-stable so each task owns one slot and a
     // retry can reset its own without racing the others.
-    let written: Arc<Vec<AtomicU64>> =
-        Arc::new((0..chunks.len()).map(|_| AtomicU64::new(0)).collect());
+    let written: Arc<Vec<AtomicU64>> = Arc::new((0..chunks.len()).map(|_| AtomicU64::new(0)).collect());
     let finished = Arc::new(AtomicBool::new(false));
 
     // Body bytes arrive continuously but a chunk only reaches the old
@@ -436,25 +457,12 @@ mod tests {
         // digest match (md5("abcd"))
         let mut h = md5::Context::new();
         h.consume(b"abcd");
-        assert!(verify_streamed(
-            &p,
-            4,
-            Some(h),
-            Some(4),
-            Some("e2fc714c4727ee9395f324cd2e7f331f")
-        )
-        .is_ok());
+        assert!(verify_streamed(&p, 4, Some(h), Some(4), Some("e2fc714c4727ee9395f324cd2e7f331f")).is_ok());
         // digest mismatch
         let mut h = md5::Context::new();
         h.consume(b"abc");
         assert!(matches!(
-            verify_streamed(
-                &p,
-                4,
-                Some(h),
-                Some(4),
-                Some("e2fc714c4727ee9395f324cd2e7f331f")
-            ),
+            verify_streamed(&p, 4, Some(h), Some(4), Some("e2fc714c4727ee9395f324cd2e7f331f")),
             Err(Error::ChecksumMismatch { .. })
         ));
     }

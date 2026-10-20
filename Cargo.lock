@@ -1181,6 +1181,7 @@ dependencies = [
 name = "kuro-api"
 version = "0.3.0"
 dependencies = [
+ "md5",
  "reqwest",
  "serde",
  "serde_json",

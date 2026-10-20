@@ -10,9 +10,11 @@ pub mod retry;
 pub mod types;
 
 pub use client::{build_client, ApiClient};
-pub use config::{game_server_by_app_id, index_url, server_entry, servers, Game, Server, ServerEntry};
+pub use config::{
+    game_server_by_app_id, index_url, server_entry, servers, Game, Server, ServerEntry, WUWA_PACK_CONFIG_URLS,
+};
 pub use error::{Error, Result};
 pub use types::{
-    ChunkInfo, CdnNode, DefaultSection, FileRef, GroupInfo, LauncherConfig, LauncherIndex,
-    LocalConfig, PatchConfig, PatchIndex, ResourceItem,
+    CdnNode, ChunkInfo, DefaultSection, FileRef, GroupInfo, LauncherConfig, LauncherIndex, LocalConfig, PackBundle,
+    PackCdnNode, PackConfig, PackEntry, PatchConfig, PatchIndex, ResourceItem,
 };
