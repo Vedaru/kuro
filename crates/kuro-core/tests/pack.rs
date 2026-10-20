@@ -772,3 +772,61 @@ async fn a_large_pak_is_fetched_as_ranges() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// An entry with no digest but a size cannot be verified or fetched, so it is
+/// not silently reported as missing forever: it is skipped, and only the
+/// genuinely absent files end up in `--check`.
+#[tokio::test]
+async fn an_entry_without_a_digest_is_skipped_not_downloaded() {
+    let base = std::env::temp_dir().join(format!("kuro-pack-nodigest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let game = setup_game(&base, "10003");
+
+    let real = vec![3u8; 256];
+    let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_json(&[(
+        "Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak",
+        &real,
+    )]))
+    .unwrap();
+    manifest["resource"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "dest": "Client/Content/HD/unverifiable.pak",
+            "md5": "",
+            "size": 1024,
+        }));
+
+    let server = common::spawn_http_server(vec![
+        ("/common/indexFile.json".into(), manifest_json(&[])),
+        (
+            "/hd/indexFile.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        ),
+    ])
+    .await;
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let cfg = config(&server, "3.7.1");
+    let report = mgr
+        .sync_pack_inner(
+            Quality::Hd,
+            &cfg,
+            std::slice::from_ref(&server),
+            &HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The digest-less entry is neither "needs download" nor "broken".
+    assert_eq!(
+        report.broken,
+        vec!["Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak"]
+    );
+    assert!(!game.join("Client/Content/HD/unverifiable.pak").exists());
+
+    let _ = std::fs::remove_dir_all(&base);
+}

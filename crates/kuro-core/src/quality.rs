@@ -67,6 +67,12 @@ impl Quality {
         self.as_arg()
     }
 
+    /// The pack-document key for this tier: the pack list is lowercase
+    /// (`sd`/`hd`/`uhd`), while `bundles` and `-krqlv` are uppercase.
+    pub fn pack_key(self) -> String {
+        self.as_arg().to_ascii_lowercase()
+    }
+
     /// Human name for the UI.
     pub fn label(self) -> &'static str {
         match self {

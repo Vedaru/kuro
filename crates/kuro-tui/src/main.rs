@@ -915,25 +915,15 @@ async fn run(
                             spawn_simple(&tx, &path, TaskKind::Checkout);
                         }
                     }
-                    KeyCode::Up => {
-                        if state.focus == Focus::Log {
-                            state.log_scroll += 1;
-                        }
+                    // Scrolling belongs to the log pane; the guard keeps the
+                    // other panes from silently swallowing these keys.
+                    KeyCode::Up if state.focus == Focus::Log => state.log_scroll += 1,
+                    KeyCode::Down if state.focus == Focus::Log => {
+                        state.log_scroll = state.log_scroll.saturating_sub(1);
                     }
-                    KeyCode::Down => {
-                        if state.focus == Focus::Log {
-                            state.log_scroll = state.log_scroll.saturating_sub(1);
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        if state.focus == Focus::Log {
-                            state.log_scroll += 10;
-                        }
-                    }
-                    KeyCode::PageDown => {
-                        if state.focus == Focus::Log {
-                            state.log_scroll = state.log_scroll.saturating_sub(10);
-                        }
+                    KeyCode::PageUp if state.focus == Focus::Log => state.log_scroll += 10,
+                    KeyCode::PageDown if state.focus == Focus::Log => {
+                        state.log_scroll = state.log_scroll.saturating_sub(10);
                     }
                     _ => {}
                 }

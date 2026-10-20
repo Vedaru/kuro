@@ -118,12 +118,6 @@ pub struct PackPartReport {
     pub skipped: usize,
 }
 
-impl PackPartReport {
-    pub fn is_complete(&self) -> bool {
-        self.downloaded == 0
-    }
-}
-
 /// Summary of installing (or verifying) one tier.
 #[derive(Debug, Clone)]
 pub struct PackReport {
@@ -195,12 +189,10 @@ pub fn read_record(game_folder: &Path) -> PackRecord {
 }
 
 fn write_record(game_folder: &Path, record: &PackRecord) -> Result<()> {
-    let path = record_path(game_folder);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(record)?)?;
-    Ok(())
+    state::write_atomic(
+        &record_path(game_folder),
+        &serde_json::to_string_pretty(record)?,
+    )
 }
 
 /// Read the launcher's records for one tier.
@@ -208,7 +200,7 @@ pub fn state_of(game_folder: &Path, tier: Quality) -> PackState {
     let marker = std::fs::read_to_string(
         game_folder
             .join(PACKS_DIR)
-            .join(format!("{}.json", tier.as_arg().to_ascii_lowercase())),
+            .join(format!("{}.json", tier.pack_key())),
     )
     .ok()
     .and_then(|s| serde_json::from_str::<PackMarker>(&s).ok());
@@ -223,7 +215,7 @@ pub fn state_of(game_folder: &Path, tier: Quality) -> PackState {
         in_bundles,
         recorded_version: read_record(game_folder)
             .installed
-            .get(&tier.as_arg().to_ascii_lowercase())
+            .get(&tier.pack_key())
             .cloned(),
     }
 }
@@ -249,7 +241,7 @@ pub fn register(
     let packs: Vec<String> = bundle_packs
         .map(|p| p.to_vec())
         .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| vec!["common".to_string(), tier.as_arg().to_ascii_lowercase()]);
+        .unwrap_or_else(|| vec!["common".to_string(), tier.pack_key()]);
     let mut bundles = match cfg.extra.remove("bundles") {
         Some(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
@@ -262,14 +254,14 @@ pub fn register(
     let dir = game_folder.join(PACKS_DIR);
     std::fs::create_dir_all(&dir)?;
     let marker = PackMarker {
-        pack_name: tier.as_arg().to_ascii_lowercase(),
+        pack_name: tier.pack_key(),
         version: version.to_string(),
     };
-    let marker_path = dir.join(format!("{}.json", tier.as_arg().to_ascii_lowercase()));
+    let marker_path = dir.join(format!("{}.json", tier.pack_key()));
     state::write_atomic(&marker_path, &serde_json::to_string_pretty(&marker)?)?;
 
     let mut record = read_record(game_folder);
-    let key = tier.as_arg().to_ascii_lowercase();
+    let key = tier.pack_key();
     record.installed.insert(key.clone(), version.to_string());
     if let Some(files) = files {
         record.files.insert(key, files.to_vec());
@@ -287,7 +279,7 @@ pub fn register(
 pub fn unregister(game_folder: &Path, tier: Quality) -> Result<()> {
     let marker = game_folder
         .join(PACKS_DIR)
-        .join(format!("{}.json", tier.as_arg().to_ascii_lowercase()));
+        .join(format!("{}.json", tier.pack_key()));
     if marker.exists() {
         std::fs::remove_file(&marker)?;
     }
@@ -320,7 +312,7 @@ fn prune_stale(
     tier: Quality,
     keep: &std::collections::HashSet<String>,
 ) -> usize {
-    let key = tier.as_arg().to_ascii_lowercase();
+    let key = tier.pack_key();
     let mut record = read_record(game_folder);
     let Some(previous) = record.files.get(&key).cloned() else {
         return 0;
@@ -381,17 +373,21 @@ fn is_downgrade(installed: &str, offered: &str) -> bool {
     pad(offered) < pad(current)
 }
 
+/// One pack of a tier, resolved and validated, ready to scan.
+struct PlannedPack {
+    name: String,
+    entry: PackEntry,
+    manifest: PatchIndex,
+}
+
 /// The manifest of the tier's own pack, not `common`.
 ///
 /// `common` overlaps the channel manifest, which `sync` owns, so its paths must
 /// never become this module's pruning candidates or its file record.
-fn tier_manifest<'a>(
-    plan: &'a [(&str, &PackEntry, PatchIndex)],
-    tier: Quality,
-) -> Option<&'a PatchIndex> {
+fn tier_manifest(plan: &[PlannedPack], tier: Quality) -> Option<&PatchIndex> {
     plan.iter()
-        .find(|(name, _, _)| name.eq_ignore_ascii_case(tier.as_arg()))
-        .map(|(_, _, m)| m)
+        .find(|p| p.name.eq_ignore_ascii_case(tier.as_arg()))
+        .map(|p| &p.manifest)
 }
 
 /// Drop files of the previous install that the tier's manifest no longer lists,
@@ -399,7 +395,7 @@ fn tier_manifest<'a>(
 fn prune_and_record(
     game_folder: &Path,
     tier: Quality,
-    plan: &[(&str, &PackEntry, PatchIndex)],
+    plan: &[PlannedPack],
 ) -> (usize, Vec<String>) {
     let Some(manifest) = tier_manifest(plan, tier) else {
         return (0, Vec::new());
@@ -412,6 +408,42 @@ fn prune_and_record(
     let pruned = prune_stale(game_folder, tier, &keep);
     let dests = manifest.resource.iter().map(|r| r.dest.clone()).collect();
     (pruned, dests)
+}
+
+/// Settle the launcher's records for a tier that is now correct on disk, and
+/// return how many stale files were pruned.
+///
+/// A healthy registration is left alone: the launcher may have rewritten it
+/// while the game ran, and replacing a working record with ours buys nothing.
+fn reconcile_records(
+    game_folder: &Path,
+    tier: Quality,
+    plan: &[PlannedPack],
+    version: &str,
+) -> Result<usize> {
+    let (pruned, files) = prune_and_record(game_folder, tier, plan);
+    let state = state_of(game_folder, tier);
+    let current = state.marker.as_ref().is_some_and(|m| m.version == version);
+    if !state.registered() || !current {
+        let packs = plan.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        register(game_folder, tier, version, Some(&packs), Some(&files))?;
+    }
+    Ok(pruned)
+}
+
+/// The version a tier records: its own pack's, or `common`'s when the document
+/// names none for the tier.
+fn planned_version(plan: &[PlannedPack], tier: Quality, config: &PackConfig) -> String {
+    plan.iter()
+        .find(|p| p.name.eq_ignore_ascii_case(tier.as_arg()))
+        .map(|p| p.entry.version.clone())
+        .or_else(|| {
+            config
+                .resource_packs
+                .get("common")
+                .map(|c| c.version.clone())
+        })
+        .unwrap_or_default()
 }
 
 fn bundle_record(version: &str, packs: &[String]) -> serde_json::Value {
@@ -478,66 +510,13 @@ impl crate::GameManager {
         if bases.is_empty() {
             return Err(Error::NoCdnNode);
         }
-        let mut packs = bundle_packs(config, tier);
-        if packs.is_empty() {
-            packs = vec!["common".to_string(), tier.as_arg().to_ascii_lowercase()];
-        }
-
-        if let Some(tx) = &tx {
-            let _ = tx
-                .send(crate::ProgressEvent::Log(format!(
-                    "quality pack {}: {} ({})",
-                    tier.as_arg(),
-                    packs.join(" + "),
-                    bases[0].trim_end_matches('/')
-                )))
-                .await;
-        }
-
-        // Resolve and validate every pack up front: `common` is downloaded
-        // before the tier pack, so a tier manifest that turns out to be
-        // unusable must be refused before the first byte of `common` is
-        // written. Downloading tens of GiB and only then rejecting the tier is
-        // the failure this ordering exists to prevent.
-        let mut plan: Vec<(&str, &PackEntry, PatchIndex)> = Vec::with_capacity(packs.len());
-        for name in &packs {
-            let Some(entry) = config.resource_packs.get(name) else {
-                return Err(Error::Patch(format!(
-                    "the pack config for this channel has no `{name}` pack (has: {})",
-                    config
-                        .resource_packs
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            };
-            let manifest = self.fetch_pack_manifest(name, entry, bases).await?;
-            plan.push((name.as_str(), entry, manifest));
-        }
-
-        let mut version = String::new();
-        for (name, entry, _) in &plan {
-            if name.eq_ignore_ascii_case(tier.as_arg()) {
-                version = entry.version.clone();
-            }
-        }
-        if version.is_empty() {
-            version = config
-                .resource_packs
-                .get("common")
-                .map(|c| c.version.clone())
-                .unwrap_or_default();
-        }
-
-        // A channel whose pack document lags what is on disk would otherwise
-        // "install" a tier backwards, overwriting newer paks with older ones and
-        // recording the old version. Numeric comparison only — a version that
-        // is not dotted-numeric is not comparable, so it is left alone rather
-        // than guessed at.
+        let plan = self
+            .plan_pack_tier(tier, config, bases, tx.as_ref())
+            .await?;
+        let version = planned_version(&plan, tier, config);
         if let Some(installed) = read_record(&self.game_folder)
             .installed
-            .get(&tier.as_arg().to_ascii_lowercase())
+            .get(&tier.pack_key())
             .cloned()
         {
             if is_downgrade(&installed, &version) {
@@ -553,10 +532,16 @@ impl crate::GameManager {
         // touched, so `--check` reports the whole tier and a repair that has
         // nothing to do never withdraws the records it is about to rewrite.
         let mut scans = Vec::with_capacity(plan.len());
-        for (name, entry, manifest) in &plan {
+        for planned in &plan {
             scans.push(
-                self.scan_pack_part(name, entry, manifest, channel, tx.as_ref())
-                    .await?,
+                self.scan_pack_part(
+                    &planned.name,
+                    &planned.entry,
+                    &planned.manifest,
+                    channel,
+                    tx.as_ref(),
+                )
+                .await?,
             );
         }
 
@@ -571,36 +556,19 @@ impl crate::GameManager {
         if !repair {
             // `--check`: the scan already holds exactly the entries that failed
             // size + MD5, so reporting them costs nothing further.
-            for scan in scans {
-                for missing in &scan.todo {
-                    report.broken.push(missing.item.dest.clone());
-                }
-                if let Some(part) = report.parts.iter_mut().find(|p| p.name == scan.report.name) {
-                    part.downloaded = scan.todo.len();
-                    part.bytes = scan.todo.iter().map(|m| m.item.size).sum();
-                }
+            report.broken = scans
+                .iter()
+                .flat_map(|s| s.todo.iter().map(|m| m.item.dest.clone()))
+                .collect();
+            for (part, scan) in report.parts.iter_mut().zip(&scans) {
+                part.downloaded = scan.todo.len();
+                part.bytes = scan.todo.iter().map(|m| m.item.size).sum();
             }
             return Ok(report);
         }
 
         if scans.iter().all(|s| s.todo.is_empty()) {
-            // Nothing to download: only touch the records when they are missing
-            // (an already-complete directory, or a launcher that dropped them).
-            // Rewriting unconditionally would replace a registry the launcher
-            // may have updated with ours.
-            let (pruned, written) = prune_and_record(&self.game_folder, tier, &plan);
-            report.pruned = pruned;
-            let state = state_of(&self.game_folder, tier);
-            let current = state.marker.as_ref().is_some_and(|m| m.version == version);
-            if !state.registered() || !current {
-                register(
-                    &self.game_folder,
-                    tier,
-                    &version,
-                    Some(&packs),
-                    Some(&written),
-                )?;
-            }
+            report.pruned = reconcile_records(&self.game_folder, tier, &plan, &version)?;
             report.registered = true;
             return Ok(report);
         }
@@ -612,29 +580,68 @@ impl crate::GameManager {
         unregister(&self.game_folder, tier)?;
 
         for (idx, scan) in scans.into_iter().enumerate() {
-            let entry = plan[idx].1;
             let part = self
-                .write_pack_part(scan, entry, bases, tx.as_ref())
+                .write_pack_part(scan, &plan[idx].entry, bases, tx.as_ref())
                 .await?;
             report.broken.extend(part.broken);
-            if let Some(slot) = report.parts.iter_mut().find(|p| p.name == part.report.name) {
-                *slot = part.report;
-            }
+            report.parts[idx] = part.report;
         }
 
         if report.broken.is_empty() {
-            let (pruned, written) = prune_and_record(&self.game_folder, tier, &plan);
-            report.pruned = pruned;
-            register(
-                &self.game_folder,
-                tier,
-                &version,
-                Some(&packs),
-                Some(&written),
-            )?;
+            report.pruned = reconcile_records(&self.game_folder, tier, &plan, &version)?;
             report.registered = true;
         }
         Ok(report)
+    }
+
+    /// Resolve and validate every pack of a tier, without writing anything.
+    ///
+    /// `common` downloads first, so a tier pack whose manifest turns out to be
+    /// unusable must be refused now: the alternative is writing tens of GiB of
+    /// `common` and only then rejecting the tier.
+    async fn plan_pack_tier(
+        &self,
+        tier: Quality,
+        config: &PackConfig,
+        bases: &[String],
+        tx: Option<&tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
+    ) -> Result<Vec<PlannedPack>> {
+        let mut packs = bundle_packs(config, tier);
+        if packs.is_empty() {
+            packs = vec!["common".to_string(), tier.pack_key()];
+        }
+        if let Some(tx) = tx {
+            let _ = tx
+                .send(crate::ProgressEvent::Log(format!(
+                    "quality pack {}: {} ({})",
+                    tier.as_arg(),
+                    packs.join(" + "),
+                    bases[0].trim_end_matches('/')
+                )))
+                .await;
+        }
+
+        let mut plan = Vec::with_capacity(packs.len());
+        for name in packs {
+            let Some(entry) = config.resource_packs.get(&name) else {
+                return Err(Error::Patch(format!(
+                    "the pack config for this channel has no `{name}` pack (has: {})",
+                    config
+                        .resource_packs
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            };
+            let manifest = self.fetch_pack_manifest(&name, entry, bases).await?;
+            plan.push(PlannedPack {
+                name,
+                entry: entry.clone(),
+                manifest,
+            });
+        }
+        Ok(plan)
     }
 
     /// The channel's full manifest, keyed by normalised (lowercase) dest.
@@ -699,33 +706,12 @@ impl crate::GameManager {
         let mut total = 0u64;
         for item in &manifest.resource {
             if item.size == 0 || item.md5.is_empty() {
-                // Nothing to verify against and nothing to fetch — a
-                // zero-length marker file is created rather than downloaded.
-                if item.size == 0 {
-                    let path = self.game_folder.join(relative(&item.dest));
-                    if !path.exists() {
-                        if let Some(dir) = path.parent() {
-                            std::fs::create_dir_all(dir)?;
-                        }
-                        std::fs::write(&path, [])?;
-                    }
-                }
+                create_empty_marker(&self.game_folder, item)?;
                 continue;
             }
             total += item.size;
             let key = normalise(&item.dest);
-            // `common` describes the CN base client, which the channel also
-            // serves; the channel is the authority for its own files. An entry
-            // the channel does not describe, or describes differently, is left
-            // to the channel: the pack document is shared across channels, and
-            // its copy of a channel-specific binary is the wrong channel's.
-            // (CN agrees on all 816; Bilibili agrees on 747 and differs on the
-            // 69 `krsdk_*`/anti-cheat binaries, plus one CN-only SDK dll.)
-            if is_common
-                && channel
-                    .get(&key)
-                    .is_none_or(|(size, md5)| *size != item.size || md5 != &item.md5)
-            {
+            if is_common && !channel_agrees(channel, &key, item) {
                 skipped += 1;
                 continue;
             }
@@ -782,7 +768,6 @@ impl crate::GameManager {
     }
 
     /// Download and verify everything [`scan_pack_part`] reported missing.
-    #[allow(clippy::too_many_arguments)]
     async fn write_pack_part(
         &self,
         scan: PackScan,
@@ -804,63 +789,22 @@ impl crate::GameManager {
         let sem = Arc::new(tokio::sync::Semaphore::new(FILE_CONCURRENCY));
         let done = Arc::new(AtomicU64::new(0));
         let mut handles = tokio::task::JoinSet::new();
-        for Missing { item, key, path } in todo {
+        for missing in todo {
             let sem = sem.clone();
-            let http = self.http_client();
-            let budget = self.download_budget();
-            let bases = bases.to_vec();
-            let cache = cache.clone();
-            let base_url = entry.base_url.clone();
-            let tx = tx.cloned();
             let done = done.clone();
+            let cache = cache.clone();
+            let tx = tx.cloned();
+            let fetch = Fetch {
+                http: self.http_client(),
+                budget: self.download_budget(),
+                urls: pack_urls(bases, &entry.base_url, &missing.item.dest),
+            };
             handles.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                let urls: Vec<String> = bases
-                    .iter()
-                    .map(|b| {
-                        format!(
-                            "{}/{}/{}",
-                            b.trim_end_matches('/'),
-                            base_url.trim_matches('/'),
-                            item.dest.trim_start_matches('/')
-                        )
-                    })
-                    .collect();
-                let tmp = with_suffix(&path, ".pack.tmp");
-                let chunks = crate::download::chunk_plan(item.size, SYNTH_CHUNK_SIZE);
-                if chunks.is_empty() {
-                    download_single(
-                        &http,
-                        &urls,
-                        &tmp,
-                        Some(item.size),
-                        Some(item.md5.as_str()),
-                        &item.dest,
-                        tx.as_ref(),
-                        &budget,
-                    )
-                    .await?;
-                } else {
-                    download_chunked(
-                        &http,
-                        &urls,
-                        &tmp,
-                        &chunks,
-                        Some(item.md5.as_str()),
-                        CHUNK_CONCURRENCY,
-                        &item.dest,
-                        tx.as_ref(),
-                        &budget,
-                    )
-                    .await?;
-                }
-                safe_replace(&tmp, &path)?;
-                cache.record_file(&key, &path, &item.md5);
+                let size = fetch.file(&missing, tx.as_ref()).await?;
+                cache.record_file(&missing.key, &missing.path, &missing.item.md5);
                 done.fetch_add(1, Ordering::Relaxed);
-                Ok::<u64, Error>(item.size)
+                Ok::<u64, Error>(size)
             });
         }
         while let Some(joined) = handles.join_next().await {
@@ -886,6 +830,107 @@ impl crate::GameManager {
         let _ = cache.save();
         Ok(PartOutcome { report, broken })
     }
+}
+
+/// One file's download context: the client and CDN budget are shared, the URL
+/// list is per-file (each base + the pack's root + the dest).
+struct Fetch {
+    http: reqwest::Client,
+    budget: crate::download::Budget,
+    urls: Vec<String>,
+}
+
+impl Fetch {
+    /// Fetch one missing file to its temp sibling and swap it into place,
+    /// returning the size written.
+    async fn file(
+        &self,
+        missing: &Missing,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
+    ) -> Result<u64> {
+        if let Some(dir) = missing.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = with_suffix(&missing.path, ".pack.tmp");
+        let chunks = crate::download::chunk_plan(missing.item.size, SYNTH_CHUNK_SIZE);
+        if chunks.is_empty() {
+            download_single(
+                &self.http,
+                &self.urls,
+                &tmp,
+                Some(missing.item.size),
+                Some(missing.item.md5.as_str()),
+                &missing.item.dest,
+                tx,
+                &self.budget,
+            )
+            .await?;
+        } else {
+            download_chunked(
+                &self.http,
+                &self.urls,
+                &tmp,
+                &chunks,
+                Some(missing.item.md5.as_str()),
+                CHUNK_CONCURRENCY,
+                &missing.item.dest,
+                tx,
+                &self.budget,
+            )
+            .await?;
+        }
+        safe_replace(&tmp, &missing.path)?;
+        Ok(missing.item.size)
+    }
+}
+
+/// Every CDN URL one pack file can be fetched from, in failover order.
+fn pack_urls(bases: &[String], base_url: &str, dest: &str) -> Vec<String> {
+    bases
+        .iter()
+        .map(|b| {
+            format!(
+                "{}/{}/{}",
+                b.trim_end_matches('/'),
+                base_url.trim_matches('/'),
+                dest.trim_start_matches('/')
+            )
+        })
+        .collect()
+}
+
+/// Does the channel serve this exact file?
+///
+/// `common` describes the CN base client, which every channel also serves, and
+/// the channel is the authority for its own files. An entry the channel does
+/// not describe, or describes differently, is left to it: the pack document is
+/// shared across channels, so its copy of a channel-specific binary is the
+/// wrong channel's. (CN agrees on all 816; Bilibili agrees on 747 and differs
+/// on the 69 `krsdk_*`/anti-cheat binaries, plus one CN-only SDK dll.)
+fn channel_agrees(
+    channel: &HashMap<String, (u64, String)>,
+    key: &str,
+    item: &kuro_api::ResourceItem,
+) -> bool {
+    channel
+        .get(key)
+        .is_some_and(|(size, md5)| *size == item.size && md5 == &item.md5)
+}
+
+/// A zero-length entry is a marker, not a download: create it if absent.
+fn create_empty_marker(game_folder: &Path, item: &kuro_api::ResourceItem) -> Result<()> {
+    if item.size != 0 {
+        return Ok(());
+    }
+    let path = game_folder.join(relative(&item.dest));
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, [])?;
+    Ok(())
 }
 
 /// One manifest entry that failed verification, with its resolved path.
@@ -917,7 +962,7 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
     let tier = Quality::ALL
         .into_iter()
         .find(|q| q.as_arg().eq_ignore_ascii_case(name));
-    let prefix = tier.map(|t| format!("client/content/{}/", t.dir_name().to_ascii_lowercase()));
+    let prefix = tier.map(|t| format!("client/content/{}/", t.pack_key()));
     let check = |dest: &str| -> Result<()> {
         let key = normalise(dest);
         let first = key.split('/').next().unwrap_or("");
