@@ -195,6 +195,7 @@ async fn common_defers_to_the_channel_where_they_disagree() {
     let channel_sdk = b"THE-CHANNEL-VERSION-OF-IT".to_vec();
     let agreed = b"AGREED-FILE".to_vec();
     let cn_only = b"CN-ONLY-SDK".to_vec();
+    let hd_pak = b"HD-PAK".to_vec();
     std::fs::create_dir_all(game.join("Client/Binaries/Win64")).unwrap();
     std::fs::write(game.join("Client/Binaries/Win64/bilibili_sdk.dll"), &channel_sdk).unwrap();
 
@@ -207,12 +208,16 @@ async fn common_defers_to_the_channel_where_they_disagree() {
                 ("Client/Binaries/Win64/thirdparty/krpcsdk_mainland/krsdk.dll", &cn_only),
             ]),
         ),
-        ("/hd/indexFile.json".into(), manifest_json(&[])),
+        (
+            "/hd/indexFile.json".into(),
+            manifest_json(&[("Client/Content/HD/pakchunk0.pak", &hd_pak)]),
+        ),
         (
             "/zip/Client/Binaries/Win64/bilibili_sdk.dll".into(),
             sdk_pack_doc.clone(),
         ),
         ("/zip/Client/Binaries/Win64/shared.dll".into(), agreed.clone()),
+        ("/zip/Client/Content/HD/pakchunk0.pak".into(), hd_pak.clone()),
     ])
     .await;
 
@@ -297,6 +302,46 @@ async fn check_reports_without_touching_anything() {
         "--check downloaded a file"
     );
     assert!(!game.join("launcherDownloadConfig/hd.json").exists());
+}
+
+/// A zero-length manifest entry is a marker file. `--check` must report it as
+/// missing without creating it: it used to be created during the scan, so even
+/// a read-only run wrote into the install.
+#[tokio::test]
+async fn check_does_not_create_marker_files() {
+    let base = tempfile::Builder::new().prefix("kuro-pack-marker-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
+
+    let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_json(&[])).unwrap();
+    manifest["resource"].as_array_mut().unwrap().push(serde_json::json!({
+        "dest": "Client/Content/HD/.keep",
+        "md5": "",
+        "size": 0,
+    }));
+
+    let server = common::spawn_http_server(vec![
+        ("/common/indexFile.json".into(), manifest_json(&[])),
+        ("/hd/indexFile.json".into(), serde_json::to_vec(&manifest).unwrap()),
+    ])
+    .await;
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let cfg = config(&server, "3.7.1");
+    let report = mgr
+        .sync_pack_inner(
+            Quality::Hd,
+            &cfg,
+            std::slice::from_ref(&server),
+            &HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let marker = game.join("Client/Content/HD/.keep");
+    assert_eq!(report.broken, vec!["Client/Content/HD/.keep".to_string()]);
+    assert!(!marker.exists(), "--check created a marker file");
 }
 
 /// A rerun after a completed install is a no-op, not a re-download.
@@ -570,6 +615,137 @@ async fn a_shrinking_tier_removes_its_own_stale_files_only() {
         .is_file());
 }
 
+/// A pack document that lists no files is not "this tier is now empty": it is
+/// one that failed to publish (or is half-uploaded). Installing it would prune
+/// the whole installed tier and then register the empty result as healthy, so
+/// it is refused before anything is touched.
+#[tokio::test]
+async fn an_empty_tier_manifest_does_not_wipe_the_installed_tier() {
+    let base = tempfile::Builder::new().prefix("kuro-pack-empty-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
+
+    let pak = vec![7u8; 4096];
+    let good = common::spawn_http_server(vec![
+        ("/common/indexFile.json".into(), manifest_json(&[])),
+        (
+            "/hd/indexFile.json".into(),
+            manifest_json(&[("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak", &pak)]),
+        ),
+        (
+            "/zip/Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak".into(),
+            pak.clone(),
+        ),
+    ])
+    .await;
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let cfg = config(&good, "3.7.1");
+    let installed = mgr
+        .sync_pack_inner(
+            Quality::Hd,
+            &cfg,
+            std::slice::from_ref(&good),
+            &HashMap::new(),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(installed.registered);
+    let body = game.join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak");
+    assert!(body.is_file());
+
+    // The next publish is empty.
+    let empty = common::spawn_http_server(vec![
+        ("/common/indexFile.json".into(), manifest_json(&[])),
+        ("/hd/indexFile.json".into(), manifest_json(&[])),
+    ])
+    .await;
+    let cfg = config(&empty, "3.7.2");
+    let err = mgr
+        .sync_pack_inner(
+            Quality::Hd,
+            &cfg,
+            std::slice::from_ref(&empty),
+            &HashMap::new(),
+            true,
+            None,
+        )
+        .await
+        .expect_err("an empty tier manifest was accepted");
+    assert!(err.to_string().contains("lists no files"), "unexpected error: {err}");
+
+    assert!(body.is_file(), "the installed tier was wiped by an empty manifest");
+    assert!(
+        game.join("launcherDownloadConfig/hd.json").is_file(),
+        "a refused run withdrew the tier's launcher record"
+    );
+}
+
+/// The launcher can update a tier without kuro ever seeing it, writing its own
+/// marker. The downgrade guard must read that too, or kuro later "downgrades" a
+/// newer install back to whatever the pack document advertises.
+#[tokio::test]
+async fn a_launcher_side_update_is_not_downgraded() {
+    let base = tempfile::Builder::new()
+        .prefix("kuro-pack-downgrade-")
+        .tempdir()
+        .unwrap();
+    let game = setup_game(base.path(), "10003");
+
+    // The launcher updated HD to 3.8.0 and wrote its records.
+    let marker_dir = game.join("launcherDownloadConfig");
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(
+        marker_dir.join("hd.json"),
+        serde_json::json!({ "packName": "hd", "version": "3.8.0" }).to_string(),
+    )
+    .unwrap();
+    let mut cfg_on_disk: LocalConfig =
+        serde_json::from_str(&std::fs::read_to_string(game.join("launcherDownloadConfig.json")).unwrap()).unwrap();
+    cfg_on_disk.extra.insert(
+        "bundles".to_string(),
+        serde_json::json!({ "HD": { "version": "3.8.0", "packs": ["common", "hd"] } }),
+    );
+    std::fs::write(
+        game.join("launcherDownloadConfig.json"),
+        serde_json::to_string_pretty(&cfg_on_disk).unwrap(),
+    )
+    .unwrap();
+
+    // The pack document still advertises 3.7.1.
+    let pak = vec![9u8; 128];
+    let server = common::spawn_http_server(vec![
+        ("/common/indexFile.json".into(), manifest_json(&[])),
+        (
+            "/hd/indexFile.json".into(),
+            manifest_json(&[("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak", &pak)]),
+        ),
+    ])
+    .await;
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let cfg = config(&server, "3.7.1");
+    let err = mgr
+        .sync_pack_inner(
+            Quality::Hd,
+            &cfg,
+            std::slice::from_ref(&server),
+            &HashMap::new(),
+            true,
+            None,
+        )
+        .await
+        .expect_err("a launcher-side 3.8.0 install was downgraded to 3.7.1");
+    assert!(
+        err.to_string().contains("refusing to downgrade"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !game.join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak").exists(),
+        "the refused run still wrote files"
+    );
+}
+
 /// A manifest that does not match the digest the channel published for it is
 /// refused before anything is written: the alternative is downloading 80 GiB
 /// against a file list nobody vouched for.
@@ -665,11 +841,11 @@ async fn a_large_pak_is_fetched_as_ranges() {
     assert_eq!(again.parts[1].downloaded, 0);
 }
 
-/// An entry with no digest but a size cannot be verified or fetched, so it is
-/// not silently reported as missing forever: it is skipped, and only the
-/// genuinely absent files end up in `--check`.
+/// An entry with a size but no digest cannot be verified, so it must not be
+/// written on trust — and skipping it alone would report a hole as healthy.
+/// The whole tier is refused instead, before anything is downloaded.
 #[tokio::test]
-async fn an_entry_without_a_digest_is_skipped_not_downloaded() {
+async fn an_entry_without_a_digest_refuses_the_tier() {
     let base = tempfile::Builder::new()
         .prefix("kuro-pack-nodigest-")
         .tempdir()
@@ -691,27 +867,38 @@ async fn an_entry_without_a_digest_is_skipped_not_downloaded() {
     let server = common::spawn_http_server(vec![
         ("/common/indexFile.json".into(), manifest_json(&[])),
         ("/hd/indexFile.json".into(), serde_json::to_vec(&manifest).unwrap()),
+        (
+            "/zip/Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak".into(),
+            real.clone(),
+        ),
     ])
     .await;
 
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
-    let report = mgr
+    let err = mgr
         .sync_pack_inner(
             Quality::Hd,
             &cfg,
             std::slice::from_ref(&server),
             &HashMap::new(),
-            false,
+            true,
             None,
         )
         .await
-        .unwrap();
+        .expect_err("a manifest with an unverifiable entry was installed");
+    assert!(
+        err.to_string().contains("without a valid md5"),
+        "unexpected error: {err}"
+    );
 
-    // The digest-less entry is neither "needs download" nor "broken".
-    assert_eq!(
-        report.broken,
-        vec!["Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak"]
+    assert!(
+        !game.join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak").exists(),
+        "the refused run still wrote a file"
     );
     assert!(!game.join("Client/Content/HD/unverifiable.pak").exists());
+    assert!(
+        !game.join("launcherDownloadConfig/hd.json").exists(),
+        "the refused run registered the tier"
+    );
 }

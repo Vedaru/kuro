@@ -349,11 +349,34 @@ fn is_downgrade(installed: &str, offered: &str) -> bool {
     pad(offered) < pad(current)
 }
 
+/// Every version that still says something about what is installed.
+///
+/// The launcher's marker (`launcherDownloadConfig/<tier>.json`) is written by
+/// the official updater, which knows nothing about kuro's record, so it is the
+/// one that catches "user updated through the launcher". Our own
+/// (`.kuro_cache/packs.json`) is only evidence while the root config still
+/// lists the bundle: `unregister` deliberately leaves the version behind, and
+/// an uninstalled tier must not be able to block a legitimate older reinstall.
+fn installed_versions(game_folder: &Path, tier: Quality) -> Vec<String> {
+    let state = state_of(game_folder, tier);
+    let mut seen: Vec<String> = state.marker.iter().map(|m| m.version.clone()).collect();
+    if state.in_bundles {
+        if let Some(v) = read_record(game_folder).installed.get(&tier.pack_key()) {
+            if !seen.contains(v) {
+                seen.push(v.clone());
+            }
+        }
+    }
+    seen
+}
+
 /// One pack of a tier, resolved and validated, ready to scan.
 struct PlannedPack {
     name: String,
     entry: PackEntry,
-    manifest: PatchIndex,
+    /// Shared so the blocking verify pool can borrow it without a copy: a
+    /// WuWa-sized manifest is tens of thousands of entries.
+    manifest: Arc<PatchIndex>,
 }
 
 /// The manifest of the tier's own pack, not `common`.
@@ -363,19 +386,42 @@ struct PlannedPack {
 fn tier_manifest(plan: &[PlannedPack], tier: Quality) -> Option<&PatchIndex> {
     plan.iter()
         .find(|p| p.name.eq_ignore_ascii_case(tier.as_arg()))
-        .map(|p| &p.manifest)
+        .map(|p| p.manifest.as_ref())
 }
 
 /// Drop files of the previous install that the tier's manifest no longer lists,
 /// and return the dests it does list — the record the next run prunes against.
+///
+/// A plan with no manifest for this tier yields no record at all rather than an
+/// empty one: an empty list is what tells `prune_stale` that every previously
+/// recorded file is stale. `plan_pack_tier` already refuses an empty *published*
+/// manifest, so reaching here with one is a caller bug, not a publish accident.
 fn prune_and_record(game_folder: &Path, tier: Quality, plan: &[PlannedPack]) -> (usize, Vec<String>) {
-    let Some(manifest) = tier_manifest(plan, tier) else {
+    let Some(manifest) = tier_manifest(plan, tier).filter(|m| manifest_is_authoritative(m)) else {
         return (0, Vec::new());
     };
     let keep: std::collections::HashSet<String> = manifest.resource.iter().map(|r| path_key(&r.dest)).collect();
     let pruned = prune_stale(game_folder, tier, &keep);
     let dests = manifest.resource.iter().map(|r| r.dest.clone()).collect();
     (pruned, dests)
+}
+
+/// Whether a manifest may be used as the *complete* list of a tier's files.
+///
+/// It may not when it is empty. An empty index is not "this tier ships nothing",
+/// it is a document that failed to be published or was replaced by a stub (all
+/// three live 3.7.0 tier indexes are 41-byte `{"resource":[]}` stubs). Pruning
+/// against one deletes the whole installed tier — tens of GiB — and then
+/// registers the now-empty tier as installed, so the launcher sees no problem
+/// to repair. Requiring a non-empty manifest costs nothing in the normal case:
+/// every real tier ships 100 files.
+fn manifest_is_authoritative(manifest: &PatchIndex) -> bool {
+    !manifest.resource.is_empty()
+}
+
+/// A digest in the form the CDN publishes: 32 hex digits.
+fn is_md5(md5: &str) -> bool {
+    md5.len() == 32 && md5.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Settle the launcher's records for a tier that is now correct on disk, and
@@ -389,7 +435,10 @@ fn reconcile_records(game_folder: &Path, tier: Quality, plan: &[PlannedPack], ve
     let current = state.marker.as_ref().is_some_and(|m| m.version == version);
     if !state.registered() || !current {
         let packs = plan.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
-        register(game_folder, tier, version, Some(&packs), Some(&files))?;
+        // An empty list would overwrite the only description of what is on
+        // disk with "nothing", stranding those files beyond any future prune.
+        let files = (!files.is_empty()).then_some(files.as_slice());
+        register(game_folder, tier, version, Some(&packs), files)?;
     }
     Ok(pruned)
 }
@@ -467,7 +516,7 @@ impl crate::GameManager {
         }
         let plan = self.plan_pack_tier(tier, config, bases, tx.as_ref()).await?;
         let version = planned_version(&plan, tier, config);
-        if let Some(installed) = read_record(&self.game_folder).installed.get(&tier.pack_key()).cloned() {
+        for installed in installed_versions(&self.game_folder, tier) {
             if is_downgrade(&installed, &version) {
                 return Err(Error::Patch(format!(
                     "the channel offers {} {version}, older than the installed {installed} — \
@@ -480,11 +529,22 @@ impl crate::GameManager {
         // Verify first, write second. Every pack is scanned before anything is
         // touched, so `--check` reports the whole tier and a repair that has
         // nothing to do never withdraws the records it is about to rewrite.
+        // One cache for the whole tier: `save` drops entries that were not
+        // touched, so a per-part cache/save would evict the other part's hashes
+        // and force a full re-hash of tens of GiB on every run.
+        let cache = Md5Cache::load(&self.game_folder);
         let mut scans = Vec::with_capacity(plan.len());
         for planned in &plan {
             scans.push(
-                self.scan_pack_part(&planned.name, &planned.entry, &planned.manifest, channel, tx.as_ref())
-                    .await?,
+                self.scan_pack_part(
+                    &planned.name,
+                    &planned.entry,
+                    Arc::clone(&planned.manifest),
+                    channel,
+                    &cache,
+                    tx.as_ref(),
+                )
+                .await?,
             );
         }
 
@@ -511,6 +571,7 @@ impl crate::GameManager {
         }
 
         if scans.iter().all(|s| s.todo.is_empty()) {
+            let _ = cache.save();
             report.pruned = reconcile_records(&self.game_folder, tier, &plan, &version)?;
             report.registered = true;
             return Ok(report);
@@ -523,7 +584,13 @@ impl crate::GameManager {
         unregister(&self.game_folder, tier)?;
 
         for (idx, scan) in scans.into_iter().enumerate() {
-            let part = self.write_pack_part(scan, &plan[idx].entry, bases, tx.as_ref()).await?;
+            // Saved per part so an interrupted run keeps the hashes of the parts
+            // that did finish; the shared cache means the next part's save still
+            // carries them.
+            let part = self
+                .write_pack_part(scan, &plan[idx].entry, bases, &cache, tx.as_ref())
+                .await?;
+            let _ = cache.save();
             report.broken.extend(part.broken);
             report.parts[idx] = part.report;
         }
@@ -571,10 +638,17 @@ impl crate::GameManager {
                 )));
             };
             let manifest = self.fetch_pack_manifest(&name, entry, bases).await?;
+            if name.eq_ignore_ascii_case(tier.as_arg()) && !manifest_is_authoritative(&manifest) {
+                return Err(Error::Patch(format!(
+                    "the pack document for `{name}` lists no files — refusing to install {tier_arg} \
+                     (the document is stale or was not published yet)",
+                    tier_arg = tier.as_arg()
+                )));
+            }
             plan.push(PlannedPack {
                 name,
                 entry: entry.clone(),
-                manifest,
+                manifest: Arc::new(manifest),
             });
         }
         Ok(plan)
@@ -626,44 +700,71 @@ impl crate::GameManager {
         &self,
         name: &str,
         entry: &PackEntry,
-        manifest: &PatchIndex,
+        manifest: Arc<PatchIndex>,
         channel: &HashMap<String, (u64, String)>,
+        cache: &Md5Cache,
         tx: Option<&tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
     ) -> Result<PackScan> {
         let is_common = name.eq_ignore_ascii_case("common");
         let mut todo = Vec::new();
         let mut skipped = 0usize;
-        let cache = Md5Cache::load(&self.game_folder);
         let mut total = 0u64;
+        let mut pending = Vec::new();
         for item in &manifest.resource {
-            if item.size == 0 || item.md5.is_empty() {
-                create_empty_marker(&self.game_folder, item)?;
+            if item.size == 0 {
+                // A zero-length entry is a marker, not a download — but it is
+                // still work, so it belongs in `todo`: creating it during the
+                // scan made `--check` write to the install.
+                let path = self.game_folder.join(normalise(&item.dest));
+                let present = std::fs::metadata(&path).is_ok_and(|m| m.len() == 0);
+                if !present {
+                    todo.push(Missing {
+                        item: item.clone(),
+                        key: path_key(&item.dest),
+                        path,
+                        marker: true,
+                    });
+                }
                 continue;
             }
-            total += item.size;
             let key = path_key(&item.dest);
             if is_common && !channel_agrees(channel, &key, item) {
                 skipped += 1;
                 continue;
             }
+            total += item.size;
             // `key` is the case-folded comparison form; the file itself keeps
             // the manifest's spelling. Writing to the folded path would create
             // `client/content/hd` on case-sensitive hosts and leave the real
             // `Client/Content/HD` empty.
-            let path = self.game_folder.join(normalise(&item.dest));
-            let ok = match std::fs::metadata(&path) {
-                Ok(m) if m.len() == item.size => cache.matches(&key, &path, &m, &item.md5),
-                _ => false,
-            };
-            if !ok {
-                todo.push(Missing {
-                    item: item.clone(),
-                    key,
-                    path,
-                });
-            }
+            pending.push((item.clone(), key, self.game_folder.join(normalise(&item.dest))));
         }
-        let _ = cache.save();
+
+        // Hashing is CPU- and I/O-bound and runs for minutes on a full tier;
+        // doing it inline would occupy an async worker for the whole scan (the
+        // channel verify and merge paths already use a pool for this reason).
+        let game_cache = cache.clone();
+        let broken = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            pending
+                .into_par_iter()
+                .filter(|(item, key, path)| {
+                    let ok = match std::fs::metadata(path) {
+                        Ok(m) if m.len() == item.size => game_cache.matches(key, path, &m, &item.md5),
+                        _ => false,
+                    };
+                    !ok
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| Error::Patch(format!("pack verify task: {e}")))?;
+        todo.extend(broken.into_iter().map(|(item, key, path)| Missing {
+            item,
+            key,
+            path,
+            marker: false,
+        }));
 
         if let Some(tx) = tx {
             let _ = tx
@@ -692,7 +793,6 @@ impl crate::GameManager {
                 skipped,
             },
             todo,
-            cache,
         })
     }
 
@@ -702,13 +802,10 @@ impl crate::GameManager {
         scan: PackScan,
         entry: &PackEntry,
         bases: &[String],
+        cache: &Md5Cache,
         tx: Option<&tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
     ) -> Result<PartOutcome> {
-        let PackScan {
-            mut report,
-            todo,
-            cache,
-        } = scan;
+        let PackScan { mut report, todo } = scan;
         let name = report.name.clone();
         let mut broken = Vec::new();
         if todo.is_empty() {
@@ -730,8 +827,15 @@ impl crate::GameManager {
             };
             handles.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                let size = fetch.file(&missing, tx.as_ref()).await?;
-                cache.record_file(&missing.key, &missing.path, &missing.item.md5);
+                let size = if missing.marker {
+                    create_empty_marker(&missing.path)?;
+                    0
+                } else {
+                    fetch.file(&missing, tx.as_ref()).await?
+                };
+                if !missing.item.md5.is_empty() {
+                    cache.record_file(&missing.key, &missing.path, &missing.item.md5);
+                }
                 done.fetch_add(1, Ordering::Relaxed);
                 Ok::<u64, Error>(size)
             });
@@ -754,9 +858,8 @@ impl crate::GameManager {
                 Err(e) => broken.push(e.to_string()),
             }
         }
-        // Persist what was just downloaded, so a rerun after an interruption
-        // re-hashes only the tail.
-        let _ = cache.save();
+        // The cache is persisted once per tier, by the caller: saving here would
+        // prune every other part's entries, since only `touched` survives.
         Ok(PartOutcome { report, broken })
     }
 }
@@ -828,19 +931,18 @@ fn channel_agrees(channel: &HashMap<String, (u64, String)>, key: &str, item: &ku
 }
 
 /// A zero-length entry is a marker, not a download: create it if absent.
-fn create_empty_marker(game_folder: &Path, item: &kuro_api::ResourceItem) -> Result<()> {
-    if item.size != 0 {
-        return Ok(());
-    }
-    let path = game_folder.join(normalise(&item.dest));
-    if path.exists() {
-        return Ok(());
-    }
+///
+/// Written through a temp sibling and [`safe_replace`] rather than `fs::write`:
+/// both `path.exists()` and `fs::write` follow a symlink, so a link left in the
+/// tier directory would have kuro create the file at the link's target —
+/// outside the install. A rename replaces the link itself.
+fn create_empty_marker(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, [])?;
-    Ok(())
+    let tmp = crate::path::tmp_sibling(path, "marker");
+    std::fs::write(&tmp, [])?;
+    crate::atomic::safe_replace(&tmp, path)
 }
 
 /// One manifest entry that failed verification, with its resolved path.
@@ -848,13 +950,14 @@ struct Missing {
     item: kuro_api::ResourceItem,
     key: String,
     path: PathBuf,
+    /// A zero-length entry: create the file instead of fetching it.
+    marker: bool,
 }
 
 /// The result of verifying one pack, before anything is written.
 struct PackScan {
     report: PackPartReport,
     todo: Vec<Missing>,
-    cache: Md5Cache,
 }
 
 struct PartOutcome {
@@ -871,6 +974,16 @@ struct PartOutcome {
 fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
     let tier = Quality::ALL.into_iter().find(|q| q.as_arg().eq_ignore_ascii_case(name));
     let prefix = tier.map(|t| format!("client/content/{}/", t.pack_key()));
+    // A named tier owns exactly its own body directory. `common` owns everything
+    // *else*, so its rule is the mirror image: it must never write into a body
+    // directory, because those are what the user's tier choice selects between
+    // and a `common` install would clobber the tier the launcher believes is
+    // active. (Upstream enforces the same split.)
+    let body_prefixes: Vec<String> = Quality::ALL
+        .iter()
+        .map(|t| format!("client/content/{}/", t.pack_key()))
+        .collect();
+    let is_common = name.eq_ignore_ascii_case("common");
     let check = |dest: &str| -> Result<()> {
         let key = path_key(dest);
         let first = key.split('/').next().unwrap_or("");
@@ -885,10 +998,28 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
                 )));
             }
         }
+        if is_common && body_prefixes.iter().any(|p| key.starts_with(p.as_str())) {
+            return Err(Error::Patch(format!(
+                "`common` manifest entry inside a quality-tier body: {dest} — \
+                 those files belong to the sd/hd/uhd pack"
+            )));
+        }
         Ok(())
     };
     for item in &manifest.resource {
         check(&item.dest)?;
+        // Every downloadable entry needs a digest: without one there is nothing
+        // to verify the fetched bytes against, and the file would be written
+        // unverified (or skipped, leaving a hole the report still calls
+        // healthy). Live pack documents always carry one; an entry that does not
+        // means the document is malformed, so the tier is refused rather than
+        // installed partially.
+        if item.size > 0 && !is_md5(&item.md5) {
+            return Err(Error::Patch(format!(
+                "pack manifest entry without a valid md5: {} (size {})",
+                item.dest, item.size
+            )));
+        }
     }
     for dest in &manifest.delete_files {
         check(dest)?;
@@ -957,6 +1088,24 @@ mod tests {
             &manifest(&["Client/Content/UHD/pakchunk1-UHD-WindowsNoEditor.pak"]),
         );
         assert!(err.is_err(), "an HD pack must not write the UHD body");
+    }
+
+    /// `common` is the base client; it must not write into a tier body, which is
+    /// what the user's quality choice selects between.
+    #[test]
+    fn common_pack_is_kept_out_of_the_tier_bodies() {
+        assert!(validate_pack_manifest(
+            "common",
+            &manifest(&["Client/Binaries/Win64/Client-Win64-Shipping.exe"])
+        )
+        .is_ok());
+        for body in ["SD", "HD", "UHD"] {
+            let dest = format!("Client/Content/{body}/pakchunk0.pak");
+            assert!(
+                validate_pack_manifest("common", &manifest(&[&dest])).is_err(),
+                "`common` was allowed to write {dest}"
+            );
+        }
     }
 
     #[test]

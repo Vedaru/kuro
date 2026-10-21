@@ -30,15 +30,27 @@ pub fn safe_replace(src: &Path, dest: &Path) -> Result<()> {
     let backup = backup_path(dest);
 
     // 1. move the current file aside (if any)
-    if dest.exists() {
+    let had_backup = if dest.exists() {
         if backup.exists() {
             std::fs::remove_file(&backup)?;
         }
         std::fs::rename(dest, &backup)?;
-    }
+        true
+    } else {
+        false
+    };
 
-    // 2. move the new file into place
-    std::fs::rename(src, dest)?;
+    // 2. move the new file into place. If this fails, the original is sitting in
+    // `.bak` and `dest` does not exist — put it back now rather than relying on
+    // a `recover_backup` that not every caller runs. Leaving it there would turn
+    // a transient failure (src removed by a reboot, ENOSPC, a full quota) into a
+    // missing game file that the next `--check` reports as a re-download.
+    if let Err(e) = std::fs::rename(src, dest) {
+        if had_backup {
+            let _ = std::fs::rename(&backup, dest);
+        }
+        return Err(e.into());
+    }
 
     // 3. drop the backup only after the swap succeeded
     if backup.exists() {
@@ -95,5 +107,25 @@ mod tests {
 
         safe_replace(&src, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    }
+
+    /// A swap whose rename fails must leave the original in place, not in
+    /// `.bak`: otherwise a transient error looks like a missing game file.
+    #[test]
+    fn a_failed_swap_restores_the_original() {
+        let dir = tempfile::Builder::new().prefix("kuro-atomic-fail-").tempdir().unwrap();
+        let dest = dir.path().join("file.bin");
+        std::fs::write(&dest, b"old").unwrap();
+
+        // src does not exist, so the second rename fails with ENOENT.
+        let missing = dir.path().join("never-written.bin");
+        let e = safe_replace(&missing, &dest);
+        assert!(e.is_err(), "a failed rename was reported as success");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old", "original lost");
+        assert!(
+            !backup_path(&dest).exists(),
+            "original left behind in .bak instead of restored"
+        );
     }
 }

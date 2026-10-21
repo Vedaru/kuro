@@ -54,6 +54,21 @@ edits.
   ships into *and* with an extension that directory uses, minus `is_protected`
   (`Client/Saved/**`, runtime logs/dumps/DBs, SDK and crash-reporter payloads).
   Widening this deletes game state that cannot be re-downloaded.
+- **A pack manifest is untrusted ground truth, so `validate_pack_manifest` in
+  `pack.rs` accepts it whole or refuses it whole.** No partial installs: an
+  empty tier document, a `common` entry inside a tier body, and an entry with
+  no MD5 are all refusals *before* the first byte and before `unregister`. A
+  skipped entry would otherwise let the tier register as healthy while a file
+  is missing, which the launcher then reports as nothing to repair.
+- **`--check` writes nothing at all**, including zero-length marker files. The
+  scan only *collects* work; every filesystem write (download, marker) happens
+  in the write phase. `check_does_not_create_marker_files` guards this.
+- **Two launcher records, two writers.** `launcherDownloadConfig/<tier>.json`
+  and the `bundles` block belong to the official updater as much as to kuro, so
+  the downgrade guard reads both (`installed_versions`); kuro's own
+  `.kuro_cache/packs.json` is only trusted while `bundles` still lists the tier.
+  `unregister` runs before the first byte of a reinstall, so a crashed run
+  leaves "not installed" rather than a record claiming missing files.
 
 ## Tests
 
