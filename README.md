@@ -58,6 +58,12 @@ the wine dependency is removed by applying patches via
   stays the narrower thing: it picks which body those fetch from the channel.
   PGR (Unity) has no quality packs, so this is WuWa-only
 - **checkout** — CN ⇄ Bilibili channel switch for WuWa (diff-file swap + appId)
+- **built-in launcher** — `kuro play` starts the game itself. Since WuWa 3.7
+  the client refuses to boot without `-krqlv=<SD|HD|UHD>` on its command line,
+  and that argument can only be given at `exec` time, so kuro owns the spawn:
+  `proton run`, or `umu-run` when no Proton is installed, in a kuro-managed
+  prefix under the install. `kuro kill` then finds the client again by its
+  recorded process group when it hangs on exit
 - Resumable, MD5-verified downloads with per-file progress bars
 
 ## Supported games & servers
@@ -151,14 +157,22 @@ older than the installed one is refused rather than rolled back.
 | `h` / `?` | help overlay |
 | `q` | quit |
 
-### Running the game (Steam + GE-Proton)
+### Running the game
 
-kuro installs **game files only** (no launcher — the official one doesn't run
-under wine). Launch the game through Steam as a non-Steam shortcut:
+kuro installs **game files only** and launches them itself — the official
+launcher doesn't run under wine, and dropping the game into Steam as a
+non-Steam shortcut loses the `-krqlv=` argument the client now demands:
 
-1. Steam → *ADD A GAME* → *Add a Non-Steam Game…* → pick `PGR.exe` / `Wuthering Waves.exe`
-2. Properties → Compatibility → force a Proton version (e.g. GE-Proton11-3)
-3. Launch — first start is slow (shader compile); updates come from kuro, not Steam
+```sh
+kuro play <folder>              # saved preset / what is on disk / HD
+kuro play <folder> --quality hd # this run only
+kuro kill <folder>              # a client that hung on exit
+```
+
+It runs under Proton (GE or dwproton, whichever `$HOME` holds) and falls back
+to `umu-run`. Overrides: `KURO_PROTON` (a directory containing `proton`),
+`KURO_PREFIX`, `STEAM_ROOT`. Only WuWa takes a tier argument; PGR launches
+plain. First start is slow (shader compile); updates come from kuro, not Steam.
 
 > PGR ships ACE (AntiCheatExpert). Its kernel drivers can't load under Proton;
 > most ACE games run fine with it absent, some refuse — no clean workaround.
@@ -202,7 +216,19 @@ pipeline is game-agnostic.
 cargo test                      # unit + integration tests
 cargo build --release           # static-ish release binary
 cargo run -p kuro-core --example pgr_proof   # live CDN smoke test (PGR)
+cargo run -p kuro-core --example status -- <folder>   # live status, one install
 ```
+
+Formatting and lints are gates, not advice — both CI workflows run them before
+anything is published, so a PR that fails either never reaches a release:
+
+```sh
+cargo fmt --check                                        # rustfmt.toml: width 120
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Neither uses `--all`: `vendor/hdiffpatch-rs` is a path dependency, not a
+workspace member, and its two dead-code warnings are not ours to fix.
 
 ## Known limitations
 
