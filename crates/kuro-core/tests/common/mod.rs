@@ -48,12 +48,7 @@ pub async fn spawn_http_server(routes: Vec<(String, Vec<u8>)>) -> String {
                             Some(r) => (
                                 "206 Partial Content",
                                 &body[r.clone()],
-                                format!(
-                                    "Content-Range: bytes {}-{}/{}\r\n",
-                                    r.start(),
-                                    r.end(),
-                                    body.len()
-                                ),
+                                format!("Content-Range: bytes {}-{}/{}\r\n", r.start(), r.end(), body.len()),
                             ),
                             None => ("200 OK", &body[..], String::new()),
                         };

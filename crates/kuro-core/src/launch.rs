@@ -80,17 +80,8 @@ impl LaunchPlan {
     /// One-line summary: argument, runner, prefix.
     pub fn brief(&self) -> String {
         let arg = self.tier_arg();
-        let what = if arg.is_empty() {
-            self.game.to_string()
-        } else {
-            arg
-        };
-        format!(
-            "{} via {} (prefix {})",
-            what,
-            self.runner(),
-            self.prefix.display()
-        )
+        let what = if arg.is_empty() { self.game.to_string() } else { arg };
+        format!("{} via {} (prefix {})", what, self.runner(), self.prefix.display())
     }
 
     /// Multi-line plan for the CLI.
@@ -107,9 +98,7 @@ impl LaunchPlan {
         ));
         match (&self.proton, &self.umu_run) {
             (None, Some(_)) => s.push_str("\n  note:   no Proton found — falling back to umu-run"),
-            (None, None) => {
-                s.push_str("\n  note:   no Proton or umu-run found — set KURO_PROTON to a build")
-            }
+            (None, None) => s.push_str("\n  note:   no Proton or umu-run found — set KURO_PROTON to a build"),
             _ => {}
         }
         s
@@ -119,12 +108,8 @@ impl LaunchPlan {
 /// Resolve everything needed to launch `game` from `game_folder` at `quality`.
 /// Does not spawn anything; call [`spawn`] for that.
 pub fn plan(game_folder: &Path, game: Game, quality: Quality) -> Result<LaunchPlan> {
-    let exe_rel = crate::game::find_game_exe(game_folder).ok_or_else(|| {
-        Error::Patch(format!(
-            "no game executable found in {}",
-            game_folder.display()
-        ))
-    })?;
+    let exe_rel = crate::game::find_game_exe(game_folder)
+        .ok_or_else(|| Error::Patch(format!("no game executable found in {}", game_folder.display())))?;
     let runners = resolve_runner();
     Ok(LaunchPlan {
         game,
@@ -152,10 +137,7 @@ pub fn spawn(plan: &LaunchPlan) -> Result<u32> {
         Some(dir) => {
             let proton = dir.join("proton");
             if !proton.is_file() {
-                return Err(Error::Patch(format!(
-                    "no proton binary at {}",
-                    proton.display()
-                )));
+                return Err(Error::Patch(format!("no proton binary at {}", proton.display())));
             }
             // Proton creates the prefix on first run; making the directory
             // first keeps a typo'd KURO_PREFIX from silently "working".
@@ -198,9 +180,7 @@ pub fn spawn(plan: &LaunchPlan) -> Result<u32> {
     // A fresh group per launch: the child becomes its leader, so `pid` is
     // both its pid and the group id `kill` signals.
     cmd.process_group(0);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
     let mut child = cmd.spawn()?;
     let pid = child.id();

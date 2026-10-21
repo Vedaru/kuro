@@ -6,9 +6,9 @@ use kuro_core::GameManager;
 
 #[tokio::main]
 async fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        "/home/vedaru/.local/share/Steam/steamapps/common/Wuthering Waves".to_string()
-    });
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/home/vedaru/.local/share/Steam/steamapps/common/Wuthering Waves".to_string());
 
     match GameManager::open(path.into()).await {
         Ok(mgr) => match mgr.status().await {

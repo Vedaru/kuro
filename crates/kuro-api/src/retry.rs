@@ -36,13 +36,7 @@ pub fn is_transient(e: &Error) -> bool {
         // kind Decode (`hyper::Error(Body, UnexpectedEof)`), not Body, and the
         // CDN is known to truncate under load. Without it a truncated body is
         // never retried and only multi-edge failover saves the request.
-        Error::Http(re) => {
-            re.is_timeout()
-                || re.is_connect()
-                || re.is_request()
-                || re.is_body()
-                || re.is_decode()
-        }
+        Error::Http(re) => re.is_timeout() || re.is_connect() || re.is_request() || re.is_body() || re.is_decode(),
         // A body that failed its MD5 is retried: the CDN is known to truncate
         // under load, and the manifest's hash is authoritative.
         Error::ChecksumMismatch { .. } => true,

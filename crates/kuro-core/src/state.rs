@@ -49,7 +49,9 @@ pub fn staged_patch_path(game_folder: &Path, name: &str) -> PathBuf {
 
 /// Staged path of a full-file fallback download.
 pub fn staged_resource_path(game_folder: &Path, dest: &str) -> PathBuf {
-    incremental_dir(game_folder).join("resources").join(dest.trim_start_matches('/'))
+    incremental_dir(game_folder)
+        .join("resources")
+        .join(dest.trim_start_matches('/'))
 }
 
 pub fn read_local_config(game_folder: &Path) -> Result<Option<LocalConfig>> {

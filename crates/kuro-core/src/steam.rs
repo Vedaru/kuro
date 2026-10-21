@@ -161,7 +161,14 @@ const SCAN_DEPTH: usize = 8;
 /// Directories that never hold a runner or a Steam root; skipping them keeps
 /// the walks quick without changing what they find.
 const SKIP_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", ".cache", ".cargo", ".rustup", "snap", ".npm",
+    "node_modules",
+    ".git",
+    "target",
+    ".cache",
+    ".cargo",
+    ".rustup",
+    "snap",
+    ".npm",
 ];
 
 /// Find a Proton build and an `umu-run` by walking `$HOME` — nothing is
@@ -190,13 +197,7 @@ fn walk_for_runners(root: &Path, max_depth: usize) -> Runners {
     }
 }
 
-fn walk(
-    dir: &Path,
-    depth: usize,
-    max_depth: usize,
-    protons: &mut Vec<PathBuf>,
-    umu_run: &mut Option<PathBuf>,
-) {
+fn walk(dir: &Path, depth: usize, max_depth: usize, protons: &mut Vec<PathBuf>, umu_run: &mut Option<PathBuf>) {
     if depth > max_depth {
         return;
     }

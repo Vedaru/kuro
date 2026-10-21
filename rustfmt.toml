@@ -1,0 +1,4 @@
+# 120 columns: the width this workspace's comments and format strings were
+# written for. The default 100 rewraps prose `cargo fmt` has no business
+# touching, which is why the tree never matched the default.
+max_width = 120

@@ -135,10 +135,7 @@ async fn apply_merges_verifies_swaps_and_cleans() {
         md5_file(&game.join("config.json")),
         md5_file(&newtree.join("config.json"))
     );
-    assert_eq!(
-        md5_file(&game.join("added.bin")),
-        md5_file(&newtree.join("added.bin"))
-    );
+    assert_eq!(md5_file(&game.join("added.bin")), md5_file(&newtree.join("added.bin")));
     assert!(!game.join("obsolete.txt").exists(), "deleteFiles removed");
 
     // version bumped + staging cleaned
@@ -340,8 +337,7 @@ async fn apply_reports_progress_events() {
     std::fs::copy(&diff_path, inc.join("group_1.krpdiff")).unwrap();
 
     let new_pak = b"PAK-NEW-DATA".repeat(1200);
-    let expected_total: u64 =
-        (new_pak.len() + b"dll-new".len() + b"{\"v\":2}".len() + b"new-file".len()) as u64;
+    let expected_total: u64 = (new_pak.len() + b"dll-new".len() + b"{\"v\":2}".len() + b"new-file".len()) as u64;
 
     let group = GroupInfo {
         dest: "group_1.krpdiff".to_string(),

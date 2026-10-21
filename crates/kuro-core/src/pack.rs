@@ -189,21 +189,14 @@ pub fn read_record(game_folder: &Path) -> PackRecord {
 }
 
 fn write_record(game_folder: &Path, record: &PackRecord) -> Result<()> {
-    state::write_atomic(
-        &record_path(game_folder),
-        &serde_json::to_string_pretty(record)?,
-    )
+    state::write_atomic(&record_path(game_folder), &serde_json::to_string_pretty(record)?)
 }
 
 /// Read the launcher's records for one tier.
 pub fn state_of(game_folder: &Path, tier: Quality) -> PackState {
-    let marker = std::fs::read_to_string(
-        game_folder
-            .join(PACKS_DIR)
-            .join(format!("{}.json", tier.pack_key())),
-    )
-    .ok()
-    .and_then(|s| serde_json::from_str::<PackMarker>(&s).ok());
+    let marker = std::fs::read_to_string(game_folder.join(PACKS_DIR).join(format!("{}.json", tier.pack_key())))
+        .ok()
+        .and_then(|s| serde_json::from_str::<PackMarker>(&s).ok());
     let in_bundles = state::read_local_config(game_folder)
         .ok()
         .flatten()
@@ -213,10 +206,7 @@ pub fn state_of(game_folder: &Path, tier: Quality) -> PackState {
     PackState {
         marker,
         in_bundles,
-        recorded_version: read_record(game_folder)
-            .installed
-            .get(&tier.pack_key())
-            .cloned(),
+        recorded_version: read_record(game_folder).installed.get(&tier.pack_key()).cloned(),
     }
 }
 
@@ -235,8 +225,8 @@ pub fn register(
 ) -> Result<()> {
     // A tier cannot be installed into a folder with no config: that file is the
     // install's identity, and kuro has no appId to invent for it.
-    let mut cfg = state::read_local_config(game_folder)?
-        .ok_or_else(|| Error::NoLocalConfig(game_folder.to_path_buf()))?;
+    let mut cfg =
+        state::read_local_config(game_folder)?.ok_or_else(|| Error::NoLocalConfig(game_folder.to_path_buf()))?;
 
     let packs: Vec<String> = bundle_packs
         .map(|p| p.to_vec())
@@ -277,9 +267,7 @@ pub fn register(
 /// no longer all there. The root config keeps `common`'s version: that is the
 /// base client, which this does not touch.
 pub fn unregister(game_folder: &Path, tier: Quality) -> Result<()> {
-    let marker = game_folder
-        .join(PACKS_DIR)
-        .join(format!("{}.json", tier.pack_key()));
+    let marker = game_folder.join(PACKS_DIR).join(format!("{}.json", tier.pack_key()));
     if marker.exists() {
         std::fs::remove_file(&marker)?;
     }
@@ -307,11 +295,7 @@ pub fn unregister(game_folder: &Path, tier: Quality) -> Result<()> {
 /// into `Client/Content/HD/` themselves is not ours to remove. Empty
 /// directories are pruned because a tier whose pak set shrank would otherwise
 /// leave a tree of empty folders behind.
-fn prune_stale(
-    game_folder: &Path,
-    tier: Quality,
-    keep: &std::collections::HashSet<String>,
-) -> usize {
+fn prune_stale(game_folder: &Path, tier: Quality, keep: &std::collections::HashSet<String>) -> usize {
     let key = tier.pack_key();
     let mut record = read_record(game_folder);
     let Some(previous) = record.files.get(&key).cloned() else {
@@ -392,19 +376,11 @@ fn tier_manifest(plan: &[PlannedPack], tier: Quality) -> Option<&PatchIndex> {
 
 /// Drop files of the previous install that the tier's manifest no longer lists,
 /// and return the dests it does list — the record the next run prunes against.
-fn prune_and_record(
-    game_folder: &Path,
-    tier: Quality,
-    plan: &[PlannedPack],
-) -> (usize, Vec<String>) {
+fn prune_and_record(game_folder: &Path, tier: Quality, plan: &[PlannedPack]) -> (usize, Vec<String>) {
     let Some(manifest) = tier_manifest(plan, tier) else {
         return (0, Vec::new());
     };
-    let keep: std::collections::HashSet<String> = manifest
-        .resource
-        .iter()
-        .map(|r| normalise(&r.dest))
-        .collect();
+    let keep: std::collections::HashSet<String> = manifest.resource.iter().map(|r| normalise(&r.dest)).collect();
     let pruned = prune_stale(game_folder, tier, &keep);
     let dests = manifest.resource.iter().map(|r| r.dest.clone()).collect();
     (pruned, dests)
@@ -415,12 +391,7 @@ fn prune_and_record(
 ///
 /// A healthy registration is left alone: the launcher may have rewritten it
 /// while the game ran, and replacing a working record with ours buys nothing.
-fn reconcile_records(
-    game_folder: &Path,
-    tier: Quality,
-    plan: &[PlannedPack],
-    version: &str,
-) -> Result<usize> {
+fn reconcile_records(game_folder: &Path, tier: Quality, plan: &[PlannedPack], version: &str) -> Result<usize> {
     let (pruned, files) = prune_and_record(game_folder, tier, plan);
     let state = state_of(game_folder, tier);
     let current = state.marker.as_ref().is_some_and(|m| m.version == version);
@@ -437,12 +408,7 @@ fn planned_version(plan: &[PlannedPack], tier: Quality, config: &PackConfig) -> 
     plan.iter()
         .find(|p| p.name.eq_ignore_ascii_case(tier.as_arg()))
         .map(|p| p.entry.version.clone())
-        .or_else(|| {
-            config
-                .resource_packs
-                .get("common")
-                .map(|c| c.version.clone())
-        })
+        .or_else(|| config.resource_packs.get("common").map(|c| c.version.clone()))
         .unwrap_or_default()
 }
 
@@ -468,9 +434,7 @@ impl crate::GameManager {
     /// none (Global today).
     pub async fn pack_config(&self) -> Result<PackConfig> {
         let entry: &ServerEntry = self.server_entry();
-        self.api_client()
-            .fetch_pack_config(entry.pack_config_urls)
-            .await
+        self.api_client().fetch_pack_config(entry.pack_config_urls).await
     }
 
     /// Verify a tier and download whatever is missing, then register it with
@@ -492,8 +456,7 @@ impl crate::GameManager {
             .map(|n| n.url.clone())
             .collect();
         let channel = self.channel_manifest().await?;
-        self.sync_pack_inner(tier, &config, &bases, &channel, repair, tx)
-            .await
+        self.sync_pack_inner(tier, &config, &bases, &channel, repair, tx).await
     }
 
     /// [`GameManager::sync_pack`] with the network discovery already done, so
@@ -510,15 +473,9 @@ impl crate::GameManager {
         if bases.is_empty() {
             return Err(Error::NoCdnNode);
         }
-        let plan = self
-            .plan_pack_tier(tier, config, bases, tx.as_ref())
-            .await?;
+        let plan = self.plan_pack_tier(tier, config, bases, tx.as_ref()).await?;
         let version = planned_version(&plan, tier, config);
-        if let Some(installed) = read_record(&self.game_folder)
-            .installed
-            .get(&tier.pack_key())
-            .cloned()
-        {
+        if let Some(installed) = read_record(&self.game_folder).installed.get(&tier.pack_key()).cloned() {
             if is_downgrade(&installed, &version) {
                 return Err(Error::Patch(format!(
                     "the channel offers {} {version}, older than the installed {installed} — \
@@ -534,14 +491,8 @@ impl crate::GameManager {
         let mut scans = Vec::with_capacity(plan.len());
         for planned in &plan {
             scans.push(
-                self.scan_pack_part(
-                    &planned.name,
-                    &planned.entry,
-                    &planned.manifest,
-                    channel,
-                    tx.as_ref(),
-                )
-                .await?,
+                self.scan_pack_part(&planned.name, &planned.entry, &planned.manifest, channel, tx.as_ref())
+                    .await?,
             );
         }
 
@@ -580,9 +531,7 @@ impl crate::GameManager {
         unregister(&self.game_folder, tier)?;
 
         for (idx, scan) in scans.into_iter().enumerate() {
-            let part = self
-                .write_pack_part(scan, &plan[idx].entry, bases, tx.as_ref())
-                .await?;
+            let part = self.write_pack_part(scan, &plan[idx].entry, bases, tx.as_ref()).await?;
             report.broken.extend(part.broken);
             report.parts[idx] = part.report;
         }
@@ -626,12 +575,7 @@ impl crate::GameManager {
             let Some(entry) = config.resource_packs.get(&name) else {
                 return Err(Error::Patch(format!(
                     "the pack config for this channel has no `{name}` pack (has: {})",
-                    config
-                        .resource_packs
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    config.resource_packs.keys().cloned().collect::<Vec<_>>().join(", ")
                 )));
             };
             let manifest = self.fetch_pack_manifest(&name, entry, bases).await?;
@@ -664,12 +608,7 @@ impl crate::GameManager {
     }
 
     /// Fetch one pack's manifest and check it may be installed.
-    async fn fetch_pack_manifest(
-        &self,
-        name: &str,
-        entry: &PackEntry,
-        bases: &[String],
-    ) -> Result<PatchIndex> {
+    async fn fetch_pack_manifest(&self, name: &str, entry: &PackEntry, bases: &[String]) -> Result<PatchIndex> {
         if entry.index_file.is_empty() {
             return Err(Error::MissingField("indexFile"));
         }
@@ -748,9 +687,7 @@ impl crate::GameManager {
                     }
                 )))
                 .await;
-            let _ = tx
-                .send(crate::ProgressEvent::SetTotal { bytes: total })
-                .await;
+            let _ = tx.send(crate::ProgressEvent::SetTotal { bytes: total }).await;
         }
 
         Ok(PackScan {
@@ -907,11 +844,7 @@ fn pack_urls(bases: &[String], base_url: &str, dest: &str) -> Vec<String> {
 /// shared across channels, so its copy of a channel-specific binary is the
 /// wrong channel's. (CN agrees on all 816; Bilibili agrees on 747 and differs
 /// on the 69 `krsdk_*`/anti-cheat binaries, plus one CN-only SDK dll.)
-fn channel_agrees(
-    channel: &HashMap<String, (u64, String)>,
-    key: &str,
-    item: &kuro_api::ResourceItem,
-) -> bool {
+fn channel_agrees(channel: &HashMap<String, (u64, String)>, key: &str, item: &kuro_api::ResourceItem) -> bool {
     channel
         .get(key)
         .is_some_and(|(size, md5)| *size == item.size && md5 == &item.md5)
@@ -959,17 +892,12 @@ struct PartOutcome {
 /// would otherwise be able to rewrite the install's identity or delete the
 /// version record it is about to write.
 fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
-    let tier = Quality::ALL
-        .into_iter()
-        .find(|q| q.as_arg().eq_ignore_ascii_case(name));
+    let tier = Quality::ALL.into_iter().find(|q| q.as_arg().eq_ignore_ascii_case(name));
     let prefix = tier.map(|t| format!("client/content/{}/", t.pack_key()));
     let check = |dest: &str| -> Result<()> {
         let key = normalise(dest);
         let first = key.split('/').next().unwrap_or("");
-        if first == ".kuro_cache"
-            || first == ".incremental_download"
-            || key.starts_with("launcherdownloadconfig")
-        {
+        if first == ".kuro_cache" || first == ".incremental_download" || key.starts_with("launcherdownloadconfig") {
             return Err(Error::UnsafePath(dest.to_string()));
         }
         if let Some(prefix) = &prefix {
@@ -1060,11 +988,9 @@ mod tests {
 
     #[test]
     fn tier_pack_is_confined_to_its_body() {
-        assert!(validate_pack_manifest(
-            "hd",
-            &manifest(&["Client/Content/HD/pakchunk1-HD-WindowsNoEditor.pak"])
-        )
-        .is_ok());
+        assert!(
+            validate_pack_manifest("hd", &manifest(&["Client/Content/HD/pakchunk1-HD-WindowsNoEditor.pak"])).is_ok()
+        );
         let err = validate_pack_manifest(
             "hd",
             &manifest(&["Client/Content/UHD/pakchunk1-UHD-WindowsNoEditor.pak"]),
@@ -1103,13 +1029,7 @@ mod tests {
 
     #[test]
     fn relative_and_absolute_spellings_are_the_same_entry() {
-        assert_eq!(
-            normalise("/Client/Content/HD/a.pak"),
-            "client/content/hd/a.pak"
-        );
-        assert_eq!(
-            normalise("Client\\Content\\HD\\a.pak"),
-            "client/content/hd/a.pak"
-        );
+        assert_eq!(normalise("/Client/Content/HD/a.pak"), "client/content/hd/a.pak");
+        assert_eq!(normalise("Client\\Content\\HD\\a.pak"), "client/content/hd/a.pak");
     }
 }

@@ -21,11 +21,7 @@ const MEMORY_BUDGET: usize = 256 << 20;
 
 /// Inspect a patch file without applying it.
 pub fn patch_info(diff_path: &Path) -> kuro_api::Result<DiffInfo> {
-    let patcher = KrDiff::new(
-        String::new(),
-        diff_path.to_string_lossy().into_owned(),
-        String::new(),
-    );
+    let patcher = KrDiff::new(String::new(), diff_path.to_string_lossy().into_owned(), String::new());
     patcher
         .info()
         .map_err(|e| Error::Patch(format!("krdiff info failed: {e}")))

@@ -133,10 +133,7 @@ impl QualityInfo {
 
     /// Installed presets, cheapest first.
     pub fn installed(&self) -> Vec<Quality> {
-        Quality::ALL
-            .into_iter()
-            .filter(|q| self.is_installed(*q))
-            .collect()
+        Quality::ALL.into_iter().filter(|q| self.is_installed(*q)).collect()
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -186,10 +183,7 @@ pub fn set_selected(game_folder: &Path, q: Quality) -> Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&SavedQuality { quality: q })?,
-    )?;
+    std::fs::write(&tmp, serde_json::to_string_pretty(&SavedQuality { quality: q })?)?;
     crate::atomic::safe_replace(&tmp, &path)
 }
 
@@ -214,11 +208,7 @@ fn count_paks(dir: &Path) -> (usize, u64) {
             let (f, b) = count_paks(&path);
             files += f;
             bytes += b;
-        } else if ft.is_file()
-            && path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("pak"))
-        {
+        } else if ft.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pak")) {
             files += 1;
             bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
         }
@@ -241,9 +231,7 @@ pub fn quality_arg(q: Quality) -> String {
 /// spellings exactly: a manifest that spells a tier some other way is not a
 /// body this can narrow to, and is left alone rather than guessed at.
 pub fn body_of(dest: &str) -> Option<Quality> {
-    let rest = dest
-        .trim_start_matches('/')
-        .strip_prefix("Client/Content/")?;
+    let rest = dest.trim_start_matches('/').strip_prefix("Client/Content/")?;
     match rest.split('/').next()? {
         "SD" => Some(Quality::Sd),
         "HD" => Some(Quality::Hd),
@@ -281,11 +269,7 @@ pub fn served_bodies(index: &PatchIndex) -> Vec<Quality> {
 /// `deleteFiles` and the krpdiff group members are paths too, so they are
 /// filtered alongside `resource`: a narrowed manifest must not ask the engine
 /// to delete or merge files it no longer describes.
-pub fn narrow_to_body(
-    index: &mut PatchIndex,
-    want: Option<Quality>,
-    strict: bool,
-) -> Result<usize> {
+pub fn narrow_to_body(index: &mut PatchIndex, want: Option<Quality>, strict: bool) -> Result<usize> {
     let Some(q) = want else {
         return Ok(0);
     };
@@ -431,10 +415,7 @@ mod tests {
         assert!(dests.contains(&"Client/Content/HD/body.pak"));
         assert!(!dests.contains(&"Client/Content/UHD/body.pak"));
         // Delete lists and krpdiff group members follow the same rule.
-        assert_eq!(
-            index.delete_files,
-            vec!["Client/Content/HD/gone.pak".to_string()]
-        );
+        assert_eq!(index.delete_files, vec!["Client/Content/HD/gone.pak".to_string()]);
         assert_eq!(index.group_infos[0].dst_files.len(), 1);
     }
 
@@ -453,10 +434,7 @@ mod tests {
     fn a_saved_preset_that_is_not_served_falls_back_to_everything() {
         // A repair run must not die because a saved preset is unserved.
         let mut index = manifest(&[Quality::Hd]);
-        assert_eq!(
-            narrow_to_body(&mut index, Some(Quality::Uhd), false).unwrap(),
-            0
-        );
+        assert_eq!(narrow_to_body(&mut index, Some(Quality::Uhd), false).unwrap(), 0);
         assert_eq!(index.resource.len(), 3);
     }
 

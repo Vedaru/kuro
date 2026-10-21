@@ -106,7 +106,10 @@ async fn checkout_swaps_diff_files_and_updates_appid() {
 
     // now serve the full set; the index's cdnList points at this server
     let server = common::spawn_http_server(vec![
-        ("/index.json".into(), serde_json::to_vec(&bilibili_index(&probe)).unwrap()),
+        (
+            "/index.json".into(),
+            serde_json::to_vec(&bilibili_index(&probe)).unwrap(),
+        ),
         (
             "/indexFile.json".into(),
             serde_json::to_vec(&PatchIndex {

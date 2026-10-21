@@ -52,10 +52,7 @@ fn config(base_url: &str, tier_version: &str) -> PackConfig {
         k1: Some(1),
         k2: Some(1),
     });
-    for (name, index) in [
-        ("common", "common/indexFile.json"),
-        ("hd", "hd/indexFile.json"),
-    ] {
+    for (name, index) in [("common", "common/indexFile.json"), ("hd", "hd/indexFile.json")] {
         cfg.resource_packs.insert(
             name.to_string(),
             PackEntry {
@@ -116,22 +113,11 @@ async fn installs_a_tier_and_registers_it_with_the_launcher() {
     );
 
     let report = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &channel,
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), &channel, true, None)
         .await
         .unwrap();
 
-    assert!(
-        report.broken.is_empty(),
-        "unexpected failures: {:?}",
-        report.broken
-    );
+    assert!(report.broken.is_empty(), "unexpected failures: {:?}", report.broken);
     assert!(report.registered);
     assert_eq!(
         std::fs::read(game.join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak")).unwrap(),
@@ -143,23 +129,16 @@ async fn installs_a_tier_and_registers_it_with_the_launcher() {
     );
 
     // Both launcher records, or the launcher offers "repair game".
-    let root: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(game.join("launcherDownloadConfig.json")).unwrap(),
-    )
-    .unwrap();
+    let root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(game.join("launcherDownloadConfig.json")).unwrap()).unwrap();
     let bundle = &root["bundles"]["HD"];
     assert_eq!(bundle["version"], "3.7.1");
     assert_eq!(bundle["resourcePacks"], serde_json::json!(["common", "hd"]));
-    assert_eq!(
-        root["versionFileMd5"], "deadbeef",
-        "unmodelled key was dropped"
-    );
+    assert_eq!(root["versionFileMd5"], "deadbeef", "unmodelled key was dropped");
     assert_eq!(root["appId"], "10003");
 
-    let marker: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(game.join("launcherDownloadConfig/hd.json")).unwrap(),
-    )
-    .unwrap();
+    let marker: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(game.join("launcherDownloadConfig/hd.json")).unwrap()).unwrap();
     assert_eq!(marker["packName"], "hd");
     assert_eq!(marker["version"], "3.7.1");
 
@@ -204,10 +183,7 @@ async fn failed_download_does_not_register_the_tier() {
         .unwrap();
 
     assert!(!report.broken.is_empty(), "a 404 must be reported");
-    assert!(
-        !report.registered,
-        "an incomplete tier must not be registered"
-    );
+    assert!(!report.registered, "an incomplete tier must not be registered");
     assert!(!pack::state_of(&game, Quality::Hd).registered());
     assert!(
         !game.join("launcherDownloadConfig/hd.json").exists(),
@@ -232,11 +208,7 @@ async fn common_defers_to_the_channel_where_they_disagree() {
     let agreed = b"AGREED-FILE".to_vec();
     let cn_only = b"CN-ONLY-SDK".to_vec();
     std::fs::create_dir_all(game.join("Client/Binaries/Win64")).unwrap();
-    std::fs::write(
-        game.join("Client/Binaries/Win64/bilibili_sdk.dll"),
-        &channel_sdk,
-    )
-    .unwrap();
+    std::fs::write(game.join("Client/Binaries/Win64/bilibili_sdk.dll"), &channel_sdk).unwrap();
 
     let server = common::spawn_http_server(vec![
         (
@@ -244,10 +216,7 @@ async fn common_defers_to_the_channel_where_they_disagree() {
             manifest_json(&[
                 ("Client/Binaries/Win64/bilibili_sdk.dll", &sdk_pack_doc),
                 ("Client/Binaries/Win64/shared.dll", &agreed),
-                (
-                    "Client/Binaries/Win64/thirdparty/krpcsdk_mainland/krsdk.dll",
-                    &cn_only,
-                ),
+                ("Client/Binaries/Win64/thirdparty/krpcsdk_mainland/krsdk.dll", &cn_only),
             ]),
         ),
         ("/hd/indexFile.json".into(), manifest_json(&[])),
@@ -255,10 +224,7 @@ async fn common_defers_to_the_channel_where_they_disagree() {
             "/zip/Client/Binaries/Win64/bilibili_sdk.dll".into(),
             sdk_pack_doc.clone(),
         ),
-        (
-            "/zip/Client/Binaries/Win64/shared.dll".into(),
-            agreed.clone(),
-        ),
+        ("/zip/Client/Binaries/Win64/shared.dll".into(), agreed.clone()),
     ])
     .await;
 
@@ -275,14 +241,7 @@ async fn common_defers_to_the_channel_where_they_disagree() {
     );
 
     let report = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &channel,
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), &channel, true, None)
         .await
         .unwrap();
 
@@ -350,9 +309,7 @@ async fn check_reports_without_touching_anything() {
     assert_eq!(report.broken.len(), 1);
     assert!(!report.registered);
     assert!(
-        !game
-            .join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak")
-            .exists(),
+        !game.join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak").exists(),
         "--check downloaded a file"
     );
     assert!(!game.join("launcherDownloadConfig/hd.json").exists());
@@ -408,10 +365,7 @@ async fn rerun_is_idempotent() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        second.parts[1].downloaded, 0,
-        "a verified tier was re-downloaded"
-    );
+    assert_eq!(second.parts[1].downloaded, 0, "a verified tier was re-downloaded");
     assert!(second.registered);
 
     let _ = std::fs::remove_dir_all(&base);
@@ -456,13 +410,10 @@ async fn a_tier_pack_cannot_write_outside_its_body() {
         .unwrap_err();
 
     assert!(
-        err.to_string()
-            .contains("manifest entry outside Client/Content/HD"),
+        err.to_string().contains("manifest entry outside Client/Content/HD"),
         "unexpected error: {err}"
     );
-    assert!(!game
-        .join("Client/Binaries/Win64/Client-Win64-Shipping.exe")
-        .exists());
+    assert!(!game.join("Client/Binaries/Win64/Client-Win64-Shipping.exe").exists());
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -551,11 +502,7 @@ async fn a_noop_rerun_does_not_disturb_a_healthy_registration() {
     // The launcher rewrote the marker while the game ran; kuro must leave it be.
     let marker = game.join("launcherDownloadConfig/hd.json");
     let launcher_written = serde_json::json!({ "packName": "hd", "version": "3.7.1" });
-    std::fs::write(
-        &marker,
-        serde_json::to_string_pretty(&launcher_written).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(&marker, serde_json::to_string_pretty(&launcher_written).unwrap()).unwrap();
     let stamp = std::fs::metadata(&marker).unwrap().modified().unwrap();
 
     let second = mgr
@@ -570,10 +517,7 @@ async fn a_noop_rerun_does_not_disturb_a_healthy_registration() {
         .await
         .unwrap();
     assert_eq!(second.parts[1].downloaded, 0);
-    assert!(
-        second.registered,
-        "a complete tier must report as registered"
-    );
+    assert!(second.registered, "a complete tier must report as registered");
     assert_eq!(
         std::fs::metadata(&marker).unwrap().modified().unwrap(),
         stamp,
@@ -703,9 +647,7 @@ async fn a_manifest_that_fails_its_published_digest_is_refused() {
         err.to_string().contains("but the channel published"),
         "unexpected error: {err}"
     );
-    assert!(!game
-        .join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak")
-        .exists());
+    assert!(!game.join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak").exists());
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -751,11 +693,7 @@ async fn a_large_pak_is_fetched_as_ranges() {
 
     assert!(report.registered);
     let pak = game.join("Client/Content/HD/pakchunk1-HD-WindowsNoEditor.pak");
-    assert_eq!(
-        std::fs::read(&pak).unwrap(),
-        big,
-        "ranged download reassembled wrong"
-    );
+    assert_eq!(std::fs::read(&pak).unwrap(), big, "ranged download reassembled wrong");
     // A rerun trusts the recorded hash instead of re-reading 5 MiB.
     let again = mgr
         .sync_pack_inner(
@@ -789,21 +727,15 @@ async fn an_entry_without_a_digest_is_skipped_not_downloaded() {
         &real,
     )]))
     .unwrap();
-    manifest["resource"]
-        .as_array_mut()
-        .unwrap()
-        .push(serde_json::json!({
-            "dest": "Client/Content/HD/unverifiable.pak",
-            "md5": "",
-            "size": 1024,
-        }));
+    manifest["resource"].as_array_mut().unwrap().push(serde_json::json!({
+        "dest": "Client/Content/HD/unverifiable.pak",
+        "md5": "",
+        "size": 1024,
+    }));
 
     let server = common::spawn_http_server(vec![
         ("/common/indexFile.json".into(), manifest_json(&[])),
-        (
-            "/hd/indexFile.json".into(),
-            serde_json::to_vec(&manifest).unwrap(),
-        ),
+        ("/hd/indexFile.json".into(), serde_json::to_vec(&manifest).unwrap()),
     ])
     .await;
 

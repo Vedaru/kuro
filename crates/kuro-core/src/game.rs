@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use kuro_api::config::ServerEntry;
 use kuro_api::{
-    build_client, game_server_by_app_id, index_url, server_entry, ApiClient, Error, FileRef, Game,
-    GroupInfo, LauncherIndex, LocalConfig, PatchConfig, PatchIndex, ResourceItem, Result, Server,
+    build_client, game_server_by_app_id, index_url, server_entry, ApiClient, Error, FileRef, Game, GroupInfo,
+    LauncherIndex, LocalConfig, PatchConfig, PatchIndex, ResourceItem, Result, Server,
 };
 
 use crate::atomic::{recover_backup, safe_replace};

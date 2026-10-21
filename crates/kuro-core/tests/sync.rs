@@ -78,9 +78,18 @@ async fn sync_repairs_missing_and_bad_files() {
     assert!(report.failed.is_empty(), "no failures: {report:?}");
 
     // all three now correct
-    assert_eq!(std::fs::read(game.join("Client/Content/Paks/fileA.pak")).unwrap(), file_a);
-    assert_eq!(std::fs::read(game.join("Client/Content/Paks/fileB.pak")).unwrap(), file_b);
-    assert_eq!(std::fs::read(game.join("Client/Content/Paks/fileC.pak")).unwrap(), file_c);
+    assert_eq!(
+        std::fs::read(game.join("Client/Content/Paks/fileA.pak")).unwrap(),
+        file_a
+    );
+    assert_eq!(
+        std::fs::read(game.join("Client/Content/Paks/fileB.pak")).unwrap(),
+        file_b
+    );
+    assert_eq!(
+        std::fs::read(game.join("Client/Content/Paks/fileC.pak")).unwrap(),
+        file_c
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -108,11 +117,7 @@ async fn sync_removes_files_not_in_manifest() {
     std::fs::write(game.join("Client/Content/Paks/stray.tmp"), b"STRAY").unwrap();
 
     // protected files the sweep must NOT touch (per the chosen exclusion rules)
-    std::fs::write(
-        game.join("Client/Content/Paks/inflight.pak.sync.tmp"),
-        b"IN-FLIGHT",
-    )
-    .unwrap();
+    std::fs::write(game.join("Client/Content/Paks/inflight.pak.sync.tmp"), b"IN-FLIGHT").unwrap();
     std::fs::create_dir_all(game.join("Client/Content/Paks/.incremental_download")).unwrap();
     std::fs::write(
         game.join("Client/Content/Paks/.incremental_download/staged.pak"),
@@ -141,17 +146,9 @@ async fn sync_removes_files_not_in_manifest() {
     // an unknown directory (not in the manifest) with a manifest-looking
     // extension must survive too
     std::fs::create_dir_all(game.join("Client/Content/Paks/OldLocale/en-US")).unwrap();
-    std::fs::write(
-        game.join("Client/Content/Paks/OldLocale/en-US/old.bin"),
-        b"OLD-LOCALE",
-    )
-    .unwrap();
+    std::fs::write(game.join("Client/Content/Paks/OldLocale/en-US/old.bin"), b"OLD-LOCALE").unwrap();
 
-    let server = common::spawn_http_server(vec![(
-        "/zip/Client/Content/Paks/fileA.pak".into(),
-        file_a.to_vec(),
-    )])
-    .await;
+    let server = common::spawn_http_server(vec![("/zip/Client/Content/Paks/fileA.pak".into(), file_a.to_vec())]).await;
 
     let full_index = PatchIndex {
         resource: vec![res("Client/Content/Paks/fileA.pak", file_a)],
@@ -176,7 +173,10 @@ async fn sync_removes_files_not_in_manifest() {
     );
 
     // manifest file still present, untouched
-    assert_eq!(std::fs::read(game.join("Client/Content/Paks/fileA.pak")).unwrap(), file_a);
+    assert_eq!(
+        std::fs::read(game.join("Client/Content/Paks/fileA.pak")).unwrap(),
+        file_a
+    );
 
     // the stale artifact is gone
     assert!(!game.join("Client/Content/Paks/pakchunk18-WindowsNoEditor.pak").exists());
@@ -190,7 +190,9 @@ async fn sync_removes_files_not_in_manifest() {
     // protected files still present
     assert!(game.join("Client/Content/Paks/inflight.pak.sync.tmp").exists());
     assert!(game.join("Client/Content/Paks/stray.tmp").exists());
-    assert!(game.join("Client/Content/Paks/.incremental_download/staged.pak").exists());
+    assert!(game
+        .join("Client/Content/Paks/.incremental_download/staged.pak")
+        .exists());
     assert!(game.join("launcherDownloadConfig.json").exists());
 
     let _ = std::fs::remove_dir_all(&base);
@@ -239,17 +241,9 @@ async fn sync_does_not_follow_symlinks_in_the_orphan_sweep() {
     let dosdevices = game.join(".kuro_cache/wineprefix/pfx/dosdevices");
     std::fs::create_dir_all(&dosdevices).unwrap();
     symlink("/", dosdevices.join("z:")).unwrap();
-    std::fs::write(
-        dosdevices.join("pakchunk20-WindowsNoEditor.pak"),
-        b"CACHE",
-    )
-    .unwrap();
+    std::fs::write(dosdevices.join("pakchunk20-WindowsNoEditor.pak"), b"CACHE").unwrap();
 
-    let server = common::spawn_http_server(vec![(
-        "/zip/Client/Content/Paks/fileA.pak".into(),
-        file_a.to_vec(),
-    )])
-    .await;
+    let server = common::spawn_http_server(vec![("/zip/Client/Content/Paks/fileA.pak".into(), file_a.to_vec())]).await;
 
     let full_index = PatchIndex {
         resource: vec![res("Client/Content/Paks/fileA.pak", file_a)],
@@ -319,11 +313,7 @@ async fn md5_cache_trusts_recorded_hash_without_reread() {
     let good = b"FILE-C-CONTENT";
     std::fs::write(game.join("Client/Content/Paks/fileC.pak"), good).unwrap();
 
-    let server = common::spawn_http_server(vec![(
-        "/zip/Client/Content/Paks/fileC.pak".into(),
-        good.to_vec(),
-    )])
-    .await;
+    let server = common::spawn_http_server(vec![("/zip/Client/Content/Paks/fileC.pak".into(), good.to_vec())]).await;
     let full_index = PatchIndex {
         resource: vec![res("Client/Content/Paks/fileC.pak", good)],
         delete_files: vec![],
@@ -374,11 +364,7 @@ async fn md5_cache_rehashes_when_stat_is_stale() {
     let good = b"FILE-C-CONTENT";
     std::fs::write(game.join("Client/Content/Paks/fileC.pak"), good).unwrap();
 
-    let server = common::spawn_http_server(vec![(
-        "/zip/Client/Content/Paks/fileC.pak".into(),
-        good.to_vec(),
-    )])
-    .await;
+    let server = common::spawn_http_server(vec![("/zip/Client/Content/Paks/fileC.pak".into(), good.to_vec())]).await;
     let full_index = PatchIndex {
         resource: vec![res("Client/Content/Paks/fileC.pak", good)],
         delete_files: vec![],
@@ -395,12 +381,7 @@ async fn md5_cache_rehashes_when_stat_is_stale() {
     let corrupt = vec![b'X'; good.len()];
     let p = game.join("Client/Content/Paks/fileC.pak");
     std::fs::write(&p, &corrupt).unwrap();
-    patch_cache_entry(
-        &game,
-        "Client/Content/Paks/fileC.pak",
-        corrupt.len() as u64,
-        1,
-    );
+    patch_cache_entry(&game, "Client/Content/Paks/fileC.pak", corrupt.len() as u64, 1);
 
     let report = mgr.sync_inner(&full_index, &[server.as_str()], "zip").await.unwrap();
     assert!(report.failed.is_empty(), "{report:?}");
