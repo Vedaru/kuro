@@ -55,11 +55,12 @@ fn bilibili_index(cdn: &str) -> LauncherIndex {
 
 #[tokio::test]
 async fn checkout_swaps_diff_files_and_updates_appid() {
-    let base = std::env::temp_dir().join(format!("kuro-checkout-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let base = tempfile::Builder::new()
+        .prefix("kuro-checkout-test-")
+        .tempdir()
+        .unwrap();
 
-    let game = setup_game(&base);
+    let game = setup_game(base.path());
 
     let bili_login = b"BILIBILI-SDK";
     let bili_pak = b"BILIBILI-PAK";
@@ -164,6 +165,4 @@ async fn checkout_swaps_diff_files_and_updates_appid() {
 
     let cfg = kuro_core::state::read_local_config(&game).unwrap().unwrap();
     assert_eq!(cfg.app_id, "10004", "appId switched to bilibili");
-
-    let _ = std::fs::remove_dir_all(&base);
 }

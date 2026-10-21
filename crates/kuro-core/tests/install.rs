@@ -32,10 +32,8 @@ fn full_index(file_a: &[u8], file_b: &[u8]) -> PatchIndex {
 
 #[tokio::test]
 async fn install_flow_writes_config_and_downloads_everything() {
-    let base = std::env::temp_dir().join(format!("kuro-install-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let folder = base.join("game");
+    let base = tempfile::Builder::new().prefix("kuro-install-test-").tempdir().unwrap();
+    let folder = base.path().join("game");
 
     let file_a = b"CLIENT-FILE-A";
     let file_b = b"CLIENT-FILE-B";
@@ -74,6 +72,4 @@ async fn install_flow_writes_config_and_downloads_everything() {
 
     assert_eq!(std::fs::read(folder.join("Client/a.dat")).unwrap(), file_a);
     assert_eq!(std::fs::read(folder.join("Client/b.dat")).unwrap(), file_b);
-
-    let _ = std::fs::remove_dir_all(&base);
 }

@@ -34,11 +34,9 @@ fn setup_game(base: &Path) -> PathBuf {
 
 #[tokio::test]
 async fn sync_repairs_missing_and_bad_files() {
-    let base = std::env::temp_dir().join(format!("kuro-sync-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let base = tempfile::Builder::new().prefix("kuro-sync-test-").tempdir().unwrap();
 
-    let game = setup_game(&base);
+    let game = setup_game(base.path());
 
     // three files on the server; game has: missing, corrupted, correct
     let file_a = b"FILE-A-CONTENT";
@@ -88,17 +86,13 @@ async fn sync_repairs_missing_and_bad_files() {
         std::fs::read(game.join("Client/Content/Paks/fileC.pak")).unwrap(),
         file_c
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn sync_removes_files_not_in_manifest() {
-    let base = std::env::temp_dir().join(format!("kuro-orphan-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let base = tempfile::Builder::new().prefix("kuro-orphan-test-").tempdir().unwrap();
 
-    let game = setup_game(&base);
+    let game = setup_game(base.path());
 
     // the manifest knows about fileA.pak only
     let file_a = b"FILE-A-CONTENT";
@@ -192,8 +186,6 @@ async fn sync_removes_files_not_in_manifest() {
         .join("Client/Content/Paks/.incremental_download/staged.pak")
         .exists());
     assert!(game.join("launcherDownloadConfig.json").exists());
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Regression: the orphan sweep must never follow symlinks. The launcher's Wine
@@ -208,10 +200,8 @@ async fn sync_removes_files_not_in_manifest() {
 async fn sync_does_not_follow_symlinks_in_the_orphan_sweep() {
     use std::os::unix::fs::symlink;
 
-    let base = std::env::temp_dir().join(format!("kuro-sync-symlink-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base);
+    let base = tempfile::Builder::new().prefix("kuro-sync-symlink-").tempdir().unwrap();
+    let game = setup_game(base.path());
 
     // the one manifest file, present and correct
     let file_a = b"FILE-A-CONTENT";
@@ -226,7 +216,7 @@ async fn sync_does_not_follow_symlinks_in_the_orphan_sweep() {
 
     // outside the install: a same-named artifact the manifest would call stale,
     // reached only through a symlink. Following that link would sweep it.
-    let outside = base.join("outside");
+    let outside = base.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     let outside_pak = outside.join("pakchunk19-WindowsNoEditor.pak");
     std::fs::write(&outside_pak, b"OUTSIDE").unwrap();
@@ -271,8 +261,6 @@ async fn sync_does_not_follow_symlinks_in_the_orphan_sweep() {
     // the links themselves are left alone
     assert!(game.join("Client/Content/Paks/escape").exists());
     assert!(game.join("Client/Content/Paks/self").exists());
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 fn file_mtime_ns(p: &Path) -> u64 {
@@ -303,10 +291,11 @@ fn patch_cache_entry(game: &Path, dest: &str, size: u64, mtime_ns: u64) {
 /// and is never repaired — proving the bytes were never hashed.
 #[tokio::test]
 async fn md5_cache_trusts_recorded_hash_without_reread() {
-    let base = std::env::temp_dir().join(format!("kuro-md5cache-trust-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base);
+    let base = tempfile::Builder::new()
+        .prefix("kuro-md5cache-trust-")
+        .tempdir()
+        .unwrap();
+    let game = setup_game(base.path());
 
     let good = b"FILE-C-CONTENT";
     std::fs::write(game.join("Client/Content/Paks/fileC.pak"), good).unwrap();
@@ -346,18 +335,17 @@ async fn md5_cache_trusts_recorded_hash_without_reread() {
         corrupt,
         "bytes must have been trusted untouched"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A stale cache entry is never trusted: a stat mismatch forces a re-hash,
 /// which catches same-size corruption and repairs it.
 #[tokio::test]
 async fn md5_cache_rehashes_when_stat_is_stale() {
-    let base = std::env::temp_dir().join(format!("kuro-md5cache-stale-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base);
+    let base = tempfile::Builder::new()
+        .prefix("kuro-md5cache-stale-")
+        .tempdir()
+        .unwrap();
+    let game = setup_game(base.path());
 
     let good = b"FILE-C-CONTENT";
     std::fs::write(game.join("Client/Content/Paks/fileC.pak"), good).unwrap();
@@ -385,6 +373,4 @@ async fn md5_cache_rehashes_when_stat_is_stale() {
     assert!(report.failed.is_empty(), "{report:?}");
     assert_eq!(report.repaired, 1, "stale entry must re-hash and repair: {report:?}");
     assert_eq!(std::fs::read(&p).unwrap(), good.to_vec());
-
-    let _ = std::fs::remove_dir_all(&base);
 }

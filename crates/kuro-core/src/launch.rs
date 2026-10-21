@@ -298,14 +298,11 @@ pub fn resolve_prefix(game_folder: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn temp_install() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kuro-launch-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let bin = dir.join("Client/Binaries/Win64");
+    /// A scratch install that removes itself on drop, so a failing assertion
+    /// cannot leave a directory behind.
+    fn temp_install() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new().prefix("kuro-launch-").tempdir().unwrap();
+        let bin = dir.path().join("Client/Binaries/Win64");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("Client-Win64-Shipping.exe"), b"MZ").unwrap();
         dir
@@ -314,12 +311,11 @@ mod tests {
     #[test]
     fn plan_carries_the_exe_quality_and_prefix() {
         let dir = temp_install();
-        let p = plan(&dir, Game::WuWa, Quality::Uhd).unwrap();
+        let p = plan(dir.path(), Game::WuWa, Quality::Uhd).unwrap();
         assert!(p.exe.ends_with("Client/Binaries/Win64/Client-Win64-Shipping.exe"));
         assert!(p.brief().contains("-krqlv=UHD"));
-        assert_eq!(p.prefix, dir.join(DEFAULT_PREFIX));
-        assert_eq!(p.folder, dir);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(p.prefix, dir.path().join(DEFAULT_PREFIX));
+        assert_eq!(p.folder, dir.path());
     }
 
     /// A pid that cannot exist (above any kernel `pid_max`) is reported as not
@@ -327,20 +323,18 @@ mod tests {
     #[test]
     fn kill_reports_a_stale_record_without_signalling() {
         let dir = temp_install();
-        record_pid(&dir, 2_000_000_000).unwrap();
-        let r = kill(&dir).unwrap();
+        record_pid(dir.path(), 2_000_000_000).unwrap();
+        let r = kill(dir.path()).unwrap();
         assert_eq!(r.pid, 2_000_000_000);
         assert!(!r.was_running);
-        assert!(!state::game_pid_file(&dir).exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!state::game_pid_file(dir.path()).exists());
     }
 
     /// Nothing recorded → a clear error, not a blind signal.
     #[test]
     fn kill_without_a_record_errors() {
         let dir = temp_install();
-        assert!(kill(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(kill(dir.path()).is_err());
     }
 
     /// SIGKILL reaches a real process group recorded by a launch.
@@ -350,27 +344,23 @@ mod tests {
         let mut cmd = Command::new("sleep");
         cmd.arg("30").process_group(0);
         let mut child = cmd.spawn().expect("spawn sleep");
-        record_pid(&dir, child.id()).unwrap();
+        record_pid(dir.path(), child.id()).unwrap();
 
-        let r = kill(&dir).unwrap();
+        let r = kill(dir.path()).unwrap();
         assert_eq!(r.pid, child.id());
         assert!(r.was_running);
         let _ = child.wait(); // reap; SIGKILL has no clean-exit path
-        assert!(!state::game_pid_file(&dir).exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!state::game_pid_file(dir.path()).exists());
     }
 
     #[test]
     fn pgr_plan_carries_no_tier_argument() {
         // Unity layout: PGR.exe sits at the install root.
-        let dir = std::env::temp_dir().join(format!("kuro-launch-pgr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("PGR.exe"), b"MZ").unwrap();
-        let p = plan(&dir, Game::Pgr, Quality::Hd).unwrap();
+        let dir = tempfile::Builder::new().prefix("kuro-launch-pgr-").tempdir().unwrap();
+        std::fs::write(dir.path().join("PGR.exe"), b"MZ").unwrap();
+        let p = plan(dir.path(), Game::Pgr, Quality::Hd).unwrap();
         assert!(p.quality.is_none());
         assert!(!p.brief().contains("-krqlv"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Proton aborts without `STEAM_COMPAT_CLIENT_INSTALL_PATH` set. With no
@@ -379,21 +369,17 @@ mod tests {
     #[test]
     fn client_install_path_defaults_to_prefix_without_steam() {
         let dir = temp_install();
-        let mut p = plan(&dir, Game::WuWa, Quality::Hd).unwrap();
+        let mut p = plan(dir.path(), Game::WuWa, Quality::Hd).unwrap();
         std::env::remove_var("STEAM_COMPAT_CLIENT_INSTALL_PATH");
         p.steam_root = None;
         assert_eq!(client_install_path(&p), p.prefix);
         p.steam_root = Some(PathBuf::from("/a/steam/root"));
         assert_eq!(client_install_path(&p), PathBuf::from("/a/steam/root"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn plan_without_exe_errors() {
-        let dir = std::env::temp_dir().join(format!("kuro-launch-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(plan(&dir, Game::Pgr, Quality::Hd).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::Builder::new().prefix("kuro-launch-empty-").tempdir().unwrap();
+        assert!(plan(dir.path(), Game::Pgr, Quality::Hd).is_err());
     }
 }

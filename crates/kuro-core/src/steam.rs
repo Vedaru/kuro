@@ -273,9 +273,8 @@ mod tests {
     /// Latest` (capital `DW-`) was skipped by a prefix matcher.
     #[test]
     fn protons_in_finds_builds_by_binary_not_name_prefix() {
-        let root = std::env::temp_dir().join(format!("kuro-steam-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let tools = root.join("compatibilitytools.d");
+        let root = tempfile::Builder::new().prefix("kuro-steam-").tempdir().unwrap();
+        let tools = root.path().join("compatibilitytools.d");
         for dir in ["DW-Proton Latest", "GE-Proton9-1", "Proton Runtime 3.0", "Empty"] {
             std::fs::create_dir_all(tools.join(dir)).unwrap();
         }
@@ -284,7 +283,7 @@ mod tests {
             std::fs::write(tools.join(dir).join("proton"), b"#!/bin/sh\n").unwrap();
         }
 
-        let found = protons_in(&root);
+        let found = protons_in(root.path());
         let names: Vec<String> = found
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -298,35 +297,32 @@ mod tests {
         assert!(!names.contains(&"Empty".to_string()));
         // Community builds sort ahead of stable Proton.
         assert_eq!(names.first().map(String::as_str), Some("DW-Proton Latest"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The HOME walk finds a runner wherever it lives — no path is assumed.
     #[test]
     fn walk_finds_proton_and_umu_run_anywhere() {
-        let home = std::env::temp_dir().join(format!("kuro-walk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
+        let home = tempfile::Builder::new().prefix("kuro-walk-").tempdir().unwrap();
         // A Proton build buried a few levels down, under made-up directory
         // names — the walk knows no layout, so the names must not matter.
-        let build = home.join("q/w/e/r/t/y");
+        let build = home.path().join("q/w/e/r/t/y");
         std::fs::create_dir_all(&build).unwrap();
         std::fs::write(build.join("proton"), b"#!/bin/sh\n").unwrap();
         // An umu-run in an unrelated tree.
-        let launcher = home.join("x/y");
+        let launcher = home.path().join("x/y");
         std::fs::create_dir_all(&launcher).unwrap();
         std::fs::write(launcher.join("umu-run"), b"#!/bin/sh\n").unwrap();
 
-        let found = walk_for_runners(&home, SCAN_DEPTH);
+        let found = walk_for_runners(home.path(), SCAN_DEPTH);
         assert_eq!(found.proton.as_deref(), Some(build.as_path()));
         assert_eq!(found.umu_run.as_deref(), Some(launcher.join("umu-run").as_path()));
 
         // The walk is bounded: a runner past the depth limit is not reported.
-        let deep = home.join("d/e/f/g/h/i/j/k/l/m");
+        let deep = home.path().join("d/e/f/g/h/i/j/k/l/m");
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("proton"), b"#!/bin/sh\n").unwrap();
-        let shallow = walk_for_runners(&home, 2);
+        let shallow = walk_for_runners(home.path(), 2);
         assert!(shallow.proton.is_none());
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A Steam root is found by the client it contains, at whatever path it
@@ -334,24 +330,24 @@ mod tests {
     /// tree is not enough: a Wine prefix's decoy must not be mistaken for one.
     #[test]
     fn walk_finds_steam_root_by_contents() {
-        let home = std::env::temp_dir().join(format!("kuro-steamwalk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        let root = home.join("somewhere/odd/SteamX");
+        let home = tempfile::Builder::new().prefix("kuro-steamwalk-").tempdir().unwrap();
+        let root = home.path().join("somewhere/odd/SteamX");
         std::fs::create_dir_all(root.join("steamapps")).unwrap();
         std::fs::write(root.join("steam.sh"), b"#!/bin/sh\n").unwrap();
 
-        assert_eq!(walk_for_steam_root(&home, SCAN_DEPTH).as_deref(), Some(root.as_path()));
+        assert_eq!(
+            walk_for_steam_root(home.path(), SCAN_DEPTH).as_deref(),
+            Some(root.as_path())
+        );
 
         // Bounded: the root sits past depth 2, so a shallow walk misses it.
-        assert!(walk_for_steam_root(&home, 2).is_none());
+        assert!(walk_for_steam_root(home.path(), 2).is_none());
 
         // A `steamapps/` without the client is a Wine-prefix decoy, not a
         // Steam install — with the real root gone, nothing is reported.
-        let decoy = home.join("prefix/drive_c/Program Files (x86)/Steam");
+        let decoy = home.path().join("prefix/drive_c/Program Files (x86)/Steam");
         std::fs::create_dir_all(decoy.join("steamapps")).unwrap();
         let _ = std::fs::remove_dir_all(&root);
-        assert!(walk_for_steam_root(&home, SCAN_DEPTH).is_none());
-
-        let _ = std::fs::remove_dir_all(&home);
+        assert!(walk_for_steam_root(home.path(), SCAN_DEPTH).is_none());
     }
 }

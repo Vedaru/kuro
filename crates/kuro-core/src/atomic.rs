@@ -63,10 +63,9 @@ mod tests {
 
     #[test]
     fn swap_and_recover() {
-        let dir = std::env::temp_dir().join("kuro-atomic-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("file.bin");
-        let src = dir.join("src.bin");
+        let dir = tempfile::Builder::new().prefix("kuro-atomic-").tempdir().unwrap();
+        let dest = dir.path().join("file.bin");
+        let src = dir.path().join("src.bin");
         std::fs::write(&dest, b"old").unwrap();
         std::fs::write(&src, b"new").unwrap();
 
@@ -79,25 +78,22 @@ mod tests {
         std::fs::rename(&dest, backup_path(&dest)).unwrap();
         recover_backup(&dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"old2");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn swap_creates_missing_destination_parent() {
-        let dir = std::env::temp_dir().join("kuro-atomic-newdir-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("src.bin");
+        let dir = tempfile::Builder::new()
+            .prefix("kuro-atomic-newdir-")
+            .tempdir()
+            .unwrap();
+        let src = dir.path().join("src.bin");
         std::fs::write(&src, b"new").unwrap();
 
         // destination two levels down, none of which exist yet
-        let dest = dir.join("Client/Content/HD/pakchunk1-HD.pak");
+        let dest = dir.path().join("Client/Content/HD/pakchunk1-HD.pak");
         assert!(!dest.parent().unwrap().exists());
 
         safe_replace(&src, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -514,11 +514,13 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kuro-dl-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A scratch directory that removes itself on drop — including when the
+    /// test panics — under a unique name, so concurrent runs cannot collide.
+    fn scratch(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("kuro-dl-{tag}-"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
@@ -546,12 +548,12 @@ mod tests {
 
     #[tokio::test]
     async fn download_single_with_no_candidates_fails_cleanly() {
-        let dir = temp_dir("nocand");
+        let dir = scratch("nocand");
         let client = reqwest::Client::new();
         let err = download_single(
             &client,
             &[],
-            &dir.join("x.bin"),
+            &dir.path().join("x.bin"),
             None,
             None,
             "x",
@@ -565,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_chunked_with_no_candidates_fails_cleanly() {
-        let dir = temp_dir("nocand-chunked");
+        let dir = scratch("nocand-chunked");
         let client = reqwest::Client::new();
         let chunks = vec![ChunkInfo {
             start: 0,
@@ -575,7 +577,7 @@ mod tests {
         let err = download_chunked(
             &client,
             &[],
-            &dir.join("x.bin"),
+            &dir.path().join("x.bin"),
             &chunks,
             None,
             2,

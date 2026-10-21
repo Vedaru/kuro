@@ -91,10 +91,8 @@ async fn a_large_file_without_chunk_infos_is_fetched_as_ranges() {
     let body = payload(SYNTH_CHUNK_SIZE as usize * 2 + 1);
     let (url, seen) = spawn_recording_server(body.clone()).await;
     let client = kuro_api::build_client().unwrap();
-    let dir = std::env::temp_dir().join(format!("kuro-synth-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let dest = dir.join("big.bin");
+    let dir = tempfile::Builder::new().prefix("kuro-synth-").tempdir().unwrap();
+    let dest = dir.path().join("big.bin");
 
     download_file(
         &client,
@@ -137,8 +135,6 @@ async fn a_large_file_without_chunk_infos_is_fetched_as_ranges() {
         next = b + 1;
     }
     assert_eq!(next, body.len(), "ranges do not cover the whole file");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -146,10 +142,8 @@ async fn a_small_file_without_chunk_infos_is_one_request() {
     let body = payload(64 * 1024);
     let (url, seen) = spawn_recording_server(body.clone()).await;
     let client = kuro_api::build_client().unwrap();
-    let dir = std::env::temp_dir().join(format!("kuro-synth-small-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let dest = dir.join("small.bin");
+    let dir = tempfile::Builder::new().prefix("kuro-synth-small-").tempdir().unwrap();
+    let dest = dir.path().join("small.bin");
 
     download_file(
         &client,
@@ -171,8 +165,6 @@ async fn a_small_file_without_chunk_infos_is_one_request() {
         vec![Seen::Whole],
         "a file smaller than one range is a single GET"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -180,10 +172,11 @@ async fn manifest_chunk_infos_win_over_synthesis() {
     let body = payload(4096);
     let (url, seen) = spawn_recording_server(body.clone()).await;
     let client = kuro_api::build_client().unwrap();
-    let dir = std::env::temp_dir().join(format!("kuro-synth-manifest-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let dest = dir.join("hinted.bin");
+    let dir = tempfile::Builder::new()
+        .prefix("kuro-synth-manifest-")
+        .tempdir()
+        .unwrap();
+    let dest = dir.path().join("hinted.bin");
 
     // Two ranges the manifest chose, not the 4 MiB default.
     let chunks = vec![
@@ -219,6 +212,4 @@ async fn manifest_chunk_infos_win_over_synthesis() {
         Seen::Whole => 0,
     });
     assert_eq!(seen, vec![Seen::Range(0, 1023), Seen::Range(1024, 4095)]);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

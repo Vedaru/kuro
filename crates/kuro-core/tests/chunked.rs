@@ -60,9 +60,7 @@ async fn spawn_range_server(body: Vec<u8>, pieces: usize, delay_ms: u64) -> Stri
 
 #[tokio::test]
 async fn chunked_streams_and_reports_progress_within_a_chunk() {
-    let dir = std::env::temp_dir().join(format!("kuro-chunked-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::Builder::new().prefix("kuro-chunked-").tempdir().unwrap();
 
     let body: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
     // ONE chunk spanning the whole file (concurrency 1). A single chunk is
@@ -80,7 +78,7 @@ async fn chunked_streams_and_reports_progress_within_a_chunk() {
         md5: String::new(),
     }];
 
-    let dest = dir.join("out.bin");
+    let dest = dir.path().join("out.bin");
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     download_chunked(
         &client,
@@ -131,6 +129,4 @@ async fn chunked_streams_and_reports_progress_within_a_chunk() {
         Some(total),
         "the last event must close the file's bar at 100%: {bytes:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

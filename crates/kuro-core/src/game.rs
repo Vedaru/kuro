@@ -1648,9 +1648,8 @@ mod tests {
     fn sweep_survives_unreadable_directory() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = std::env::temp_dir().join(format!("kuro-sweeperm-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let paks = root.join("Client/Content/Paks");
+        let root = tempfile::Builder::new().prefix("kuro-sweeperm-").tempdir().unwrap();
+        let paks = root.path().join("Client/Content/Paks");
         std::fs::create_dir_all(paks.join("locked")).unwrap();
 
         // a stale artifact we can see, and one hidden inside the locked dir
@@ -1661,7 +1660,7 @@ mod tests {
 
         let locked = paks.join("locked");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = sweep_orphans(&root, &manifest);
+        let result = sweep_orphans(root.path(), &manifest);
         // chmod does not block reads as root; that only makes the test weaker
         // (the locked dir is walked), never wrong — the sweep must still be Ok.
         let locked_readable = std::fs::read_dir(&locked).is_ok();
@@ -1676,8 +1675,6 @@ mod tests {
                 "a file we could not see is left alone"
             );
         }
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1710,10 +1707,8 @@ mod tests {
     /// hotfix manifest) must still plan its files, not report "up to date".
     #[tokio::test]
     async fn plan_covers_entries_without_from_folder() {
-        let dir = std::env::temp_dir().join(format!("kuro-plan-nofrom-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        state::write_local_config(&dir, &LocalConfig::new("3.6.0".to_string(), "10003".to_string())).unwrap();
+        let dir = tempfile::Builder::new().prefix("kuro-plan-nofrom-").tempdir().unwrap();
+        state::write_local_config(dir.path(), &LocalConfig::new("3.6.0".to_string(), "10003".to_string())).unwrap();
 
         let patch_index = PatchIndex {
             resource: vec![
@@ -1725,12 +1720,10 @@ mod tests {
             apply_types: vec![],
         };
 
-        let mgr = GameManager::open(dir.clone()).await.unwrap();
+        let mgr = GameManager::open(dir.path().to_path_buf()).await.unwrap();
         let plan = mgr.plan_from_patch_index(&patch_index, "3.6.0", "3.6.1");
         assert_eq!(plan.full_files.len(), 2, "both entries must be planned");
         assert_eq!(plan.total_bytes, 300);
         assert!(plan.full_files.iter().all(|f| !f.local_ready));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

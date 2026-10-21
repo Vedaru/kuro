@@ -1789,10 +1789,12 @@ mod tests {
 
     /// Synthetic game folder with one quality set present (HD) and the rest
     /// absent, mirroring a real WuWa install where only HD is downloaded.
-    fn fake_wuwa(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kuro-tui-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let hd = dir.join("Client/Content/HD");
+    fn fake_wuwa(tag: &str) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("kuro-tui-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let hd = dir.path().join("Client/Content/HD");
         std::fs::create_dir_all(&hd).unwrap();
         std::fs::write(hd.join("pakchunk0.pak"), vec![0u8; 4096]).unwrap();
         std::fs::write(hd.join("pakchunk1.pak"), vec![0u8; 8192]).unwrap();
@@ -1802,9 +1804,9 @@ mod tests {
     #[test]
     fn dump_panels_for_inspection() {
         let dir = fake_wuwa("dump");
-        let info = quality::info(&dir);
+        let info = quality::info(dir.path());
         let mut state = UiState {
-            paths: vec![dir.display().to_string()],
+            paths: vec![dir.path().display().to_string()],
             logs: vec!["status: Wuthering Waves (cn) — up to date".into()],
             statuses: vec![None],
             quality_modal: Some(QualityDraft {
@@ -1840,7 +1842,7 @@ mod tests {
         assert!(!help.contains("-krqlv"), "help leaks the raw flag:\n{help}");
 
         let dir = fake_wuwa("clarity");
-        let info = quality::info(&dir);
+        let info = quality::info(dir.path());
         state.show_help = false;
         state.quality_modal = Some(QualityDraft {
             game: Game::WuWa,

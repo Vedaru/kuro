@@ -14,3 +14,6 @@ crossterm = "0.29.0"
 kuro-core.workspace = true
 ratatui = "0.30.2"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

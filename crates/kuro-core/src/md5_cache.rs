@@ -168,10 +168,8 @@ mod tests {
     /// lookup panic too: the cache is disposable, so it recovers empty.
     #[test]
     fn a_poisoned_cache_recovers_instead_of_panicking() {
-        let dir = std::env::temp_dir().join(format!("kuro-md5-poison-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cache = Md5Cache::load(&dir);
+        let dir = tempfile::Builder::new().prefix("kuro-md5-poison-").tempdir().unwrap();
+        let cache = Md5Cache::load(dir.path());
         cache.store("a.pak", 1, 1, "deadbeef");
 
         let proxy = cache.clone();
@@ -187,7 +185,5 @@ mod tests {
         cache.store("b.pak", 2, 2, "cafebabe");
         assert_eq!(cache.lookup("b.pak", 2, 2).as_deref(), Some("cafebabe"));
         assert_eq!(cache.lookup("a.pak", 1, 1), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -98,9 +98,9 @@ mod tests {
 
     #[test]
     fn md5_known_vector() {
-        let dir = std::env::temp_dir().join("kuro-patch-md5-test.txt");
-        std::fs::write(&dir, b"hello").unwrap();
-        assert_eq!(md5_file(&dir).unwrap(), "5d41402abc4b2a76b9719d911017c592");
-        let _ = std::fs::remove_file(&dir);
+        let dir = tempfile::Builder::new().prefix("kuro-patch-md5-").tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        assert_eq!(md5_file(&file).unwrap(), "5d41402abc4b2a76b9719d911017c592");
     }
 }

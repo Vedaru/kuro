@@ -74,10 +74,8 @@ fn config(base_url: &str, tier_version: &str) -> PackConfig {
 /// every key it does not model alone.
 #[tokio::test]
 async fn installs_a_tier_and_registers_it_with_the_launcher() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-install-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-install-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let common = b"CLIENT-BINARY".to_vec();
     let hd = vec![7u8; 9000];
@@ -143,17 +141,13 @@ async fn installs_a_tier_and_registers_it_with_the_launcher() {
     let state = pack::state_of(&game, Quality::Hd);
     assert!(state.registered());
     assert_eq!(state.recorded_version.as_deref(), Some("3.7.1"));
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A failed download must not leave a record claiming the tier is installed.
 #[tokio::test]
 async fn failed_download_does_not_register_the_tier() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-fail-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-fail-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let hd = b"PAK".to_vec();
     // The manifest is served, the file it lists is not: the CDN 404s.
@@ -187,8 +181,6 @@ async fn failed_download_does_not_register_the_tier() {
         !game.join("launcherDownloadConfig/hd.json").exists(),
         "marker written for an uninstalled tier"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `common` describes the base client, which the channel also serves. Where the
@@ -196,10 +188,8 @@ async fn failed_download_does_not_register_the_tier() {
 /// channel-specific SDK binaries with the other channel's.
 #[tokio::test]
 async fn common_defers_to_the_channel_where_they_disagree() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-common-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10004");
+    let base = tempfile::Builder::new().prefix("kuro-pack-common-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10004");
 
     let sdk_pack_doc = b"BILIBILI-SDK-FROM-PACK-DOC".to_vec();
     let channel_sdk = b"THE-CHANNEL-VERSION-OF-IT".to_vec();
@@ -264,17 +254,13 @@ async fn common_defers_to_the_channel_where_they_disagree() {
             .exists(),
         "a CN-only SDK dll was written into a Bilibili install"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `--check` reports what is missing without downloading or writing records.
 #[tokio::test]
 async fn check_reports_without_touching_anything() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-check-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-check-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let hd = b"PAK".to_vec();
     let server = common::spawn_http_server(vec![
@@ -311,17 +297,13 @@ async fn check_reports_without_touching_anything() {
         "--check downloaded a file"
     );
     assert!(!game.join("launcherDownloadConfig/hd.json").exists());
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A rerun after a completed install is a no-op, not a re-download.
 #[tokio::test]
 async fn rerun_is_idempotent() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-rerun-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-rerun-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let hd = vec![3u8; 5000];
     let server = common::spawn_http_server(vec![
@@ -365,8 +347,6 @@ async fn rerun_is_idempotent() {
         .unwrap();
     assert_eq!(second.parts[1].downloaded, 0, "a verified tier was re-downloaded");
     assert!(second.registered);
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// The tier pack may not write outside its own body directory. Files are the
@@ -374,10 +354,8 @@ async fn rerun_is_idempotent() {
 /// would overwrite the client binary.
 #[tokio::test]
 async fn a_tier_pack_cannot_write_outside_its_body() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-escape-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-escape-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let payload = b"NOT-A-PAK".to_vec();
     let server = common::spawn_http_server(vec![
@@ -412,8 +390,6 @@ async fn a_tier_pack_cannot_write_outside_its_body() {
         "unexpected error: {err}"
     );
     assert!(!game.join("Client/Binaries/Win64/Client-Win64-Shipping.exe").exists());
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// An interrupted install must not leave the launcher believing the tier is
@@ -421,10 +397,8 @@ async fn a_tier_pack_cannot_write_outside_its_body() {
 /// failure leaves "not installed" rather than "repair game" with no way out.
 #[tokio::test]
 async fn a_failed_install_withdraws_the_records_it_cannot_vouch_for() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-fail-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-fail-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let hd = vec![7u8; 4096];
     let server = common::spawn_http_server(vec![
@@ -457,18 +431,14 @@ async fn a_failed_install_withdraws_the_records_it_cannot_vouch_for() {
         !pack::state_of(&game, Quality::Hd).registered(),
         "a failed install claimed a complete tier"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A rerun with nothing to download leaves a healthy registration in place. It
 /// must not withdraw and rewrite records the launcher may have touched since.
 #[tokio::test]
 async fn a_noop_rerun_does_not_disturb_a_healthy_registration() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-noop-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-noop-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let hd = vec![9u8; 2048];
     let server = common::spawn_http_server(vec![
@@ -521,18 +491,14 @@ async fn a_noop_rerun_does_not_disturb_a_healthy_registration() {
         stamp,
         "a no-op rerun rewrote a record it did not need to touch"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A tier whose pak set shrank must not leave the dropped files behind, but
 /// anything the user put there themselves is not ours to delete.
 #[tokio::test]
 async fn a_shrinking_tier_removes_its_own_stale_files_only() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-prune-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-prune-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let keep = vec![1u8; 1024];
     let drop = vec![2u8; 1024];
@@ -602,8 +568,6 @@ async fn a_shrinking_tier_removes_its_own_stale_files_only() {
     assert!(game
         .join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak")
         .is_file());
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A manifest that does not match the digest the channel published for it is
@@ -611,10 +575,8 @@ async fn a_shrinking_tier_removes_its_own_stale_files_only() {
 /// against a file list nobody vouched for.
 #[tokio::test]
 async fn a_manifest_that_fails_its_published_digest_is_refused() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-digest-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-digest-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let hd = vec![5u8; 512];
     let server = common::spawn_http_server(vec![
@@ -646,8 +608,6 @@ async fn a_manifest_that_fails_its_published_digest_is_refused() {
         "unexpected error: {err}"
     );
     assert!(!game.join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak").exists());
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Packs are ~400 MiB each, so every real pak goes through the parallel-range
@@ -655,10 +615,8 @@ async fn a_manifest_that_fails_its_published_digest_is_refused() {
 /// exact MD5, through the same scan/write split the small tests cover.
 #[tokio::test]
 async fn a_large_pak_is_fetched_as_ranges() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-ranges-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new().prefix("kuro-pack-ranges-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
 
     // Larger than the 4 MiB synthetic chunk size, so `chunk_plan` splits it.
     let big: Vec<u8> = (0..(5 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
@@ -705,8 +663,6 @@ async fn a_large_pak_is_fetched_as_ranges() {
         .await
         .unwrap();
     assert_eq!(again.parts[1].downloaded, 0);
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// An entry with no digest but a size cannot be verified or fetched, so it is
@@ -714,10 +670,11 @@ async fn a_large_pak_is_fetched_as_ranges() {
 /// genuinely absent files end up in `--check`.
 #[tokio::test]
 async fn an_entry_without_a_digest_is_skipped_not_downloaded() {
-    let base = std::env::temp_dir().join(format!("kuro-pack-nodigest-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let game = setup_game(&base, "10003");
+    let base = tempfile::Builder::new()
+        .prefix("kuro-pack-nodigest-")
+        .tempdir()
+        .unwrap();
+    let game = setup_game(base.path(), "10003");
 
     let real = vec![3u8; 256];
     let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_json(&[(
@@ -757,6 +714,4 @@ async fn an_entry_without_a_digest_is_skipped_not_downloaded() {
         vec!["Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak"]
     );
     assert!(!game.join("Client/Content/HD/unverifiable.pak").exists());
-
-    let _ = std::fs::remove_dir_all(&base);
 }

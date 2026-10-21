@@ -58,15 +58,13 @@ fn file_ref(dest: &str, data: &[u8]) -> FileRef {
 
 #[tokio::test]
 async fn apply_merges_verifies_swaps_and_cleans() {
-    let base = std::env::temp_dir().join(format!("kuro-apply-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let base = tempfile::Builder::new().prefix("kuro-apply-test-").tempdir().unwrap();
 
-    let game = setup_game(&base);
-    let newtree = setup_new_tree(&base);
+    let game = setup_game(base.path());
+    let newtree = setup_new_tree(base.path());
 
     // real KrDiff between old and new trees
-    let diff_path = base.join("test.krpdiff");
+    let diff_path = base.path().join("test.krpdiff");
     kuro_patch::create_krdiff(&game, &newtree, &diff_path).unwrap();
 
     // "predownload done": stage the krpdiff into the incremental dir
@@ -138,19 +136,15 @@ async fn apply_merges_verifies_swaps_and_cleans() {
     let cfg = kuro_core::state::read_local_config(&game).unwrap().unwrap();
     assert_eq!(cfg.version, "1.0.0");
     assert!(!inc.exists(), "staging cleaned up");
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// An apply that swaps nothing must not record the new version: otherwise
 /// `status` reports "up to date" forever and the real update is never taken.
 #[tokio::test]
 async fn apply_refuses_to_record_a_version_it_did_not_install() {
-    let base = std::env::temp_dir().join(format!("kuro-apply-guard-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let base = tempfile::Builder::new().prefix("kuro-apply-guard-").tempdir().unwrap();
 
-    let game = setup_game(&base);
+    let game = setup_game(base.path());
     // staging exists (a predownload ran) but holds nothing usable — the shape of
     // the live WuWa CN hotfix manifest, whose entries carry no source folder.
     std::fs::create_dir_all(game.join(".incremental_download")).unwrap();
@@ -194,8 +188,6 @@ async fn apply_refuses_to_record_a_version_it_did_not_install() {
         game.join(".incremental_download").exists(),
         "staging survives for a retry"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// An update can introduce a directory the install has never had (WuWa 3.7.0
@@ -204,12 +196,10 @@ async fn apply_refuses_to_record_a_version_it_did_not_install() {
 /// directory fails with ENOENT ("I/O error: No such file or directory").
 #[tokio::test]
 async fn apply_creates_new_target_directories() {
-    let base = std::env::temp_dir().join(format!("kuro-apply-newdir-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let base = tempfile::Builder::new().prefix("kuro-apply-newdir-").tempdir().unwrap();
 
-    let game = setup_game(&base);
-    let newtree = setup_new_tree(&base);
+    let game = setup_game(base.path());
+    let newtree = setup_new_tree(base.path());
     std::fs::create_dir_all(newtree.join("Client/Content/HD")).unwrap();
     let hd_pak = b"HD-NEW-DATA".repeat(500);
     std::fs::write(newtree.join("Client/Content/HD/pakchunk1-HD.pak"), &hd_pak).unwrap();
@@ -218,7 +208,7 @@ async fn apply_creates_new_target_directories() {
         "target directory must be absent before apply"
     );
 
-    let diff_path = base.join("newdir.krpdiff");
+    let diff_path = base.path().join("newdir.krpdiff");
     kuro_patch::create_krdiff(&game, &newtree, &diff_path).unwrap();
     let inc = game.join(".incremental_download");
     std::fs::create_dir_all(&inc).unwrap();
@@ -273,17 +263,13 @@ async fn apply_creates_new_target_directories() {
         md5_bytes(&hd_pak),
         "file in the newly-created directory landed"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn apply_without_predownload_errors_cleanly() {
-    let base = std::env::temp_dir().join(format!("kuro-apply-notest-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let base = tempfile::Builder::new().prefix("kuro-apply-notest-").tempdir().unwrap();
 
-    let game = setup_game(&base);
+    let game = setup_game(base.path());
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let err = mgr
         .apply_inner(
@@ -307,8 +293,6 @@ async fn apply_without_predownload_errors_cleanly() {
         err.to_string().contains("predownload"),
         "expected a predownload hint, got: {err}"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// The TUI draws the apply progress bar only when it receives a `SetTotal`
@@ -319,14 +303,15 @@ async fn apply_without_predownload_errors_cleanly() {
 /// completions that advance the bar.
 #[tokio::test]
 async fn apply_reports_progress_events() {
-    let base = std::env::temp_dir().join(format!("kuro-apply-progress-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let base = tempfile::Builder::new()
+        .prefix("kuro-apply-progress-")
+        .tempdir()
+        .unwrap();
 
-    let game = setup_game(&base);
-    let newtree = setup_new_tree(&base);
+    let game = setup_game(base.path());
+    let newtree = setup_new_tree(base.path());
 
-    let diff_path = base.join("progress.krpdiff");
+    let diff_path = base.path().join("progress.krpdiff");
     kuro_patch::create_krdiff(&game, &newtree, &diff_path).unwrap();
     let inc = game.join(".incremental_download");
     std::fs::create_dir_all(&inc).unwrap();
@@ -404,6 +389,4 @@ async fn apply_reports_progress_events() {
         group_done_bytes, expected_total,
         "per-group GroupDone bytes must add up to the announced total"
     );
-
-    let _ = std::fs::remove_dir_all(&base);
 }

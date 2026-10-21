@@ -4,17 +4,15 @@ use kuro_core::GameManager;
 
 #[tokio::main]
 async fn main() {
-    let dir = std::env::temp_dir().join("kuro-pgr-proof");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::Builder::new().prefix("kuro-pgr-proof-").tempdir().unwrap();
     let cfg = LocalConfig::new("4.6.0", "50015"); // PGR global
     std::fs::write(
-        dir.join("launcherDownloadConfig.json"),
+        dir.path().join("launcherDownloadConfig.json"),
         serde_json::to_string_pretty(&cfg).unwrap(),
     )
     .unwrap();
 
-    match GameManager::open(dir.clone()).await {
+    match GameManager::open(dir.path().to_path_buf()).await {
         Ok(m) => {
             println!("auto-detect: game={} server={}", m.game, m.server);
             match m.status().await {
@@ -38,5 +36,4 @@ async fn main() {
         }
         Err(e) => println!("open FAILED: {e}"),
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
