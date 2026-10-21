@@ -104,7 +104,7 @@ impl ApiClient {
             .iter()
             .filter(|n| n.p > 0 && !std::ptr::eq(*n, primary))
             .collect();
-        rest.sort_by(|a, b| b.p.cmp(&a.p));
+        rest.sort_by_key(|n| std::cmp::Reverse(n.p));
         let mut out = Vec::with_capacity(rest.len() + 1);
         out.push(primary);
         out.extend(rest);

@@ -69,10 +69,23 @@ jobs:
       - name: Install the pinned toolchain
         run: |
           set -eux
-          rustup toolchain install 1.98.1 --profile minimal
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.1
           rustc --version
           cargo --version
+
+      # Formatting and lints gate the build: a PR that fails either never
+      # reaches the publish steps, and the tree is already formatted (see
+      # rustfmt.toml), so a diff here means the change was not run through
+      # `cargo fmt`.
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        # The vendored third-party crate is built as a path dependency and has
+        # two dead-code warnings of its own; it is not ours to fix and it is not
+        # a workspace member, so lint the workspace only.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
