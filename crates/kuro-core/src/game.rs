@@ -874,7 +874,7 @@ impl GameManager {
             let urls = node_urls(&nodes, |n| ApiClient::resource_url(n, &base, f));
             let game_path = self.game_folder.join(f.trim_start_matches('/'));
             std::fs::create_dir_all(game_path.parent().unwrap())?;
-            let tmp = game_path.with_extension("checkout.tmp");
+            let tmp = tmp_sibling(&game_path, "checkout");
             let name = f.to_string();
             let md5 = expected_md5.clone();
             let http = self.http.clone();

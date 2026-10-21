@@ -182,7 +182,7 @@ pub fn set_selected(game_folder: &Path, q: Quality) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::path::tmp_sibling(&path, "write");
     std::fs::write(&tmp, serde_json::to_string_pretty(&SavedQuality { quality: q })?)?;
     crate::atomic::safe_replace(&tmp, &path)
 }

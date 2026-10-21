@@ -99,7 +99,7 @@ impl Md5Cache {
             inner.entries.retain(|k, _| touched.contains(k));
             serde_json::to_string_pretty(&inner.entries)?
         };
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = crate::path::tmp_sibling(&self.path, "write");
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }

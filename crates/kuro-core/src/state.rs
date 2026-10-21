@@ -76,7 +76,7 @@ pub fn write_atomic(path: &Path, data: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::path::tmp_sibling(path, "write");
     std::fs::write(&tmp, data)?;
     crate::atomic::safe_replace(&tmp, path)
 }

@@ -380,15 +380,24 @@ async fn cli_status(folder: &str) -> std::io::Result<()> {
 /// explicit, fails loudly when the channel does not serve that body.
 async fn cli_sync(args: &[String]) -> std::io::Result<()> {
     let (folder, rest) = split_play_args(args);
-    let body = match body_choice(None, &rest) {
-        Ok(b) => b,
-        Err(msg) => {
-            println!("{msg}");
-            return Ok(());
-        }
-    };
+    // Reject a malformed flag before touching the disk, then validate the tier
+    // against the game actually in the folder: `body_choice` needs the game to
+    // refuse a tier for a title that has none, and PGR has no packs at all, so
+    // asking for `--quality hd` on a PGR install has to be an error rather
+    // than a silently-ignored flag.
+    if let Err(msg) = parse_quality_arg(&rest) {
+        println!("{msg}");
+        return Ok(());
+    }
     match GameManager::open(PathBuf::from(&folder)).await {
         Ok(mut m) => {
+            let body = match body_choice(Some(m.game), &rest) {
+                Ok(b) => b,
+                Err(msg) => {
+                    println!("{msg}");
+                    return Ok(());
+                }
+            };
             if body != BodyChoice::All {
                 m.set_body(body);
             }
