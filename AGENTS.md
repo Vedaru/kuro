@@ -45,7 +45,9 @@ edits.
   user verbatim, not a stub. Genuine failures use `Error::Patch`.
 - **The MD5 cache is disposable** (`md5_cache.rs`): a poisoned mutex recovers by
   dropping its entries rather than panicking. `verify`/`sync` must never die
-  because the cache did.
+  because the cache did. `save` *snapshots* `touched` instead of draining it —
+  a tier saves once per pack part, and a draining save would make the second
+  call evict the first part's hashes (`saving_twice_keeps_the_first_saves_entries`).
 - **Manifest strings are untrusted**: `validate_manifest_paths` in
   `kuro-api/src/client.rs` rejects absolute paths, drive letters, UNC paths and
   `..` at the single point a remote manifest enters the process. Any new field

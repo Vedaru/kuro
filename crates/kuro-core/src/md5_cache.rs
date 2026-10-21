@@ -114,10 +114,15 @@ impl Md5Cache {
 
     /// Persist the cache with a crash-safe swap: an interrupted save leaves
     /// the previous cache file intact.
+    ///
+    /// `touched` is snapshotted, not drained: a caller may save more than once
+    /// in a run (once per pack part, so an interrupted tier keeps what finished),
+    /// and draining would make every save after the first evict the keys the
+    /// earlier ones persisted.
     pub fn save(&self) -> Result<()> {
         let data = {
             let mut inner = self.lock();
-            let touched = std::mem::take(&mut inner.touched);
+            let touched = inner.touched.clone();
             inner.entries.retain(|k, _| touched.contains(k));
             serde_json::to_string_pretty(&inner.entries)?
         };
@@ -185,5 +190,43 @@ mod tests {
         cache.store("b.pak", 2, 2, "cafebabe");
         assert_eq!(cache.lookup("b.pak", 2, 2).as_deref(), Some("cafebabe"));
         assert_eq!(cache.lookup("a.pak", 1, 1), None);
+    }
+
+    /// A tier saves once per pack part so an interrupted run keeps what
+    /// finished. The second save must not evict the first part's keys.
+    #[test]
+    fn saving_twice_keeps_the_first_saves_entries() {
+        let dir = tempfile::Builder::new().prefix("kuro-md5-twice-").tempdir().unwrap();
+        let cache = Md5Cache::load(dir.path());
+        cache.store("hd/one.pak", 10, 100, "aaaa");
+        cache.save().unwrap();
+
+        cache.store("common/two.pak", 20, 200, "bbbb");
+        cache.save().unwrap();
+
+        let reread = Md5Cache::load(dir.path());
+        assert_eq!(
+            reread.lookup("hd/one.pak", 10, 100).as_deref(),
+            Some("aaaa"),
+            "the second save dropped the first part's entry"
+        );
+        assert_eq!(reread.lookup("common/two.pak", 20, 200).as_deref(), Some("bbbb"));
+    }
+
+    /// Entries the run never looked at still age out: pruning is unchanged.
+    #[test]
+    fn a_key_the_run_never_touched_is_pruned() {
+        let dir = tempfile::Builder::new().prefix("kuro-md5-prune-").tempdir().unwrap();
+        let cache = Md5Cache::load(dir.path());
+        cache.store("stale.pak", 1, 1, "dead");
+        cache.save().unwrap();
+
+        let fresh = Md5Cache::load(dir.path());
+        fresh.store("live.pak", 2, 2, "beef");
+        fresh.save().unwrap();
+
+        let reread = Md5Cache::load(dir.path());
+        assert_eq!(reread.lookup("stale.pak", 1, 1), None, "a stale key survived");
+        assert_eq!(reread.lookup("live.pak", 2, 2).as_deref(), Some("beef"));
     }
 }

@@ -374,9 +374,7 @@ fn installed_versions(game_folder: &Path, tier: Quality) -> Vec<String> {
 struct PlannedPack {
     name: String,
     entry: PackEntry,
-    /// Shared so the blocking verify pool can borrow it without a copy: a
-    /// WuWa-sized manifest is tens of thousands of entries.
-    manifest: Arc<PatchIndex>,
+    manifest: PatchIndex,
 }
 
 /// The manifest of the tier's own pack, not `common`.
@@ -386,16 +384,15 @@ struct PlannedPack {
 fn tier_manifest(plan: &[PlannedPack], tier: Quality) -> Option<&PatchIndex> {
     plan.iter()
         .find(|p| p.name.eq_ignore_ascii_case(tier.as_arg()))
-        .map(|p| p.manifest.as_ref())
+        .map(|p| &p.manifest)
 }
 
 /// Drop files of the previous install that the tier's manifest no longer lists,
 /// and return the dests it does list — the record the next run prunes against.
 ///
-/// A plan with no manifest for this tier yields no record at all rather than an
-/// empty one: an empty list is what tells `prune_stale` that every previously
-/// recorded file is stale. `plan_pack_tier` already refuses an empty *published*
-/// manifest, so reaching here with one is a caller bug, not a publish accident.
+/// `plan_pack_tier` has already refused an empty tier manifest, so the list here
+/// is always the published one; an empty `keep` would only mean "no plan for
+/// this tier", where nothing is pruned and no record is returned.
 fn prune_and_record(game_folder: &Path, tier: Quality, plan: &[PlannedPack]) -> (usize, Vec<String>) {
     let Some(manifest) = tier_manifest(plan, tier).filter(|m| manifest_is_authoritative(m)) else {
         return (0, Vec::new());
@@ -539,7 +536,7 @@ impl crate::GameManager {
                 self.scan_pack_part(
                     &planned.name,
                     &planned.entry,
-                    Arc::clone(&planned.manifest),
+                    &planned.manifest,
                     channel,
                     &cache,
                     tx.as_ref(),
@@ -584,9 +581,10 @@ impl crate::GameManager {
         unregister(&self.game_folder, tier)?;
 
         for (idx, scan) in scans.into_iter().enumerate() {
-            // Saved per part so an interrupted run keeps the hashes of the parts
-            // that did finish; the shared cache means the next part's save still
-            // carries them.
+            // Saved after each part so an interrupted tier keeps the hashes of
+            // the parts that did finish. Safe only because `save` snapshots
+            // `touched` instead of draining it — with a draining save, this
+            // second call would evict the first part's hashes.
             let part = self
                 .write_pack_part(scan, &plan[idx].entry, bases, &cache, tx.as_ref())
                 .await?;
@@ -648,7 +646,7 @@ impl crate::GameManager {
             plan.push(PlannedPack {
                 name,
                 entry: entry.clone(),
-                manifest: Arc::new(manifest),
+                manifest,
             });
         }
         Ok(plan)
@@ -700,7 +698,7 @@ impl crate::GameManager {
         &self,
         name: &str,
         entry: &PackEntry,
-        manifest: Arc<PatchIndex>,
+        manifest: &PatchIndex,
         channel: &HashMap<String, (u64, String)>,
         cache: &Md5Cache,
         tx: Option<&tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
@@ -858,8 +856,8 @@ impl crate::GameManager {
                 Err(e) => broken.push(e.to_string()),
             }
         }
-        // The cache is persisted once per tier, by the caller: saving here would
-        // prune every other part's entries, since only `touched` survives.
+        // The cache is persisted per part, by the caller; `save` snapshots
+        // `touched`, so saving here as well would be redundant but harmless.
         Ok(PartOutcome { report, broken })
     }
 }
