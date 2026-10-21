@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
@@ -90,11 +90,33 @@ impl Md5Cache {
         }
     }
 
+    /// Lock the cache, recovering from a poisoned mutex.
+    ///
+    /// The cache is disposable state whose only job is to save hashing, so a
+    /// thread that panicked while holding the lock must not take the rest of
+    /// the verify run down with it. Its contents are dropped instead of
+    /// trusted: a panic mid-update can leave entries half-written, and a stale
+    /// entry is only ever caught later by re-hashing a multi-GB pak. The poison
+    /// flag is cleared too, or every later lock would throw away the entries
+    /// recorded after the panic.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.entries.clear();
+                guard.touched.clear();
+                self.inner.clear_poison();
+                guard
+            }
+        }
+    }
+
     /// Persist the cache with a crash-safe swap: an interrupted save leaves
     /// the previous cache file intact.
     pub fn save(&self) -> Result<()> {
         let data = {
-            let mut inner = self.inner.lock().expect("md5 cache poisoned");
+            let mut inner = self.lock();
             let touched = std::mem::take(&mut inner.touched);
             inner.entries.retain(|k, _| touched.contains(k));
             serde_json::to_string_pretty(&inner.entries)?
@@ -108,7 +130,7 @@ impl Md5Cache {
     }
 
     fn lookup(&self, key: &str, size: u64, mtime_ns: u64) -> Option<String> {
-        let mut inner = self.inner.lock().expect("md5 cache poisoned");
+        let mut inner = self.lock();
         let hit = match inner.entries.get(key) {
             Some(e) if e.size == size && e.mtime_ns == mtime_ns => Some(e.md5.clone()),
             _ => None,
@@ -120,7 +142,7 @@ impl Md5Cache {
     }
 
     fn store(&self, key: &str, size: u64, mtime_ns: u64, md5: &str) {
-        let mut inner = self.inner.lock().expect("md5 cache poisoned");
+        let mut inner = self.lock();
         inner.touched.insert(key.to_string());
         inner.entries.insert(
             key.to_string(),
@@ -136,4 +158,36 @@ impl Md5Cache {
 fn mtime_ns(meta: &std::fs::Metadata) -> Option<u64> {
     let d = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
     Some(d.as_nanos() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic while another thread held the lock must not make every later
+    /// lookup panic too: the cache is disposable, so it recovers empty.
+    #[test]
+    fn a_poisoned_cache_recovers_instead_of_panicking() {
+        let dir = std::env::temp_dir().join(format!("kuro-md5-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Md5Cache::load(&dir);
+        cache.store("a.pak", 1, 1, "deadbeef");
+
+        let proxy = cache.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = proxy.lock();
+            panic!("die holding the lock");
+        })
+        .join();
+
+        // Recovered, and the pre-panic entry is gone rather than trusted.
+        assert_eq!(cache.lookup("a.pak", 1, 1), None);
+        // Recording works again, and the poison flag is not left set.
+        cache.store("b.pak", 2, 2, "cafebabe");
+        assert_eq!(cache.lookup("b.pak", 2, 2).as_deref(), Some("cafebabe"));
+        assert_eq!(cache.lookup("a.pak", 1, 1), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
