@@ -735,28 +735,30 @@ async fn run(
                     continue;
                 }
 
-                // quality-preset modal
-                if state.quality_modal.is_some() {
+                // quality-preset modal. Taking the draft out of the state
+                // rather than poking at it through the `Option` keeps the key
+                // handling free of `unwrap`s and makes the reopen explicit: the
+                // draft is put back unless the key closed the modal.
+                if let Some(mut draft) = state.quality_modal.take() {
                     let mut close = false;
                     let mut install: Option<Quality> = None;
                     match key.code {
-                        KeyCode::Char('s') => state.quality_modal.as_mut().unwrap().choice = Quality::Sd,
-                        KeyCode::Char('h') => state.quality_modal.as_mut().unwrap().choice = Quality::Hd,
-                        KeyCode::Char('u') => state.quality_modal.as_mut().unwrap().choice = Quality::Uhd,
+                        KeyCode::Char('s') => draft.choice = Quality::Sd,
+                        KeyCode::Char('h') => draft.choice = Quality::Hd,
+                        KeyCode::Char('u') => draft.choice = Quality::Uhd,
                         // `i` downloads the highlighted tier's paks without
                         // leaving the modal, so the status column updates in
                         // place and Enter can then apply it.
-                        KeyCode::Char('i') => {
-                            install = Some(state.quality_modal.as_ref().unwrap().choice);
-                        }
+                        KeyCode::Char('i') => install = Some(draft.choice),
                         KeyCode::Enter => {
-                            let choice = state.quality_modal.as_ref().unwrap().choice;
-                            apply_quality(&mut state, &path, choice);
+                            let choice = draft.choice;
                             // Selecting a tier whose paks are not on disk is the
                             // common case (SD/UHD are not part of any channel
                             // manifest) — install it instead of saving a preset
                             // that `play` will then refuse.
-                            if !quality::info(std::path::Path::new(&path)).is_installed(choice) {
+                            let installed = draft.info.is_installed(choice);
+                            apply_quality(&mut state, &path, choice);
+                            if !installed {
                                 install = Some(choice);
                             }
                             close = true;
@@ -781,8 +783,13 @@ async fn run(
                             push_log(&mut state, "busy — wait for the current task to finish");
                         }
                     }
-                    if close {
-                        state.quality_modal = None;
+                    if !close {
+                        // The packs on disk may have changed since the modal
+                        // opened — `i` starts an install right here, and the
+                        // panel must stop claiming a freshly downloaded tier is
+                        // "not installed".
+                        draft.info = quality::info(std::path::Path::new(&path));
+                        state.quality_modal = Some(draft);
                     }
                     continue;
                 }
