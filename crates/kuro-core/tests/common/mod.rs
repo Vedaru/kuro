@@ -1,6 +1,23 @@
-//! Shared test helpers: a minimal in-process HTTP server.
+//! Shared test helpers: a minimal in-process HTTP server, and the MD5 forms
+//! every test needs to build a manifest entry for a fixture file.
+//!
+//! Each integration test compiles this module into its own binary, so helpers
+//! one test does not use are "dead" there and nowhere else.
+#![allow(dead_code)]
+
+use std::path::Path;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Lowercase hex MD5 of a byte slice — the form manifests carry.
+pub fn md5_bytes(data: &[u8]) -> String {
+    format!("{:x}", md5::compute(data))
+}
+
+/// Lowercase hex MD5 of a file on disk.
+pub fn md5_file(path: &Path) -> String {
+    format!("{:x}", md5::compute(std::fs::read(path).unwrap()))
+}
 
 /// Serve the given `(path, body)` routes on 127.0.0.1 and return the base URL.
 /// Paths must start with `/`.

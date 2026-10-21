@@ -1,19 +1,15 @@
 //! End-to-end test of the apply pipeline with a synthetic KrDiff patch:
 //! merge -> verify -> atomic swap -> delete -> version bump -> cleanup.
 
+mod common;
+
+use common::{md5_bytes, md5_file};
+
 use std::path::{Path, PathBuf};
 
 use kuro_api::{FileRef, GroupInfo, LocalConfig, PatchConfig, PatchIndex, ResourceItem};
 use kuro_core::{GameManager, ProgressEvent};
 use tokio::sync::mpsc;
-
-fn md5_bytes(data: &[u8]) -> String {
-    format!("{:x}", md5::compute(data))
-}
-
-fn md5_file(p: &Path) -> String {
-    kuro_patch::md5_file(p).unwrap()
-}
 
 fn setup_game(base: &Path) -> PathBuf {
     let game = base.join("game");

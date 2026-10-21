@@ -2,11 +2,9 @@
 
 mod common;
 
-use kuro_api::{LocalConfig, PatchIndex, ResourceItem};
+use common::md5_bytes;
 
-fn md5_bytes(data: &[u8]) -> String {
-    format!("{:x}", md5::compute(data))
-}
+use kuro_api::{LocalConfig, PatchIndex, ResourceItem};
 
 fn full_index(file_a: &[u8], file_b: &[u8]) -> PatchIndex {
     PatchIndex {

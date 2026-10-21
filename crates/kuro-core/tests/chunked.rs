@@ -2,6 +2,9 @@
 //! range slowly: the file must come out byte-exact and progress must advance
 //! *within* a chunk, not jump only when a whole chunk lands.
 
+mod common;
+
+use common::md5_bytes;
 use kuro_api::ChunkInfo;
 use kuro_core::download::{download_chunked, Budget};
 use kuro_core::ProgressEvent;
@@ -53,10 +56,6 @@ async fn spawn_range_server(body: Vec<u8>, pieces: usize, delay_ms: u64) -> Stri
         }
     });
     format!("http://{addr}")
-}
-
-fn md5_bytes(data: &[u8]) -> String {
-    format!("{:x}", md5::compute(data))
 }
 
 #[tokio::test]

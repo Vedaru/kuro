@@ -3,14 +3,12 @@
 
 mod common;
 
+use common::md5_bytes;
+
 use std::path::{Path, PathBuf};
 
 use kuro_api::{LocalConfig, PatchIndex, ResourceItem};
 use kuro_core::GameManager;
-
-fn md5_bytes(data: &[u8]) -> String {
-    format!("{:x}", md5::compute(data))
-}
 
 fn res(dest: &str, data: &[u8]) -> ResourceItem {
     ResourceItem {

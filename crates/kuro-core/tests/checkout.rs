@@ -3,14 +3,12 @@
 
 mod common;
 
+use common::md5_bytes;
+
 use std::path::{Path, PathBuf};
 
 use kuro_api::{LauncherIndex, LocalConfig, PatchIndex, ResourceItem, Server};
 use kuro_core::GameManager;
-
-fn md5_bytes(data: &[u8]) -> String {
-    format!("{:x}", md5::compute(data))
-}
 
 fn setup_game(base: &Path) -> PathBuf {
     let game = base.join("game");

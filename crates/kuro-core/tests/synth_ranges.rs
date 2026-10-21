@@ -7,6 +7,9 @@
 //! bytes that land: the failure mode is a single full-file GET, which produces
 //! a byte-identical file.
 
+mod common;
+
+use common::md5_bytes;
 use std::sync::{Arc, Mutex};
 
 use kuro_core::download::{download_file, Budget, SYNTH_CHUNK_SIZE};
@@ -83,10 +86,6 @@ fn payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-fn md5_hex(data: &[u8]) -> String {
-    format!("{:x}", md5::compute(data))
-}
-
 #[tokio::test]
 async fn a_large_file_without_chunk_infos_is_fetched_as_ranges() {
     let body = payload(SYNTH_CHUNK_SIZE as usize * 2 + 1);
@@ -103,7 +102,7 @@ async fn a_large_file_without_chunk_infos_is_fetched_as_ranges() {
         &dest,
         body.len() as u64,
         &[],
-        &md5_hex(&body),
+        &md5_bytes(&body),
         "big.bin",
         None,
         &Budget::unlimited(),
@@ -158,7 +157,7 @@ async fn a_small_file_without_chunk_infos_is_one_request() {
         &dest,
         body.len() as u64,
         &[],
-        &md5_hex(&body),
+        &md5_bytes(&body),
         "small.bin",
         None,
         &Budget::unlimited(),
@@ -205,7 +204,7 @@ async fn manifest_chunk_infos_win_over_synthesis() {
         &dest,
         body.len() as u64,
         &chunks,
-        &md5_hex(&body),
+        &md5_bytes(&body),
         "hinted.bin",
         None,
         &Budget::unlimited(),
