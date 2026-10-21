@@ -88,19 +88,11 @@ use std::sync::Arc;
 use kuro_api::{ApiClient, Error, PackConfig, PackEntry, PatchIndex, Result, ServerEntry};
 
 use crate::atomic::safe_replace;
-use crate::download::{download_chunked, download_single};
+use crate::download::{download_chunked, download_single, CHUNK_CONCURRENCY, FILE_CONCURRENCY, SYNTH_CHUNK_SIZE};
 use crate::md5_cache::Md5Cache;
+use crate::path::{key as path_key, normalise, tmp_sibling};
 use crate::quality::Quality;
 use crate::state;
-
-/// Concurrent files within one pack (the shared [`Budget`] caps total requests).
-const FILE_CONCURRENCY: usize = 8;
-/// Ranges in flight for one large file.
-const CHUNK_CONCURRENCY: usize = 8;
-/// Files above this size are fetched as parallel ranges. The pack manifests
-/// carry no `chunkInfos`, and pack paks are ~400 MiB each, so this is what stops
-/// a tier download from being 100 single-stream transfers.
-const SYNTH_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 /// `launcherDownloadConfig/` — the launcher's per-pack version records.
 pub const PACKS_DIR: &str = "launcherDownloadConfig";
@@ -304,10 +296,10 @@ fn prune_stale(game_folder: &Path, tier: Quality, keep: &std::collections::HashS
     let mut removed = 0;
     let mut parents = std::collections::BTreeSet::new();
     for dest in &previous {
-        if keep.contains(&normalise(dest)) {
+        if keep.contains(&path_key(dest)) {
             continue;
         }
-        let path = game_folder.join(relative(dest));
+        let path = game_folder.join(normalise(dest));
         if path.is_file() && std::fs::remove_file(&path).is_ok() {
             removed += 1;
             let mut dir = path.parent();
@@ -380,7 +372,7 @@ fn prune_and_record(game_folder: &Path, tier: Quality, plan: &[PlannedPack]) -> 
     let Some(manifest) = tier_manifest(plan, tier) else {
         return (0, Vec::new());
     };
-    let keep: std::collections::HashSet<String> = manifest.resource.iter().map(|r| normalise(&r.dest)).collect();
+    let keep: std::collections::HashSet<String> = manifest.resource.iter().map(|r| path_key(&r.dest)).collect();
     let pruned = prune_stale(game_folder, tier, &keep);
     let dests = manifest.resource.iter().map(|r| r.dest.clone()).collect();
     (pruned, dests)
@@ -603,7 +595,7 @@ impl crate::GameManager {
         Ok(manifest
             .resource
             .into_iter()
-            .map(|r| (normalise(&r.dest), (r.size, r.md5)))
+            .map(|r| (path_key(&r.dest), (r.size, r.md5)))
             .collect())
     }
 
@@ -649,7 +641,7 @@ impl crate::GameManager {
                 continue;
             }
             total += item.size;
-            let key = normalise(&item.dest);
+            let key = path_key(&item.dest);
             if is_common && !channel_agrees(channel, &key, item) {
                 skipped += 1;
                 continue;
@@ -658,7 +650,7 @@ impl crate::GameManager {
             // the manifest's spelling. Writing to the folded path would create
             // `client/content/hd` on case-sensitive hosts and leave the real
             // `Client/Content/HD` empty.
-            let path = self.game_folder.join(relative(&item.dest));
+            let path = self.game_folder.join(normalise(&item.dest));
             let ok = match std::fs::metadata(&path) {
                 Ok(m) if m.len() == item.size => cache.matches(&key, &path, &m, &item.md5),
                 _ => false,
@@ -788,7 +780,7 @@ impl Fetch {
         if let Some(dir) = missing.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = with_suffix(&missing.path, ".pack.tmp");
+        let tmp = tmp_sibling(&missing.path, "pack");
         let chunks = crate::download::chunk_plan(missing.item.size, SYNTH_CHUNK_SIZE);
         if chunks.is_empty() {
             download_single(
@@ -855,7 +847,7 @@ fn create_empty_marker(game_folder: &Path, item: &kuro_api::ResourceItem) -> Res
     if item.size != 0 {
         return Ok(());
     }
-    let path = game_folder.join(relative(&item.dest));
+    let path = game_folder.join(normalise(&item.dest));
     if path.exists() {
         return Ok(());
     }
@@ -895,7 +887,7 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
     let tier = Quality::ALL.into_iter().find(|q| q.as_arg().eq_ignore_ascii_case(name));
     let prefix = tier.map(|t| format!("client/content/{}/", t.pack_key()));
     let check = |dest: &str| -> Result<()> {
-        let key = normalise(dest);
+        let key = path_key(dest);
         let first = key.split('/').next().unwrap_or("");
         if first == ".kuro_cache" || first == ".incremental_download" || key.starts_with("launcherdownloadconfig") {
             return Err(Error::UnsafePath(dest.to_string()));
@@ -931,22 +923,6 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// The manifest's spelling of a dest, as a path relative to the game folder.
-fn relative(dest: &str) -> String {
-    dest.trim_start_matches('/').replace('\\', "/")
-}
-
-/// Case-folded form, for comparing two manifests' view of the same file.
-fn normalise(dest: &str) -> String {
-    relative(dest).to_ascii_lowercase()
-}
-
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(suffix);
-    PathBuf::from(s)
 }
 
 #[cfg(test)]
@@ -1025,11 +1001,5 @@ mod tests {
             ])
         )
         .is_ok());
-    }
-
-    #[test]
-    fn relative_and_absolute_spellings_are_the_same_entry() {
-        assert_eq!(normalise("/Client/Content/HD/a.pak"), "client/content/hd/a.pak");
-        assert_eq!(normalise("Client\\Content\\HD\\a.pak"), "client/content/hd/a.pak");
     }
 }

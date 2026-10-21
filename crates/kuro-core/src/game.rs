@@ -12,7 +12,10 @@ use kuro_api::{
 };
 
 use crate::atomic::{recover_backup, safe_replace};
-use crate::download::{download_chunked, download_single, Budget};
+use crate::download::{
+    download_chunked, download_single, Budget, CHUNK_CONCURRENCY, CONCURRENCY, FILE_CONCURRENCY, SYNTH_CHUNK_SIZE,
+};
+use crate::path::{extension_of, normalise, split_dest, tmp_sibling};
 use crate::quality::{self, Quality};
 use crate::state::{self, incremental_dir};
 
@@ -73,35 +76,6 @@ pub struct GameStatus {
     pub update_available: bool,
 }
 
-/// Global ceiling on in-flight CDN requests for the whole run — every file and
-/// every byte range draws from this one pool (see [`Budget`]).
-///
-/// The Kuro CDN throttles per *connection*: a single edge streamed
-/// ~0.05–0.10 MB/s however fast the client's link was, so throughput comes
-/// from concurrency. But only up to a point — measured 2026-09, aggregate
-/// throughput scaled ~linearly to 8 connections (~0.6 MB/s against a ~0.8 MB/s
-/// machine ceiling), and at 12+ the fan-out itself provoked stalls (a 32-way
-/// batch hung a 4 MiB ranged GET for 52.3s while its peers finished in
-/// 2.8–8.4s). 8 is the measured sweet spot.
-///
-/// Sharing one budget across the run is the point: a big pak's ranges and a
-/// small file's request compete for the same 8 slots instead of each file
-/// reserving its own, so the tail of one file no longer leaves the link idle
-/// while the next file waits its turn.
-const DOWNLOAD_CONCURRENCY: usize = 8;
-/// Range tasks a single chunked file may have outstanding at once. Actual
-/// connections are capped by `DOWNLOAD_CONCURRENCY`; this only sizes one
-/// file's fan-out.
-const CHUNK_CONCURRENCY: usize = 8;
-/// CN 3.6.0 manifests carry no chunkInfos — synthesize fixed-size ranges so
-/// large paks download over parallel connections (CDNs rate-limit per conn).
-const SYNTH_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-/// Concurrent files the download loops keep in flight. The `JoinSet` still
-/// spawns a task per file, but this semaphore gates how many run at once, so it
-/// bounds open file handles and in-flight work: enough files that a small file
-/// fills a slot a big file's tail would leave idle, without a run-wide list of
-/// open descriptors.
-const FILE_CONCURRENCY: usize = 8;
 /// Parallel krpdiff merges during apply (CPU-bound, native engine).
 const MERGE_CONCURRENCY: usize = 4;
 
@@ -174,7 +148,7 @@ impl GameManager {
             server,
             api,
             http,
-            budget: Budget::new(DOWNLOAD_CONCURRENCY),
+            budget: Budget::new(CONCURRENCY),
             body,
         })
     }
@@ -764,7 +738,7 @@ impl GameManager {
         }
 
         for (dest, staged) in &staged_outputs {
-            let game_path = self.game_folder.join(normalise_dest(dest));
+            let game_path = self.game_folder.join(normalise(dest));
             // `safe_replace` creates the parent directory, so a group that adds
             // a directory the install never had (e.g. Client/Content/HD) is fine.
             recover_backup(&game_path)?;
@@ -781,7 +755,7 @@ impl GameManager {
             if !staged.exists() {
                 continue; // not downloaded (already current or not needed)
             }
-            let game_path = self.game_folder.join(normalise_dest(&item.dest));
+            let game_path = self.game_folder.join(normalise(&item.dest));
             std::fs::create_dir_all(game_path.parent().unwrap())?;
             recover_backup(&game_path)?;
             safe_replace(&staged, &game_path)?;
@@ -790,7 +764,7 @@ impl GameManager {
 
         // ---- delete phase ----
         for f in &patch_index.delete_files {
-            let game_path = self.game_folder.join(normalise_dest(f));
+            let game_path = self.game_folder.join(normalise(f));
             if game_path.exists() {
                 std::fs::remove_file(&game_path)?;
                 report.deleted.push(f.clone());
@@ -807,7 +781,7 @@ impl GameManager {
             if is_krpdiff(&item.dest) {
                 continue;
             }
-            let game_path = self.game_folder.join(normalise_dest(&item.dest));
+            let game_path = self.game_folder.join(normalise(&item.dest));
             if !file_matches(&game_path, item.size, &item.md5) {
                 not_installed.push(item.dest.clone());
             }
@@ -817,7 +791,7 @@ impl GameManager {
                 if is_krpdiff(&dst.dest) || complete_dests.contains(&dst.dest) {
                     continue;
                 }
-                let game_path = self.game_folder.join(normalise_dest(&dst.dest));
+                let game_path = self.game_folder.join(normalise(&dst.dest));
                 if !file_matches(&game_path, dst.size, &dst.md5) {
                     not_installed.push(dst.dest.clone());
                 }
@@ -1087,7 +1061,7 @@ impl GameManager {
                             });
                         }
                     }
-                    let key = normalise_dest(&item.dest);
+                    let key = normalise(&item.dest);
                     let p = game_folder.join(&key);
                     let meta = std::fs::metadata(&p).ok();
                     let ok = match &meta {
@@ -1152,7 +1126,7 @@ impl GameManager {
                 let _permit = sem.acquire().await.unwrap();
                 let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
                 let urls = node_urls(&cdn_nodes, |n| ApiClient::resource_url(n, &from, &item.dest));
-                let key = normalise_dest(&item.dest);
+                let key = normalise(&item.dest);
                 let game_path = game_folder.join(&key);
                 std::fs::create_dir_all(game_path.parent().unwrap())?;
                 let tmp = tmp_sibling(&game_path, "sync");
@@ -1403,40 +1377,6 @@ fn is_krpdiff(dest: &str) -> bool {
     b.len() >= 8 && b[b.len() - 8..].eq_ignore_ascii_case(b".krpdiff")
 }
 
-/// Manifest paths are CDN paths: forward slashes, no drive prefix, relative to
-/// the install root (a stray leading `/` also shows up in the live files).
-/// Normalise once so every join and comparison agrees.
-fn normalise_dest(dest: &str) -> String {
-    dest.trim_start_matches('/').replace('\\', "/")
-}
-
-fn split_dest(dest: &str) -> (&str, &str) {
-    match dest.rsplit_once('/') {
-        Some((dir, name)) => (dir, name),
-        None => ("", dest),
-    }
-}
-
-fn extension_of(name: &str) -> Option<String> {
-    name.rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .filter(|ext| !ext.is_empty())
-}
-
-/// Temp path for an in-flight download, sitting next to its destination.
-///
-/// Appends instead of replacing the extension: `Path::with_extension` maps
-/// `pakchunk0.pak` and `pakchunk0.sig` — siblings the CDN always ships
-/// together, and repairs/downloads run several files at once — onto the same
-/// `pakchunk0.tmp`, so two concurrent writers can clobber each other's
-/// half-written file. The `.tmp` suffix also keeps it protected from the
-/// orphan sweep.
-fn tmp_sibling(path: &Path, tag: &str) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(format!(".{tag}.tmp"));
-    PathBuf::from(s)
-}
-
 /// CDN folder a full-file entry is fetched from. Entries without `fromFolder`
 /// (every entry of the live WuWa CN hotfix manifest) are served straight off
 /// the patch's own base URL — the same fallback `sync` uses for the full
@@ -1504,7 +1444,7 @@ fn group_already_target(game_folder: &Path, group: &GroupInfo) -> bool {
 fn sweep_orphans(game_folder: &Path, manifest: &[ResourceItem]) -> Result<usize> {
     use std::collections::HashSet;
 
-    let manifest_set: HashSet<String> = manifest.iter().map(|r| normalise_dest(&r.dest)).collect();
+    let manifest_set: HashSet<String> = manifest.iter().map(|r| normalise(&r.dest)).collect();
     let dir_exts = manifest_dir_extensions(manifest);
 
     // collect orphans first, delete after — mutating the tree while walking it
@@ -1546,7 +1486,7 @@ fn sweep_orphans(game_folder: &Path, manifest: &[ResourceItem]) -> Result<usize>
 fn manifest_dir_extensions(manifest: &[ResourceItem]) -> HashMap<String, HashSet<String>> {
     let mut map: HashMap<String, HashSet<String>> = HashMap::new();
     for r in manifest {
-        let dest = normalise_dest(&r.dest);
+        let dest = normalise(&r.dest);
         let (dir, name) = split_dest(&dest);
         if let Some(ext) = extension_of(name) {
             map.entry(dir.to_string()).or_default().insert(ext);

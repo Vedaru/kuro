@@ -15,6 +15,7 @@ pub mod game;
 pub mod launch;
 pub mod md5_cache;
 pub mod pack;
+pub mod path;
 pub mod quality;
 pub mod state;
 pub mod steam;

@@ -19,22 +19,43 @@ use crate::game::ProgressEvent;
 use kuro_api::retry;
 use kuro_api::{ChunkInfo, Error, Result};
 
+/// Global ceiling on in-flight CDN requests for one run — every file and every
+/// byte range draws from this one pool (see [`Budget`]).
+///
+/// The Kuro CDN throttles per *connection*: a single edge streamed
+/// ~0.05–0.10 MB/s however fast the client's link was, so throughput comes
+/// from concurrency. But only up to a point — measured 2026-09, aggregate
+/// throughput scaled ~linearly to 8 connections (~0.6 MB/s against a ~0.8 MB/s
+/// machine ceiling), and at 12+ the fan-out itself provoked stalls (a 32-way
+/// batch hung a 4 MiB ranged GET for 52.3s while its peers finished in
+/// 2.8–8.4s). 8 is the measured sweet spot.
+pub const CONCURRENCY: usize = 8;
+
+/// Ranges a single chunked file may have outstanding at once. Actual
+/// connections are capped by [`CONCURRENCY`]; this only sizes one file's
+/// fan-out.
+pub const CHUNK_CONCURRENCY: usize = 8;
+
+/// Files the download loops keep in flight. The `JoinSet` still spawns a task
+/// per file, but a semaphore of this size gates how many run at once — enough
+/// that a small file fills a slot a big file's tail leaves idle, without a
+/// run-wide list of open descriptors.
+pub const FILE_CONCURRENCY: usize = 8;
+
+/// Files above this size are fetched as parallel ranges when the manifest
+/// ships no `chunkInfos` (CN 3.6.0 patch manifests, every pack manifest): a
+/// whole-file GET would be one throttled connection for a multi-GB pak.
+pub const SYNTH_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
 /// Process-wide ceiling on in-flight HTTP requests, one permit per open
 /// connection.
-///
-/// The Kuro CDN throttles per *connection*: measured 2026-09, a single edge
-/// streamed ~0.05–0.10 MB/s no matter how fast the client's link was, while N
-/// parallel ranges scaled almost linearly (8 connections ≈ 0.6 MB/s against a
-/// ~0.8 MB/s machine ceiling). So throughput comes from concurrency, but past
-/// a point the fan-out itself provokes stalls — a 16-way batch left requests
-/// hanging for minutes, and a documented 32-way fan-out stalled a 4 MiB GET
-/// for 52.3s.
 ///
 /// The budget is shared by *every* download in a run rather than handed out
 /// per file. A big pak fans its ranges out into the same pool small files draw
 /// from, so when a range finishes and a small file has nothing else to do, it
 /// takes the freed slot instead of the tail of one file leaving the link idle
-/// while the next file waits its turn.
+/// while the next file waits its turn. Sized by [`CONCURRENCY`], whose docs
+/// carry the measurements behind the number.
 #[derive(Clone, Default)]
 pub struct Budget(Option<Arc<Semaphore>>);
 
