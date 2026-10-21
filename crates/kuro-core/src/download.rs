@@ -106,6 +106,62 @@ pub fn chunk_plan(size: u64, chunk: u64) -> Vec<ChunkInfo> {
         .collect()
 }
 
+/// Fetch one file, whole or as parallel ranges, whichever the manifest allows.
+///
+/// A manifest that names its own `chunkInfos` says how to split the file; one
+/// that names none (CN 3.6.0 patch manifests, every pack manifest) would
+/// otherwise be a single throttled connection for a multi-GB pak, so ranges
+/// are synthesized from [`SYNTH_CHUNK_SIZE`]. A file no bigger than one range
+/// is a single GET either way — a range header buys nothing there.
+///
+/// The callers differ only in where the size, chunks and digest come from, so
+/// the choice lives here rather than in four near-identical copies of this
+/// branch.
+#[allow(clippy::too_many_arguments)]
+pub async fn download_file(
+    client: &reqwest::Client,
+    urls: &[String],
+    dest: &Path,
+    size: u64,
+    chunks: &[ChunkInfo],
+    expected_md5: &str,
+    name: &str,
+    progress: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
+    budget: &Budget,
+) -> Result<()> {
+    let plan = if chunks.is_empty() {
+        chunk_plan(size, SYNTH_CHUNK_SIZE)
+    } else {
+        chunks.to_vec()
+    };
+    if plan.is_empty() {
+        download_single(
+            client,
+            urls,
+            dest,
+            Some(size),
+            Some(expected_md5),
+            name,
+            progress,
+            budget,
+        )
+        .await
+    } else {
+        download_chunked(
+            client,
+            urls,
+            dest,
+            &plan,
+            Some(expected_md5),
+            CHUNK_CONCURRENCY,
+            name,
+            progress,
+            budget,
+        )
+        .await
+    }
+}
+
 /// Download a whole file to `dest` (temp file semantics: caller renames on
 /// success). Verifies size and MD5 when provided. Emits per-file progress if
 /// a sender is given.

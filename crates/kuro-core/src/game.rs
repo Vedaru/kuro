@@ -12,9 +12,7 @@ use kuro_api::{
 };
 
 use crate::atomic::{recover_backup, safe_replace};
-use crate::download::{
-    download_chunked, download_single, Budget, CHUNK_CONCURRENCY, CONCURRENCY, FILE_CONCURRENCY, SYNTH_CHUNK_SIZE,
-};
+use crate::download::{download_file, download_single, Budget, CONCURRENCY, FILE_CONCURRENCY};
 use crate::path::{extension_of, normalise, split_dest, tmp_sibling};
 use crate::quality::{self, Quality};
 use crate::state::{self, incremental_dir};
@@ -388,15 +386,8 @@ impl GameManager {
             let staged = state::staged_resource_path(&self.game_folder, &res.dest);
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = tmp_sibling(&staged, "dl");
-            // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
-            // ranges so big paks download over parallel connections (the CDN
-            // rate-limits per connection). Whole-file MD5 is still verified.
-            let chunk_infos = if res.chunk_infos.is_empty() {
-                crate::download::chunk_plan(res.size, SYNTH_CHUNK_SIZE)
-            } else {
-                res.chunk_infos.clone()
-            };
             let size = res.size;
+            let chunk_infos = res.chunk_infos.clone();
             let md5 = res.md5.clone();
             let dest = res.dest.clone();
             let name = item.name.clone();
@@ -415,32 +406,7 @@ impl GameManager {
                         total: item_size,
                     })
                     .await;
-                if chunk_infos.is_empty() {
-                    download_single(
-                        &http,
-                        &urls,
-                        &tmp,
-                        Some(size),
-                        Some(md5.as_str()),
-                        &dest,
-                        Some(&tx),
-                        &budget,
-                    )
-                    .await?;
-                } else {
-                    download_chunked(
-                        &http,
-                        &urls,
-                        &tmp,
-                        &chunk_infos,
-                        Some(md5.as_str()),
-                        CHUNK_CONCURRENCY,
-                        &dest,
-                        Some(&tx),
-                        &budget,
-                    )
-                    .await?;
-                }
+                download_file(&http, &urls, &tmp, size, &chunk_infos, &md5, &dest, Some(&tx), &budget).await?;
                 std::fs::rename(&tmp, &staged)?;
                 let _ = tx.send(ProgressEvent::GroupDone { name, bytes: item_size }).await;
                 Ok::<_, Error>(())
@@ -629,14 +595,10 @@ impl GameManager {
                 continue;
             }
             let res = res_by_dest.get(&dst.dest);
-            let (from, chunks, md5) = match res {
-                Some(r) if r.from_folder.is_some() => {
-                    (r.from_folder.clone().unwrap(), r.chunk_infos.clone(), r.md5.clone())
-                }
-                _ => {
-                    // fall back to the patch's zip base
-                    (patch_cfg.base_url.clone(), vec![], String::new())
-                }
+            let (from, chunks) = match res {
+                Some(r) if r.from_folder.is_some() => (r.from_folder.clone().unwrap(), r.chunk_infos.clone()),
+                // fall back to the patch's zip base
+                _ => (patch_cfg.base_url.clone(), vec![]),
             };
             let urls = node_urls(cdn_nodes, |base| ApiClient::resource_url(base, &from, &dst.dest));
             let staged = state::staged_patch_path(&self.game_folder, &dst.dest);
@@ -661,32 +623,7 @@ impl GameManager {
                         })
                         .await;
                 }
-                if chunks.is_empty() {
-                    download_single(
-                        &http,
-                        &urls,
-                        &tmp,
-                        Some(size),
-                        Some(dst_md5.as_str()),
-                        &name,
-                        tx.as_ref(),
-                        &budget,
-                    )
-                    .await?;
-                } else {
-                    download_chunked(
-                        &http,
-                        &urls,
-                        &tmp,
-                        &chunks,
-                        Some(md5.as_str()),
-                        CHUNK_CONCURRENCY,
-                        &name,
-                        tx.as_ref(),
-                        &budget,
-                    )
-                    .await?;
-                }
+                download_file(&http, &urls, &tmp, size, &chunks, &dst_md5, &name, tx.as_ref(), &budget).await?;
                 std::fs::rename(&tmp, &staged)?;
                 if let Some(tx) = &tx {
                     let _ = tx.send(ProgressEvent::GroupDone { name, bytes: size }).await;
@@ -1130,40 +1067,18 @@ impl GameManager {
                 let game_path = game_folder.join(&key);
                 std::fs::create_dir_all(game_path.parent().unwrap())?;
                 let tmp = tmp_sibling(&game_path, "sync");
-                // CN 3.6.0 manifests carry no chunkInfos; synthesize fixed-size
-                // ranges so big paks download over parallel connections (the
-                // CDN rate-limits per connection). Whole-file MD5 still verified.
-                let chunk_infos = if item.chunk_infos.is_empty() {
-                    crate::download::chunk_plan(item.size, SYNTH_CHUNK_SIZE)
-                } else {
-                    item.chunk_infos.clone()
-                };
-                if chunk_infos.is_empty() {
-                    download_single(
-                        &http,
-                        &urls,
-                        &tmp,
-                        Some(item.size),
-                        Some(item.md5.as_str()),
-                        &item.dest,
-                        tx.as_ref(),
-                        &budget,
-                    )
-                    .await?;
-                } else {
-                    download_chunked(
-                        &http,
-                        &urls,
-                        &tmp,
-                        &chunk_infos,
-                        Some(item.md5.as_str()),
-                        CHUNK_CONCURRENCY,
-                        &item.dest,
-                        tx.as_ref(),
-                        &budget,
-                    )
-                    .await?;
-                }
+                download_file(
+                    &http,
+                    &urls,
+                    &tmp,
+                    item.size,
+                    &item.chunk_infos,
+                    &item.md5,
+                    &item.dest,
+                    tx.as_ref(),
+                    &budget,
+                )
+                .await?;
                 safe_replace(&tmp, &game_path)?;
                 cache.record_file(&key, &game_path, &item.md5);
                 Ok::<_, Error>((item.dest, item.size))

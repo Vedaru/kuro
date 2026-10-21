@@ -88,7 +88,7 @@ use std::sync::Arc;
 use kuro_api::{ApiClient, Error, PackConfig, PackEntry, PatchIndex, Result, ServerEntry};
 
 use crate::atomic::safe_replace;
-use crate::download::{download_chunked, download_single, CHUNK_CONCURRENCY, FILE_CONCURRENCY, SYNTH_CHUNK_SIZE};
+use crate::download::{download_file, FILE_CONCURRENCY};
 use crate::md5_cache::Md5Cache;
 use crate::path::{key as path_key, normalise, tmp_sibling};
 use crate::quality::Quality;
@@ -781,33 +781,18 @@ impl Fetch {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = tmp_sibling(&missing.path, "pack");
-        let chunks = crate::download::chunk_plan(missing.item.size, SYNTH_CHUNK_SIZE);
-        if chunks.is_empty() {
-            download_single(
-                &self.http,
-                &self.urls,
-                &tmp,
-                Some(missing.item.size),
-                Some(missing.item.md5.as_str()),
-                &missing.item.dest,
-                tx,
-                &self.budget,
-            )
-            .await?;
-        } else {
-            download_chunked(
-                &self.http,
-                &self.urls,
-                &tmp,
-                &chunks,
-                Some(missing.item.md5.as_str()),
-                CHUNK_CONCURRENCY,
-                &missing.item.dest,
-                tx,
-                &self.budget,
-            )
-            .await?;
-        }
+        download_file(
+            &self.http,
+            &self.urls,
+            &tmp,
+            missing.item.size,
+            &missing.item.chunk_infos,
+            &missing.item.md5,
+            &missing.item.dest,
+            tx,
+            &self.budget,
+        )
+        .await?;
         safe_replace(&tmp, &missing.path)?;
         Ok(missing.item.size)
     }
