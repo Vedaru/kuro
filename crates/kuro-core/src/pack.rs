@@ -973,7 +973,7 @@ struct PartOutcome {
 /// version record it is about to write.
 fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
     let tier = Quality::ALL.into_iter().find(|q| q.as_arg().eq_ignore_ascii_case(name));
-    let prefix = tier.map(|t| format!("client/content/{}/", t.pack_key()));
+    let spelled = tier.map(|t| format!("Client/Content/{}/", t.dir_name()));
     // A named tier owns exactly its own body directory. `common` owns everything
     // *else*, so its rule is the mirror image: it must never write into a body
     // directory, because those are what the user's tier choice selects between
@@ -990,8 +990,13 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
         if first == ".kuro_cache" || first == ".incremental_download" || key.starts_with("launcherdownloadconfig") {
             return Err(Error::UnsafePath(dest.to_string()));
         }
-        if let Some(prefix) = &prefix {
-            if !key.starts_with(prefix.as_str()) {
+        if let Some(spelled) = &spelled {
+            // Compared as spelled, not folded: the body directory is
+            // `Client/Content/HD/` and on a case-sensitive host
+            // `client/content/hd/` is a different directory the game never
+            // reads. A manifest that spells it that way would register the
+            // tier as complete with its files somewhere else.
+            if !crate::path::normalise(dest).starts_with(spelled.as_str()) {
                 return Err(Error::Patch(format!(
                     "`{name}` manifest entry outside Client/Content/{}: {dest}",
                     tier.map(|t| t.dir_name()).unwrap_or_default()
@@ -1006,6 +1011,7 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
         }
         Ok(())
     };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in &manifest.resource {
         check(&item.dest)?;
         // Every downloadable entry needs a digest: without one there is nothing
@@ -1020,9 +1026,27 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
                 item.dest, item.size
             )));
         }
+        // Two entries for one path would be queued twice against the same
+        // destination (and share one temp path), so whichever writer lands
+        // second decides the bytes. Only one of them can be right.
+        if !seen.insert(path_key(&item.dest)) {
+            return Err(Error::Patch(format!(
+                "`{name}` manifest lists {dest} more than once",
+                dest = item.dest
+            )));
+        }
     }
     for dest in &manifest.delete_files {
         check(dest)?;
+    }
+    if !manifest.delete_files.is_empty() {
+        // Not implemented for packs, and silently ignoring one would leave the
+        // file behind while the tier still registers as installed. Pruning
+        // covers a *tier* body, but not `common`'s files.
+        return Err(Error::Unsupported(
+            "this pack manifest deletes files, which kuro cannot apply yet — \
+             the pack was not installed",
+        ));
     }
     for group in &manifest.group_infos {
         check(&group.dest)?;
@@ -1121,6 +1145,48 @@ mod tests {
                 "{bad} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_body_directory_must_be_spelled_as_the_game_reads_it() {
+        // Case-insensitive match is not enough: the game reads
+        // `Client/Content/HD`, and a lowercase body is a different directory on
+        // any case-sensitive host.
+        assert!(
+            validate_pack_manifest("hd", &manifest(&["client/content/hd/pakchunk1.pak"])).is_err(),
+            "a lowercase body directory was accepted"
+        );
+        // A leading slash and backslashes are the CDN's ways of saying the
+        // same relative path, and must still pass.
+        assert!(
+            validate_pack_manifest("hd", &manifest(&["/Client/Content/HD/a.pak"])).is_ok(),
+            "an absolute-spelled dest was refused"
+        );
+        assert!(
+            validate_pack_manifest("hd", &manifest(&["Client\\Content\\HD\\a.pak"])).is_ok(),
+            "a backslash-spelled dest was refused"
+        );
+    }
+
+    #[test]
+    fn a_path_listed_twice_is_refused() {
+        let once = manifest(&["Client/Content/HD/a.pak"]);
+        assert!(validate_pack_manifest("hd", &once).is_ok());
+        assert!(
+            validate_pack_manifest("hd", &manifest(&["Client/Content/HD/a.pak", "Client/Content/HD/a.pak"])).is_err(),
+            "a duplicate dest was accepted"
+        );
+    }
+
+    #[test]
+    fn a_delete_list_is_refused_rather_than_ignored() {
+        let mut m = manifest(&["Client/Content/HD/a.pak"]);
+        m.delete_files.push("Client/Content/HD/old.pak".to_string());
+        let err = validate_pack_manifest("hd", &m).expect_err("a deleteFiles entry was ignored");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "a language gap should be Unsupported, got {err:?}"
+        );
     }
 
     #[test]

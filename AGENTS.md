@@ -56,10 +56,16 @@ edits.
   Widening this deletes game state that cannot be re-downloaded.
 - **A pack manifest is untrusted ground truth, so `validate_pack_manifest` in
   `pack.rs` accepts it whole or refuses it whole.** No partial installs: an
-  empty tier document, a `common` entry inside a tier body, and an entry with
-  no MD5 are all refusals *before* the first byte and before `unregister`. A
-  skipped entry would otherwise let the tier register as healthy while a file
-  is missing, which the launcher then reports as nothing to repair.
+  empty tier document, a `common` entry inside a tier body, an entry with no
+  MD5, a dest listed twice, and any `deleteFiles` entry are all refusals
+  *before* the first byte and before `unregister`. A skipped entry would
+  otherwise let the tier register as healthy while a file is missing, which the
+  launcher then reports as nothing to repair. (`deleteFiles` and `groupInfos`
+  are `Error::Unsupported`: the packs never ship them, so refusing is honest.)
+- **The tier body is matched as spelled, not case-folded.** The game reads
+  `Client/Content/HD`; on a case-sensitive host a manifest spelling
+  `client/content/hd` would write files the game never reads. Leading slashes
+  and backslashes are still normalised first.
 - **`--check` writes nothing at all**, including zero-length marker files. The
   scan only *collects* work; every filesystem write (download, marker) happens
   in the write phase. `check_does_not_create_marker_files` guards this.
