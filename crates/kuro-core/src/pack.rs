@@ -438,7 +438,7 @@ impl crate::GameManager {
         tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
     ) -> Result<PackReport> {
         if !self.game.uses_quality_tiers() {
-            return Err(Error::Unimplemented(
+            return Err(Error::Unsupported(
                 "this game has no quality packs — only Wuthering Waves has Client/Content/<TIER>",
             ));
         }
@@ -917,7 +917,7 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
         // source-version bookkeeping, which does not exist for packs — saying
         // so is better than silently downloading the fallbacks and leaving the
         // groups unmerged.
-        return Err(Error::Unimplemented(
+        return Err(Error::Unsupported(
             "this pack manifest uses krpdiff groups, which kuro cannot merge yet — \
              the pack was not installed",
         ));

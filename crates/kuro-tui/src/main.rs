@@ -19,8 +19,27 @@ use kuro_core::{
     ProgressEvent, Quality, QualityInfo, Server, SteamInfo,
 };
 
-/// Default game folder (the user's known install).
-const DEFAULT_GAME_DIR: &str = "/home/vedaru/Games/Wuthering Waves";
+/// Where WuWa lives when no folder is given on the command line: the first
+/// Steam library's `common/` if Steam is installed (which is where a Proton
+/// install of this game actually lands), else `~/Games/Wuthering Waves`.
+///
+/// Resolved at runtime rather than compiled in — a hardcoded `$HOME` is only
+/// correct on the machine it was written on, and this is the path every bare
+/// `kuro play` / `kuro sync` falls back to.
+fn default_folder() -> String {
+    let steam = detect_steam();
+    match &steam {
+        Some(info) => default_game_dir(info, Game::WuWa).to_string_lossy().into_owned(),
+        None => std::env::var("HOME")
+            .map(|home| {
+                PathBuf::from(home)
+                    .join("Games/Wuthering Waves")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default(),
+    }
+}
 
 enum UiEvent {
     /// Status result for one game (index into `UiState::statuses`).
@@ -202,7 +221,7 @@ async fn main() -> std::io::Result<()> {
             return cli_install(&args).await;
         }
         Some("status") => {
-            let folder = args.get(1).cloned().unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
+            let folder = args.get(1).cloned().unwrap_or_else(default_folder);
             return cli_status(&folder).await;
         }
         Some("sync") => {
@@ -229,7 +248,7 @@ async fn main() -> std::io::Result<()> {
         paths = auto_detect_games();
     }
     if paths.is_empty() {
-        paths.push(DEFAULT_GAME_DIR.to_string());
+        paths.push(default_folder());
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UiEvent>(64);
@@ -394,7 +413,7 @@ async fn cli_sync(args: &[String]) -> std::io::Result<()> {
 /// choice, what is on disk and the prefix it will launch in; with a preset,
 /// save it.
 fn cli_quality(args: &[String]) -> std::io::Result<()> {
-    let folder = args.get(1).cloned().unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
+    let folder = args.get(1).cloned().unwrap_or_else(default_folder);
     let path = std::path::Path::new(&folder);
     let info = quality::info(path);
 
@@ -600,7 +619,7 @@ fn split_play_args(args: &[String]) -> (String, Vec<String>) {
     let rest = args.get(1..).unwrap_or(&[]);
     match rest.first() {
         Some(folder) if !folder.starts_with("--") => (folder.clone(), rest[1..].to_vec()),
-        _ => (DEFAULT_GAME_DIR.to_string(), rest.to_vec()),
+        _ => (default_folder(), rest.to_vec()),
     }
 }
 
@@ -659,7 +678,7 @@ fn cli_play(args: &[String]) -> std::io::Result<()> {
 /// `kuro kill [folder]` — SIGKILL the game kuro last launched for `folder`.
 /// For a client that hangs on shutdown and never lets go of the prefix.
 fn cli_kill(args: &[String]) -> std::io::Result<()> {
-    let folder = args.get(1).cloned().unwrap_or_else(|| DEFAULT_GAME_DIR.to_string());
+    let folder = args.get(1).cloned().unwrap_or_else(default_folder);
     match launch::kill(std::path::Path::new(&folder)) {
         Ok(r) if r.was_running => println!("killed game process group {}", r.pid),
         Ok(r) => println!("no running game (group {} already exited)", r.pid),
@@ -1727,7 +1746,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, UiState, DEFAULT_GAME_DIR,
+        body_choice, default_folder, parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, Quality, Server};
 
@@ -1827,7 +1846,7 @@ mod tests {
     fn play_args_split_folder_and_flags() {
         // Bare `kuro play`: default folder, nothing else — the panic case.
         let (folder, rest) = split_play_args(&args(&["play"]));
-        assert_eq!(folder, DEFAULT_GAME_DIR);
+        assert_eq!(folder, default_folder());
         assert!(rest.is_empty(), "unexpected trailing args: {rest:?}");
 
         // Folder first, then the tier.
@@ -1837,7 +1856,7 @@ mod tests {
 
         // A leading flag is not a folder.
         let (folder, rest) = split_play_args(&args(&["play", "--quality", "hd"]));
-        assert_eq!(folder, DEFAULT_GAME_DIR);
+        assert_eq!(folder, default_folder());
         assert_eq!(rest, vec!["--quality", "hd"]);
     }
 

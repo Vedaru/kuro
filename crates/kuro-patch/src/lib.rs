@@ -45,7 +45,14 @@ pub fn apply_krdiff(source_dir: &Path, krpdiff: &Path, out_dir: &Path) -> kuro_a
     );
 
     if !patcher.apply() {
-        return Err(Error::Unimplemented("krdiff apply failed"));
+        // The engine reports failure as a bool after printing its own reason;
+        // it does not distinguish a corrupt patch from a mismatched source, so
+        // name the pair that was tried — that is what makes the log usable.
+        return Err(Error::Patch(format!(
+            "krdiff {} could not be applied to {} (corrupt patch, or a source file that is not the expected version)",
+            krpdiff.display(),
+            source_dir.display()
+        )));
     }
     Ok(())
 }

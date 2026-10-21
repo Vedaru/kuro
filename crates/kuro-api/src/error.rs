@@ -41,8 +41,11 @@ pub enum Error {
     #[error("{0}")]
     TokenMissing(String),
 
-    #[error("unimplemented: {0}")]
-    Unimplemented(&'static str),
+    /// Something the API describes but kuro deliberately does not do. Not a
+    /// bug and not a failure to parse: the message says what was attempted and
+    /// what to do instead, because it is shown to the user verbatim.
+    #[error("{0}")]
+    Unsupported(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -898,7 +898,7 @@ impl GameManager {
     /// not supported for fast-switch (mirrors ww-manager).
     pub async fn checkout(&self, target: Server) -> Result<CheckoutReport> {
         if matches!(target, Server::Global) {
-            return Err(Error::Unimplemented(
+            return Err(Error::Unsupported(
                 "global fast-switch is not supported (package differences) — full sync instead",
             ));
         }

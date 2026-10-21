@@ -192,7 +192,7 @@ impl ApiClient {
     /// turn an installed tier into "unsupported".
     pub async fn fetch_pack_config(&self, urls: &[&str]) -> Result<PackConfig> {
         if urls.is_empty() {
-            return Err(Error::Unimplemented("this channel does not publish quality packs"));
+            return Err(Error::Unsupported("this channel does not publish quality packs"));
         }
         let client = &self.http;
         let mut last: Option<Error> = None;
