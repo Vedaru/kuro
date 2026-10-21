@@ -129,8 +129,13 @@ jobs:
           # rustup writes into $HOME (which is the synthetic /home/vedaru), so
           # it has to exist before it runs.
           install -d -m 0755 "$HOME"
+          # rustfmt and clippy are components of the pinned toolchain, not
+          # separate installs: the gates below have to run the same versions
+          # the build does, or a formatting diff can appear from the toolchain
+          # rather than from the change.
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
-              --default-toolchain 1.98.1 --no-modify-path
+              --default-toolchain 1.98.1 --no-modify-path \
+              --component rustfmt --component clippy
           "$HOME/.cargo/bin/cargo" --version
 
       - name: Fetch the chezmoi repo (publish.sh and MANIFEST.md only)
@@ -175,6 +180,17 @@ jobs:
           done
           [ "$cloned" = 1 ] || { echo "clone of kuro.git failed" >&2; exit 1; }
           echo "building kuro at $(git -C "$src" rev-parse --short HEAD)"
+
+          # Gate the publish on the tree being clean: this job is what puts a
+          # binary in the registry every machine restores, so a formatting or
+          # lint regression should stop it here rather than ship. `cargo fmt`
+          # without --all leaves the vendored hdiffpatch-rs tree alone: it is a
+          # path dependency, not a workspace member, and not ours to reformat.
+          (cd "$src" && cargo fmt --check)
+          # Workspace only for the same reason: the vendored crate raises two
+          # dead-code warnings of its own.
+          (cd "$src" && cargo clippy --workspace --all-targets -- -D warnings)
+          (cd "$src" && cargo test --workspace)
           # Not --locked: the committed Cargo.lock is honored anyway, and a lock
           # that has drifted from Cargo.toml should not be the thing that
           # reddens the publish.

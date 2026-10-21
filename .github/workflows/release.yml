@@ -16,9 +16,11 @@
 #     steps are ref-gated below, so a Dependabot PR gets a verdict instead of
 #     being merged blind.
 #
-# The forgejo side (.forgejo/workflows/package.yml) is untouched and keeps
-# feeding the vendored-component registry the ansible restore reads; this is
-# GitHub only. Three of its choices carry over deliberately:
+# The forgejo side (.forgejo/workflows/package.yml) keeps feeding the
+# vendored-component registry the ansible restore reads, and carries the same
+# fmt/clippy/test gates; the two are kept in step on purpose so a change cannot
+# pass one host and fail the other. Three of its choices carry over
+# deliberately:
 #
 #   * rustup is pinned to 1.98.1: a toolchain bump should be a deliberate act
 #     with a green run behind it, not whatever the release channel served that
