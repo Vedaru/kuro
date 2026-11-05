@@ -200,15 +200,27 @@ fn friendly_error(raw: &str) -> String {
     }
 }
 
-/// Use mimalloc instead of the system allocator.
+/// jemalloc, with unused pages returned to the OS immediately.
 ///
 /// A sync runs 60+ threads: tokio workers, the `tokio::fs` blocking pool and
 /// rayon during verify. glibc gives each thread its own malloc arena, and the
 /// download path's short-lived buffers stranded freed pages in them: a measured
-/// sync created 69 arenas and grew RSS ~1.9 MB/hour. mimalloc keeps
-/// thread-local heaps but purges freed pages eagerly, so RSS stays flat.
+/// sync created 69 arenas and grew RSS ~1.9 MB/hour. jemalloc shares arenas and,
+/// with both decay times at zero, decommits freed pages at once. On the same
+/// sync it held 168 MB flat instead of 360 MB and climbing, at the same 3.7 MB/s.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc reads its configuration from this symbol at init.
+///
+/// `tikv-jemalloc-sys` builds with the `_rjem_` prefix, so a plain `malloc_conf`
+/// would be ignored. jemalloc reads the symbol as a `char *`; the first word of
+/// a `&[u8]` static is exactly that pointer. `dirty_decay_ms:0` purges dirty
+/// pages on free, `muzzy_decay_ms:0` purges the muzzy stage they decay to.
+#[allow(non_upper_case_globals)]
+#[used]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
