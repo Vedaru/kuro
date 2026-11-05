@@ -940,8 +940,25 @@ impl GameManager {
                 .await;
         }
 
-        self.sync_inner_with_progress(Arc::new(full_index), &nodes, &cfg.base_url, tx)
-            .await
+        let report = self
+            .sync_inner_with_progress(Arc::new(full_index), &nodes, &cfg.base_url, tx)
+            .await?;
+
+        // A clean sync leaves every tracked file at the remote revision, but
+        // only `apply` used to record the version. Without this, `status` kept
+        // reporting the old version and the TUI offered an update that was
+        // already installed. Only record after a run with no failures: a
+        // partial repair must not claim the new version.
+        if report.failed.is_empty() {
+            let app_id = self.server_entry().app_id;
+            let local = self
+                .local_config()?
+                .unwrap_or_else(|| LocalConfig::new(index.default.version.clone(), app_id))
+                .retargeted(index.default.version.clone(), app_id);
+            state::write_local_config(&self.game_folder, &local)?;
+        }
+
+        Ok(report)
     }
 
     /// Sync core, testable with a synthetic index + local HTTP server.
