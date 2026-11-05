@@ -200,6 +200,16 @@ fn friendly_error(raw: &str) -> String {
     }
 }
 
+/// Use mimalloc instead of the system allocator.
+///
+/// A sync runs 60+ threads: tokio workers, the `tokio::fs` blocking pool and
+/// rayon during verify. glibc gives each thread its own malloc arena, and the
+/// download path's short-lived buffers stranded freed pages in them: a measured
+/// sync created 69 arenas and grew RSS ~1.9 MB/hour. mimalloc keeps
+/// thread-local heaps but purges freed pages eagerly, so RSS stays flat.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

@@ -41,6 +41,16 @@ edits.
   3.6.0 patch manifests) gets synthesized 4 MiB ranges — without that, a 26 GB
   pak is one throttled connection. Do not open-code the choice in a new loop;
   `tests/synth_ranges.rs` asserts the request pattern.
+- **Download writes go through a 1 MiB `BufWriter`** (`WRITE_BATCH` in
+  `download.rs`). `tokio::fs` turns every write into a blocking-pool task, so
+  writing each network piece directly put a task and a cross-thread buffer
+  handoff on every 8-16 KiB read. That churn was what grew the process's glibc
+  arena pages. Keep the batching when touching either download loop.
+- **`kuro` uses mimalloc, not glibc malloc** (`#[global_allocator]` in
+  `kuro-tui/src/main.rs`). The same 60+ thread sync left glibc with 69 per-thread
+  arenas and RSS creeping ~1.9 MB/hour. mimalloc's thread-local heaps purge freed
+  pages eagerly. Do not remove it or reintroduce `MALLOC_ARENA_MAX` tuning; the
+  allocator is the fix, the tuning was the workaround.
 - **`Error::Unsupported` is a deliberate refusal** whose message is shown to the
   user verbatim, not a stub. Genuine failures use `Error::Patch`.
 - **The MD5 cache is disposable** (`md5_cache.rs`): a poisoned mutex recovers by

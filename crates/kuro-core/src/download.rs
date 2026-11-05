@@ -47,6 +47,16 @@ pub const FILE_CONCURRENCY: usize = 8;
 /// whole-file GET would be one throttled connection for a multi-GB pak.
 pub const SYNTH_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
+/// File writes are batched to this size.
+///
+/// `tokio::fs` hands every write to the blocking pool as its own task, so
+/// writing each network read directly meant a blocking task, a buffer handoff
+/// and a cross-thread free for every 8-16 KiB piece. On a long sync that churn
+/// stranded pages in glibc's per-thread arenas and grew RSS ~1.9 MB/hour. One
+/// MiB batches the writes down by two orders of magnitude without changing the
+/// bytes on disk or buffering a whole pak.
+const WRITE_BATCH: usize = 1 << 20;
+
 /// Process-wide ceiling on in-flight HTTP requests, one permit per open
 /// connection.
 ///
@@ -224,7 +234,8 @@ async fn download_single_once(
     // is actually expected.
     let want_md5 = expected_md5.is_some_and(|m| !m.is_empty());
     let mut hasher = want_md5.then(md5::Context::new);
-    let mut file = tokio::fs::File::create(dest).await?;
+    let file = tokio::fs::File::create(dest).await?;
+    let mut file = tokio::io::BufWriter::with_capacity(WRITE_BATCH, file);
     let mut stream = resp.bytes_stream();
     let mut done: u64 = 0;
     let mut last_report: u64 = 0;
@@ -410,6 +421,7 @@ pub async fn download_chunked(
                     // stalled edge shows no progress until it resumes.
                     let mut f = tokio::fs::OpenOptions::new().write(true).open(&dest).await?;
                     f.seek(std::io::SeekFrom::Start(start)).await?;
+                    let mut f = tokio::io::BufWriter::with_capacity(WRITE_BATCH, f);
                     let mut stream = resp.bytes_stream();
                     let mut hasher = md5::Context::new();
                     let mut n: u64 = 0;
