@@ -126,17 +126,18 @@ jobs:
           apt-get install -y --no-install-recommends \
               build-essential ca-certificates curl git pkg-config \
               python3 python3-yaml binutils zstd xz-utils file
-          # rustup writes into $HOME (which is the synthetic /home/vedaru), so
-          # it has to exist before it runs.
+          # The glibc-amd64 runner image already ships the pinned 1.98.1
+          # toolchain (rustfmt and clippy included) at /opt/cargo, with
+          # RUSTUP_HOME=/opt/rustup. Running rustup again asks it to install
+          # into $HOME/.cargo, rustup refuses because /opt/cargo exists, and
+          # the step then dies on the missing $HOME/.cargo/bin/cargo (exit
+          # 127). Use the image's toolchain and fail loudly if the image ever
+          # drifts off the pin.
           install -d -m 0755 "$HOME"
-          # rustfmt and clippy are components of the pinned toolchain, not
-          # separate installs: the gates below have to run the same versions
-          # the build does, or a formatting diff can appear from the toolchain
-          # rather than from the change.
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
-              --default-toolchain 1.98.1 --no-modify-path \
-              --component rustfmt --component clippy
-          "$HOME/.cargo/bin/cargo" --version
+          cargo --version | grep -q '^cargo 1.98.1 ' || {
+            echo "runner image does not provide cargo 1.98.1" >&2
+            exit 1
+          }
 
       - name: Fetch the chezmoi repo (publish.sh and MANIFEST.md only)
         env:
