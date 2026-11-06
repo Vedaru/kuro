@@ -1977,4 +1977,12 @@ mod tests {
         draft.cycle_body();
         assert_eq!(draft.body, BodyChoice::All);
     }
+    /// The allocator must keep jemalloc's default 10 s dirty decay. A
+    /// `_rjem_malloc_conf` override (the zero-decay experiment) would change
+    /// this and raise the CPU cost; catch that here, not on a laptop.
+    #[test]
+    fn allocator_keeps_jemalloc_default_decay() {
+        let dirty: isize = unsafe { tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0").unwrap() };
+        assert_eq!(dirty, 10_000);
+    }
 }

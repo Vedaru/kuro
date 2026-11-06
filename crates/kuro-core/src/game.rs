@@ -916,6 +916,22 @@ impl GameManager {
         self.sync_with_progress(None).await
     }
 
+    /// Record the remote version after a sync that did not fail.
+    ///
+    /// `sync` repairs files from the live manifest, so a clean run leaves the
+    /// install at that version. Only `apply` used to write the record, which
+    /// made `status` keep reporting the old version. A run with any failure
+    /// must not claim the new one.
+    fn record_synced_version(game_folder: &Path, app_id: &str, remote: &str, report: &SyncReport) -> Result<()> {
+        if !report.failed.is_empty() {
+            return Ok(());
+        }
+        let local = state::read_local_config(game_folder)?
+            .unwrap_or_else(|| LocalConfig::new(remote, app_id))
+            .retargeted(remote, app_id);
+        state::write_local_config(game_folder, &local)
+    }
+
     /// Sync with optional progress events (used by install and the TUI).
     pub async fn sync_with_progress(&self, tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>) -> Result<SyncReport> {
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
@@ -944,19 +960,12 @@ impl GameManager {
             .sync_inner_with_progress(Arc::new(full_index), &nodes, &cfg.base_url, tx)
             .await?;
 
-        // A clean sync leaves every tracked file at the remote revision, but
-        // only `apply` used to record the version. Without this, `status` kept
-        // reporting the old version and the TUI offered an update that was
-        // already installed. Only record after a run with no failures: a
-        // partial repair must not claim the new version.
-        if report.failed.is_empty() {
-            let app_id = self.server_entry().app_id;
-            let local = self
-                .local_config()?
-                .unwrap_or_else(|| LocalConfig::new(index.default.version.clone(), app_id))
-                .retargeted(index.default.version.clone(), app_id);
-            state::write_local_config(&self.game_folder, &local)?;
-        }
+        Self::record_synced_version(
+            &self.game_folder,
+            self.server_entry().app_id,
+            &index.default.version,
+            &report,
+        )?;
 
         Ok(report)
     }
@@ -1742,5 +1751,33 @@ mod tests {
         assert_eq!(plan.full_files.len(), 2, "both entries must be planned");
         assert_eq!(plan.total_bytes, 300);
         assert!(plan.full_files.iter().all(|f| !f.local_ready));
+    }
+
+    #[test]
+    fn sync_records_the_remote_version_only_without_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = LocalConfig::new("3.6.0", "10003");
+        cfg.extra
+            .insert("bundles".to_string(), serde_json::json!({"hd": {"version": "3.6.0"}}));
+        state::write_local_config(dir.path(), &cfg).unwrap();
+
+        GameManager::record_synced_version(dir.path(), "10003", "3.7.0", &SyncReport::default()).unwrap();
+        let after = state::read_local_config(dir.path()).unwrap().unwrap();
+        assert_eq!(after.version, "3.7.0");
+        assert_eq!(
+            after.extra["bundles"]["hd"]["version"], "3.6.0",
+            "keys kuro does not model must survive the version write"
+        );
+
+        let failed = SyncReport {
+            failed: vec!["boom".to_string()],
+            ..Default::default()
+        };
+        GameManager::record_synced_version(dir.path(), "10003", "3.8.0", &failed).unwrap();
+        assert_eq!(
+            state::read_local_config(dir.path()).unwrap().unwrap().version,
+            "3.7.0",
+            "a run with failures must not claim the new version"
+        );
     }
 }
