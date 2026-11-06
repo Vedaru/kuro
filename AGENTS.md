@@ -46,12 +46,13 @@ edits.
   writing each network piece directly put a task and a cross-thread buffer
   handoff on every 8-16 KiB read. That churn was what grew the process's glibc
   arena pages. Keep the batching when touching either download loop.
-- **`kuro` uses jemalloc with zero decay, not glibc malloc** (`#[global_allocator]`
-  and `_rjem_malloc_conf` in `kuro-tui/src/main.rs`). The same 60+ thread sync
-  left glibc with 69 per-thread arenas and RSS creeping ~1.9 MB/hour. jemalloc
-  shares arenas, and `dirty_decay_ms:0`/`muzzy_decay_ms:0` decommit freed pages
-  immediately: 168 MB flat vs 360 MB and climbing, same 3.7 MB/s. Do not remove
-  it or reintroduce `MALLOC_ARENA_MAX` tuning; the allocator is the fix.
+- **`kuro` uses jemalloc, not glibc malloc** (`#[global_allocator]` in
+  `kuro-tui/src/main.rs`). The same 60+ thread sync left glibc with 69 per-thread
+  arenas and RSS creeping ~1.9 MB/hour. jemalloc shares arenas and returns pages
+  on its default 10 s decay: 214 MB flat vs 360 MB and climbing, same 3.7 MB/s.
+  Do not remove it or reintroduce `MALLOC_ARENA_MAX` tuning; the allocator is the
+  fix. Zero decay (163 MB) is possible but costs ~10% more CPU; default is the
+  power-friendly choice.
 - **`Error::Unsupported` is a deliberate refusal** whose message is shown to the
   user verbatim, not a stub. Genuine failures use `Error::Patch`.
 - **The MD5 cache is disposable** (`md5_cache.rs`): a poisoned mutex recovers by
