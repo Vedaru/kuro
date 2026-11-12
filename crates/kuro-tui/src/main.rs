@@ -93,6 +93,8 @@ enum UiEvent {
 #[derive(Default)]
 struct TaskUi {
     kind: String,
+    /// Folder this task writes to; `None` for tasks that do not touch a tree.
+    target: Option<String>,
     done: usize,
     /// Items announced but not yet finished (GroupStart - GroupDone).
     queued: usize,
@@ -1344,6 +1346,7 @@ async fn run(
                         state.busy = true;
                         state.task = Some(TaskUi {
                             kind: "install".into(),
+                            target: Some(target.clone()),
                             ..Default::default()
                         });
                         notify(
@@ -1481,7 +1484,8 @@ async fn run(
                     KeyCode::Char('c') if !state.busy => {
                         state.busy = true;
                         state.task = Some(TaskUi {
-                            kind: "checkout".into(),
+                            kind: "checkout (in place)".into(),
+                            target: Some(path.clone()),
                             ..Default::default()
                         });
                         state.focus = Focus::Task;
@@ -1584,7 +1588,7 @@ async fn run(
                 UiEvent::TaskDone(r) => {
                     let install_end = state.task.as_ref().is_some_and(|t| t.kind == "install");
                     let install_ok = install_end && r.is_ok();
-                    let switched = r.is_ok() && state.task.as_ref().is_some_and(|t| t.kind == "checkout");
+                    let switched = r.is_ok() && state.task.as_ref().is_some_and(|t| t.kind.starts_with("checkout"));
                     match &r {
                         Ok(msg) => notify(&mut state, msg.clone()),
                         Err(e) => notify(&mut state, format!("failed: {}", friendly_error(e))),
@@ -2272,6 +2276,9 @@ fn task_lines(state: &UiState) -> Vec<Line<'_>> {
         Some(t) => {
             let stopped = matches!(t.finished, Some(TaskEnd::Stopped));
             let mut v = vec![Line::raw(format!("task: {}", t.kind))];
+            if let Some(target) = &t.target {
+                v.push(Line::raw(format!("at: {target}")));
+            }
             // A stopped task has no progress to show; its bar and in-flight
             // rows are stale and would read as a paused 0%.
             if !stopped {
