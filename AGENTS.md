@@ -121,6 +121,12 @@ edits.
   `.kuro_cache/packs.json` is only trusted while `bundles` still lists the tier.
   `unregister` runs before the first byte of a reinstall, so a crashed run
   leaves "not installed" rather than a record claiming missing files.
+- **A from-zero install writes its identity last.** `install_with_progress`
+  builds a manager from the requested game/server instead of reading
+  `launcherDownloadConfig.json`, so an aborted install leaves no config claiming
+  a version that is not complete. The first successful sync writes it, then the
+  installed tier(s) are registered. The TUI's blank row is the default install
+  target and becomes a real row when the install finishes.
 
 ## Tests
 

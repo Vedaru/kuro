@@ -151,6 +151,22 @@ impl GameManager {
         })
     }
 
+    /// A manager for a folder that is about to become an install. Unlike
+    /// [`Self::open`] it does not need `launcherDownloadConfig.json` yet; the
+    /// config is written by the first successful sync, so an aborted install
+    /// leaves no half-truth behind.
+    fn manage(game: Game, server: Server, game_folder: PathBuf) -> Result<Self> {
+        Ok(Self {
+            game_folder,
+            game,
+            server,
+            api: ApiClient::new()?,
+            http: build_client()?,
+            budget: Budget::new(CONCURRENCY),
+            body: BodyChoice::All,
+        })
+    }
+
     /// Replace the body choice for this run (install / sync read it).
     pub fn set_body(&mut self, body: BodyChoice) {
         self.body = body;
@@ -904,41 +920,36 @@ impl GameManager {
         body: BodyChoice,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<InstallReport> {
-        let entry = server_entry(game, server).ok_or_else(|| Error::UnknownAppId(format!("{game}/{server}")))?;
-        let api = ApiClient::new()?;
-        let index = api.fetch_index(&index_url(game, server)?).await?;
-        let version = index.default.version.clone();
-
         std::fs::create_dir_all(&game_folder)?;
-        // `open()` (and the sync that follows) resolve game+server from this
-        // file, so it has to be written before we can sync — but a failed sync
-        // must not leave it claiming a version we never installed. Keep the
-        // previous bytes and put them back on failure.
-        let cfg_path = game_folder.join(state::LOCAL_CONFIG_FILE);
-        let prev_cfg = std::fs::read(&cfg_path).ok();
-        // A reinstall into an existing folder must keep the launcher's own keys
-        // (`bundles` among them); a first install starts from nothing.
-        let cfg = state::read_local_config(&game_folder)?
-            .unwrap_or_else(|| LocalConfig::new(version.clone(), entry.app_id))
-            .retargeted(version.clone(), entry.app_id);
-        state::write_local_config(&game_folder, &cfg)?;
-
-        let mut mgr = Self::open(game_folder.clone()).await?;
+        let mut mgr = Self::manage(game, server, game_folder.clone())?;
+        let index = mgr.api.fetch_index(&index_url(game, server)?).await?;
+        let version = index.default.version.clone();
         mgr.set_body(body);
-        let sync = match mgr.sync_base_with_progress(tx).await {
-            Ok(report) => report,
-            Err(e) => {
-                match prev_cfg {
-                    Some(bytes) => {
-                        let _ = std::fs::write(&cfg_path, bytes);
-                    }
-                    None => {
-                        let _ = std::fs::remove_file(&cfg_path);
-                    }
-                }
-                return Err(e);
+        let sync = mgr.sync_base_with_progress(tx).await?;
+        if !sync.failed.is_empty() {
+            return Err(Error::Patch(format!(
+                "{} file(s) failed to download — the install is incomplete; rerun it to resume",
+                sync.failed.len()
+            )));
+        }
+        // The channel manifest carries the HD body for WuWa 3.7.x. A from-zero
+        // install is not finished until the launcher records name the tier
+        // (ww-manager does the same after `download`); without them the
+        // launcher answers "repair game" even though every file is present.
+        if game.uses_quality_tiers() {
+            let info = quality::info(&game_folder);
+            let installed = info.installed();
+            for tier in &installed {
+                crate::pack::register(&game_folder, *tier, &version, None, None)?;
             }
-        };
+            // Remember the body for `play` on a first install, but never
+            // overwrite a preset the user already chose.
+            if info.selected.is_none() {
+                if let Some(tier) = installed.first() {
+                    let _ = quality::set_selected(&game_folder, *tier);
+                }
+            }
+        }
         let game_exe = find_game_exe(&game_folder);
         Ok(InstallReport {
             version,

@@ -153,6 +153,9 @@ struct UiState {
     focus: Focus,
     /// Open install modal (game + server selection).
     install: Option<InstallDraft>,
+    /// Folder the running install writes to, so its row can be added when it
+    /// finishes (a blank TUI has only the placeholder row).
+    install_target: Option<String>,
     /// Help overlay open.
     show_help: bool,
     /// Detected Steam + Proton (for install targets).
@@ -243,6 +246,7 @@ async fn stop_task(state: &mut UiState) {
     // download cannot keep streaming into the staging tree while the user
     // starts the next one, and so "stopped" is not a guess.
     let _ = handle.await;
+    state.install_target = None;
     if let Some(task) = state.task.as_mut() {
         task.finished = Some(TaskEnd::Stopped);
         task.files.clear();
@@ -252,6 +256,33 @@ async fn stop_task(state: &mut UiState) {
         state,
         "stopped — partial files are kept; the next run continues from them",
     );
+}
+
+/// The folder a new install should default to: the blank row the TUI opened
+/// with, or the standard game folder when the cursor is on a real install.
+fn install_target_for(state: &UiState) -> String {
+    state
+        .paths
+        .get(state.active)
+        .filter(|p| !std::path::Path::new(p).join("launcherDownloadConfig.json").is_file())
+        .cloned()
+        .unwrap_or_else(default_folder)
+}
+
+/// Add an install to the games list, returning its index. Reinstalling into
+/// a known folder refreshes the existing row instead of adding a duplicate.
+fn remember_install_path(state: &mut UiState, target: &str) -> usize {
+    if let Some(idx) = state
+        .paths
+        .iter()
+        .position(|p| std::path::Path::new(p) == std::path::Path::new(target))
+    {
+        return idx;
+    }
+    state.paths.push(target.to_string());
+    state.statuses.push(None);
+    state.quality_sel.push(None);
+    state.paths.len() - 1
 }
 
 /// Human-friendly game name for messages.
@@ -1314,8 +1345,12 @@ async fn run(
                                 ),
                             },
                         );
+                        state.install_target = Some(target.clone());
                         state.task_handle = Some(spawn_install(&tx, &target, game, server, body));
                     }
+                    // The Enter that started the install belongs to the modal,
+                    // not to the games list (otherwise it also opens Detail).
+                    continue;
                 }
 
                 if state.screen == Screen::Games {
@@ -1336,7 +1371,7 @@ async fn run(
                         }
                         KeyCode::Char('i') => {
                             if !state.busy {
-                                state.install = Some(InstallDraft::new(default_folder()));
+                                state.install = Some(InstallDraft::new(install_target_for(&state)));
                             }
                         }
                         KeyCode::Char('r') => {
@@ -1527,6 +1562,8 @@ async fn run(
                     }
                 },
                 UiEvent::TaskDone(r) => {
+                    let install_end = state.task.as_ref().is_some_and(|t| t.kind == "install");
+                    let install_ok = install_end && r.is_ok();
                     let switched = r.is_ok() && state.task.as_ref().is_some_and(|t| t.kind == "checkout");
                     match &r {
                         Ok(msg) => notify(&mut state, msg.clone()),
@@ -1540,6 +1577,19 @@ async fn run(
                     }
                     state.busy = false;
                     state.task_handle = None;
+                    if install_end {
+                        if let Some(target) = state.install_target.take() {
+                            if install_ok {
+                                // A blank TUI only has a placeholder row; the
+                                // finished install must become a real row and
+                                // its status must be read from the new config.
+                                let idx = remember_install_path(&mut state, &target);
+                                state.active = idx;
+                                state.quality_sel[idx] = quality::selected(std::path::Path::new(&target));
+                                spawn_status(&tx, &target, idx);
+                            }
+                        }
+                    }
                     if let Some(path) = state.paths.get(state.active).cloned() {
                         state.quality_sel[state.active] = quality::selected(std::path::Path::new(&path));
                         // Checkout changes the appId, so the cached "server:"
@@ -2551,8 +2601,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, cli_bar, debug_log, default_folder, init_debug, parse_quality_arg, split_play_args, ui,
-        CliProgress, InstallDraft, QualityDraft, Screen, UiState,
+        body_choice, cli_bar, debug_log, default_folder, init_debug, install_target_for, parse_quality_arg,
+        remember_install_path, split_play_args, ui, CliProgress, InstallDraft, QualityDraft, Screen, UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, ProgressEvent, Quality, Server};
 
@@ -2830,6 +2880,46 @@ mod tests {
             "help missing stop key:\n{out}"
         );
         assert!(!out.contains("Esc / Ctrl+C"), "help still maps Esc to stop:\n{out}");
+    }
+
+    #[test]
+    fn a_blank_row_is_the_install_target() {
+        let mut state = UiState {
+            paths: vec!["/tmp/kuro-not-installed".into()],
+            statuses: vec![None],
+            quality_sel: vec![None],
+            ..Default::default()
+        };
+        assert_eq!(install_target_for(&state), "/tmp/kuro-not-installed");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("launcherDownloadConfig.json"), "{}").unwrap();
+        state.paths[0] = dir.path().to_string_lossy().into_owned();
+        assert_eq!(
+            install_target_for(&state),
+            default_folder(),
+            "a real install should not be the default target of a new install"
+        );
+    }
+
+    #[test]
+    fn a_finished_install_becomes_one_row() {
+        let mut state = UiState {
+            paths: vec!["/a".into()],
+            statuses: vec![None],
+            quality_sel: vec![None],
+            ..Default::default()
+        };
+        assert_eq!(remember_install_path(&mut state, "/b"), 1);
+        assert_eq!(state.paths, vec!["/a".to_string(), "/b".to_string()]);
+        assert_eq!(state.statuses.len(), 2);
+        assert_eq!(state.quality_sel.len(), 2);
+        assert_eq!(
+            remember_install_path(&mut state, "/b"),
+            1,
+            "reinstalling into the same folder must not add a duplicate row"
+        );
+        assert_eq!(state.paths.len(), 2);
     }
 
     /// The CLI bar is one running total, not a per-file row. Verify fills it

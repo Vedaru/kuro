@@ -134,6 +134,13 @@ applied only on an explicit `a` / `--apply`.
 hashing, then bytes for the whole download (`common` + tier together). Piped
 output gets no bar, only the final summary.
 
+`kuro install` also works on an empty folder: it writes
+`launcherDownloadConfig.json` only after the whole sync verifies, then records
+the installed quality tier with the launcher. For WuWa CN/Bilibili the channel
+index is the current base version (3.7.1 today), so follow a fresh install with
+`kuro update` to reach 3.8.0. In the TUI, `i` defaults its target to the blank
+row kuro opened with; the finished install becomes that row.
+
 A pack manifest has exactly one path rule: a tier owns
 `Client/Content/<TIER>/`, and any pack may write the target version's
 `Client/Saved/Resources/<version>/`. That is the official rule, and the version
