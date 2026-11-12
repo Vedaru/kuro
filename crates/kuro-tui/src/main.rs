@@ -214,7 +214,7 @@ impl InstallDraft {
             target: target.clone(),
             suggested: target,
             edit_target: false,
-            field: 0,
+            field: 3,
             fresh_target: false,
             body: BodyChoice::All,
         }
@@ -1407,7 +1407,7 @@ async fn run(
                             if draft.field == 3 {
                                 draft.edit_target = true;
                                 draft.fresh_target = true;
-                            } else {
+                            } else if draft.field == 4 {
                                 if draft.target.trim().is_empty() {
                                     draft.target = draft.suggested.clone();
                                 }
@@ -2335,6 +2335,17 @@ fn folder_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or("game").to_string()
 }
 
+/// `$HOME/...` reads better and leaves the folder line room at 60 columns.
+fn display_path(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(home.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
 fn short_game_name(game: Game) -> &'static str {
     match game {
         Game::WuWa => "WuWa",
@@ -2666,10 +2677,11 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
                 row(2, "pack    ", pack),
                 Line::from(vec![
                     cursor(3),
+                    dim("folder  "),
                     if selected(3) {
-                        accent(draft.target.clone())
+                        accent(display_path(&draft.target))
                     } else {
-                        strong(draft.target.clone())
+                        strong(display_path(&draft.target))
                     },
                 ]),
                 Line::from(vec![
@@ -2677,10 +2689,10 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
                     if selected(4) { accent("install") } else { dim("install") },
                 ]),
                 Line::styled(
-                    if selected(3) {
-                        "↑↓ select · Enter edit folder"
-                    } else {
-                        "↑↓ select · ←→ change · Enter install"
+                    match draft.field {
+                        3 => "↑↓ select · Enter edit folder",
+                        4 => "↑↓ select · Enter install",
+                        _ => "↑↓ select · ←→ change",
                     },
                     Style::default().fg(Color::Cyan),
                 ),
@@ -3170,9 +3182,10 @@ mod tests {
     }
 
     #[test]
-    fn install_modal_starts_on_options_not_typing() {
+    fn install_modal_starts_on_the_folder_not_typing() {
         let draft = InstallDraft::new("/tmp/x".into());
         assert!(!draft.edit_target);
+        assert_eq!(draft.field, 3);
         assert_eq!(draft.target, "/tmp/x");
     }
 
