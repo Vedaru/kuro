@@ -137,21 +137,38 @@ version older than the installed one is refused rather than rolled back.
 `kuro pack` for a tier the channel does not serve, and `kuro update` for a
 pack-document version update.
 
-### TUI keys
+### TUI
+
+The TUI is a drill-down: a **games list**, then one game per page. `Esc` backs
+out. Only the open game's status, task and log are on screen, so PGR and WuWa
+are never compared side by side.
+
+**Games list**
 
 | Key | Action |
 |-----|--------|
-| `Tab` | cycle focus: status → task → log (focused box is highlighted) |
-| `←` / `→` | switch game |
-| `↑` / `↓`, `PgUp` / `PgDn` | scroll the log (when focused) |
-| `r` | refresh status |
-| `d` | update / predownload (pack document for WuWa CN/Bilibili) |
-| `a` | apply predownloaded update |
-| `s` | sync / repair files |
-| `c` | checkout server (CN ⇄ Bilibili) |
+| `↑` / `↓` (or `j` / `k`) | select a game |
+| `Enter` | open the selected game |
 | `i` | install a new game (`w`/`p` game · `c`/`b`/`g` server · `f` quality pack · `t` path · `s` Steam default) |
-| `Q` | quality preset (`s`/`h`/`u` pick · `i` install that tier's paks · Enter pick + install · saved for `p`) |
+| `r` | refresh every game's status |
 | `h` / `?` | help overlay |
+| `q` / `Esc` | quit |
+
+**Game detail**
+
+| Key | Action |
+|-----|--------|
+| `Esc` | back to the games list |
+| `p` | play |
+| `d` | update (pack document for WuWa CN/Bilibili, base predownload otherwise) |
+| `a` | apply a stage-only predownload (PGR / WuWa Global) |
+| `s` | sync / repair |
+| `c` | checkout server (CN ⇄ Bilibili) |
+| `k` | force-kill a hung client |
+| `Q` | quality preset (`s`/`h`/`u` pick · `i` install that tier's paks · Enter pick + install · saved for `p`) |
+| `r` | refresh this game's status |
+| `Tab` | cycle focus: status → task → log |
+| `↑` / `↓`, `PgUp` / `PgDn` | scroll the log (when focused) |
 | `q` | quit |
 
 ### Running the game

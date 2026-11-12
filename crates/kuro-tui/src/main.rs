@@ -1,17 +1,18 @@
 //! `kuro` — ratatui terminal UI.
 //!
-//! Keys: `r` refresh status · `p` play (launch) · `d` predownload · `a` apply ·
-//! `s` sync · `c` checkout CN<->bilibili · `Q` quality preset (+ install) ·
-//! `q` quit
+//! Two screens: a games list, then a per-game detail view. `Esc` backs up one
+//! level, so exactly one game is ever on screen. Keys on the detail screen:
+//! `r` refresh · `p` play · `d` update · `a` apply · `s` sync · `c` checkout
+//! CN<->bilibili · `Q` quality preset · `q` quit.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{init, restore, Frame, Terminal};
 
 use kuro_core::{
@@ -78,8 +79,19 @@ enum Focus {
     Log,
 }
 
+/// The drill-down stack: the games list is the root, a game detail is one
+/// level deep. `Esc` pops, so the other games are never rendered beside the
+/// active one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Screen {
+    #[default]
+    Games,
+    Detail,
+}
+
 #[derive(Default)]
 struct UiState {
+    screen: Screen,
     logs: Vec<String>,
     task: Option<TaskUi>,
     busy: bool,
@@ -969,14 +981,52 @@ async fn run(
                     }
                 }
 
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
-                    KeyCode::Char('i') => {
-                        if !state.busy {
-                            state.install = Some(InstallDraft::new(state.paths[state.active].clone()));
+                if state.screen == Screen::Games {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            state.active = state.active.saturating_sub(1);
                         }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            state.active = (state.active + 1).min(state.paths.len().saturating_sub(1));
+                        }
+                        KeyCode::Enter => {
+                            if let Some(path) = state.paths.get(state.active).cloned() {
+                                state.screen = Screen::Detail;
+                                // The detail is a fresh page: the shared
+                                // startup log would otherwise name the other
+                                // game on a page that is supposed to show one.
+                                let opened = pretty_game(active_game(&state));
+                                state.logs.clear();
+                                push_log(&mut state, format!("opened {opened}"));
+                                if state.statuses.get(state.active).and_then(|s| s.as_ref()).is_none() {
+                                    spawn_status(&tx, &path, state.active);
+                                }
+                            }
+                        }
+                        KeyCode::Char('i') => {
+                            if !state.busy {
+                                state.install = Some(InstallDraft::new(default_folder()));
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            if !state.busy {
+                                for i in 0..state.paths.len() {
+                                    spawn_status(&tx, &state.paths[i], i);
+                                }
+                                push_log(&mut state, "refreshing all games…");
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        _ => {}
                     }
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Esc => state.screen = Screen::Games,
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
                     KeyCode::Char('p') => {
                         if !state.busy {
                             play(&mut state, &path);
@@ -1003,8 +1053,6 @@ async fn run(
                             Focus::Log => Focus::Status,
                         };
                     }
-                    KeyCode::Left => switch_game(&mut state, &tx, -1),
-                    KeyCode::Right => switch_game(&mut state, &tx, 1),
                     KeyCode::Char('r') => {
                         if !state.busy {
                             spawn_status(&tx, &path, state.active);
@@ -1014,7 +1062,11 @@ async fn run(
                         if !state.busy {
                             state.busy = true;
                             state.task = Some(TaskUi {
-                                kind: "predownload".into(),
+                                kind: if active_game(&state).uses_quality_tiers() {
+                                    "update".into()
+                                } else {
+                                    "predownload".into()
+                                },
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
@@ -1171,24 +1223,6 @@ fn spawn_status(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, idx: usize)
     });
 }
 
-/// Switch the active game (←/→); wraps around, refreshes its status box.
-fn switch_game(state: &mut UiState, tx: &tokio::sync::mpsc::Sender<UiEvent>, delta: isize) {
-    if state.paths.len() < 2 || state.busy {
-        return;
-    }
-    let n = state.paths.len() as isize;
-    state.active = (state.active as isize + delta).rem_euclid(n) as usize;
-    if state.active < state.statuses.len() {
-        state.statuses[state.active] = None;
-    }
-    let name = state.paths[state.active].rsplit('/').next().unwrap_or("game");
-    push_log(
-        state,
-        format!("→ {name} (game {}/{})", state.active + 1, state.paths.len()),
-    );
-    spawn_status(tx, &state.paths[state.active], state.active);
-}
-
 /// The game behind the active folder, taken from its status (WuWa by default
 /// while the status is still loading).
 fn active_game(state: &UiState) -> Game {
@@ -1307,7 +1341,19 @@ fn auto_detect_games() -> Vec<String> {
             deduped.push(p);
         }
     }
-    deduped.sort();
+    // WuWa is the primary title, then PGR, then anything else. The list is
+    // still one row per game; this only decides the default cursor.
+    deduped.sort_by_key(|p| {
+        let lower = p.to_ascii_lowercase();
+        let rank = if lower.contains("wuthering") {
+            0
+        } else if lower.contains("punishing") {
+            1
+        } else {
+            2
+        };
+        (rank, p.clone())
+    });
     deduped
 }
 
@@ -1496,77 +1542,257 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
 }
 
 fn ui(f: &mut Frame, state: &UiState) {
-    // stacked sections: status / task / log / footer
+    if f.area().width < 60 || f.area().height < 20 {
+        draw_too_small(f);
+        return;
+    }
+    match state.screen {
+        Screen::Games => ui_games(f, state),
+        Screen::Detail => ui_detail(f, state),
+    }
+    render_overlays(f, state);
+}
+
+/// The designed floor. Below this, name the dimensions instead of drawing a
+/// broken frame. `q` and `Ctrl+C` still work because the event loop runs.
+fn draw_too_small(f: &mut Frame) {
+    let area = f.area();
+    let msg = vec![
+        Line::styled(
+            "terminal too small",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(format!("kuro needs 60x20, this is {}x{}", area.width, area.height)),
+        Line::raw("resize the terminal, or press q to quit"),
+    ];
+    f.render_widget(
+        Paragraph::new(msg).block(Block::bordered().border_type(BorderType::Rounded).title("kuro")),
+        area,
+    );
+}
+
+fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
+    Block::bordered().border_type(BorderType::Rounded).title(title)
+}
+
+/// The root screen: one row per installed game, one game per row. The detail
+/// view is a separate screen, so two games are never compared side by side.
+fn ui_games(f: &mut Frame, state: &UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),      // status: one box per game
-            Constraint::Percentage(45), // task: overall + per-file bars
-            Constraint::Min(4),         // log
-            Constraint::Length(1),      // footer
+            Constraint::Min(5), // games table
+            Constraint::Length(if state.task.is_some() || state.busy { 6 } else { 3 }),
+            Constraint::Min(3),    // recent log
+            Constraint::Length(1), // footer
         ])
         .split(f.area());
 
-    // ---- status section: separate box per game ----
-    let n = state.paths.len().max(1);
-    if n > 1 {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(std::iter::repeat_n(Constraint::Ratio(1, n as u32), n).collect::<Vec<_>>())
-            .split(chunks[0]);
-        for (i, col) in cols.iter().enumerate() {
-            let path = &state.paths[i];
-            let active = i == state.active;
-            let s = state.statuses.get(i).and_then(|x| x.as_ref());
-            let name = path.rsplit('/').next().unwrap_or("game").to_string();
-            let border = if active {
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("▶ {name}"))
-                    .border_style(Style::default().fg(if state.focus == Focus::Status {
-                        Color::Yellow
-                    } else {
-                        Color::Cyan
-                    }))
-            } else {
-                Block::default().borders(Borders::ALL).title(name)
-            };
-            f.render_widget(
-                Paragraph::new(status_box_lines(
-                    s,
-                    active && state.busy,
-                    state.quality_sel.get(i).copied().flatten(),
-                ))
-                .wrap(Wrap { trim: true })
-                .block(border),
-                *col,
-            );
-        }
+    let wide = f.area().width >= 100;
+    let medium = f.area().width >= 80;
+    let (header, widths) = if wide {
+        (
+            Row::new(["GAME", "SERVER", "LOCAL", "REMOTE", "QUALITY", "STATE"])
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            vec![
+                Constraint::Min(18),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Min(16),
+            ],
+        )
+    } else if medium {
+        (
+            Row::new(["GAME", "SERVER", "VERSION", "STATE"])
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            vec![
+                Constraint::Min(18),
+                Constraint::Length(10),
+                Constraint::Length(18),
+                Constraint::Min(16),
+            ],
+        )
     } else {
-        let s = state.statuses.first().and_then(|x| x.as_ref());
-        f.render_widget(
-            Paragraph::new(status_box_lines(
-                s,
-                state.busy,
-                state.quality_sel.first().copied().flatten(),
-            ))
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("status")
-                    .border_style(Style::default().fg(if state.focus == Focus::Status {
-                        Color::Yellow
-                    } else {
-                        Color::Reset
-                    })),
-            ),
-            chunks[0],
-        );
-    }
+        (
+            Row::new(["GAME", "VERSION", "STATE"])
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            vec![Constraint::Min(18), Constraint::Length(17), Constraint::Min(14)],
+        )
+    };
 
-    // ---- task section: overall bar + one bar per in-flight file ----
-    let task_lines: Vec<Line> = match &state.task {
+    let rows: Vec<Row> = state
+        .paths
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let status = state.statuses.get(i).and_then(|s| s.as_ref());
+            let quality = state.quality_sel.get(i).copied().flatten();
+            let name = match status.and_then(|s| s.as_ref().ok()) {
+                Some(s) if medium => pretty_game(s.game).to_string(),
+                Some(s) => short_game_name(s.game).to_string(),
+                None => folder_name(path),
+            };
+            let (server, local, remote, state_text, state_style) = match status {
+                Some(Ok(s)) => (
+                    s.server.to_string(),
+                    s.local_version.clone().unwrap_or_else(|| "none".into()),
+                    s.remote_version.clone(),
+                    if s.local_version.is_none() {
+                        "not installed"
+                    } else if s.update_available {
+                        "update available"
+                    } else {
+                        "up to date"
+                    },
+                    if s.local_version.is_none() {
+                        Style::default().fg(Color::Red)
+                    } else if s.update_available {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Green)
+                    },
+                ),
+                Some(Err(_)) => (
+                    "?".into(),
+                    "?".into(),
+                    "?".into(),
+                    "status error",
+                    Style::default().fg(Color::Red),
+                ),
+                None => (
+                    "?".into(),
+                    "loading".into(),
+                    "…".into(),
+                    "loading…",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            };
+            let version = if local == remote {
+                local.clone()
+            } else {
+                format!("{local} → {remote}")
+            };
+            let quality = if quality.is_some() {
+                quality.map(|q| q.as_arg().to_string()).unwrap_or_else(|| "—".into())
+            } else {
+                "—".into()
+            };
+            let cells: Vec<Cell> = if wide {
+                vec![
+                    Cell::from(name),
+                    Cell::from(server),
+                    Cell::from(local),
+                    Cell::from(remote),
+                    Cell::from(quality),
+                    Cell::from(Span::styled(state_text, state_style)),
+                ]
+            } else if medium {
+                vec![
+                    Cell::from(name),
+                    Cell::from(server),
+                    Cell::from(version),
+                    Cell::from(Span::styled(state_text, state_style)),
+                ]
+            } else {
+                vec![
+                    Cell::from(name),
+                    Cell::from(version),
+                    Cell::from(Span::styled(state_text, state_style)),
+                ]
+            };
+            Row::new(cells)
+        })
+        .collect();
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(panel(format!("kuro · games ({})", state.paths.len())))
+        .row_highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
+    let visible = chunks[0].height.saturating_sub(3) as usize;
+    let offset = state.active.saturating_sub(visible.saturating_sub(1));
+    let mut ts = TableState::default()
+        .with_selected(Some(state.active))
+        .with_offset(offset);
+    f.render_stateful_widget(table, chunks[0], &mut ts);
+
+    render_task(f, state, chunks[1], false);
+    render_log(f, state, chunks[2], false);
+    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[3]);
+}
+
+fn folder_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or("game").to_string()
+}
+
+fn short_game_name(game: Game) -> &'static str {
+    match game {
+        Game::WuWa => "WuWa",
+        Game::Pgr => "PGR",
+    }
+}
+
+fn ui_detail(f: &mut Frame, state: &UiState) {
+    let folder = state.paths.get(state.active).map(String::as_str).unwrap_or("");
+    let status = state.statuses.get(state.active).and_then(|s| s.as_ref());
+    let game_name = status
+        .and_then(|s| s.as_ref().ok())
+        .map(|s| pretty_game(s.game).to_string())
+        .unwrap_or_else(|| folder_name(folder));
+    let server = status
+        .and_then(|s| s.as_ref().ok())
+        .map(|s| format!(" › {}", s.server))
+        .unwrap_or_default();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // breadcrumb: kuro › games › <game> › <server>
+            Constraint::Length(9), // status: the open game only
+            Constraint::Length(if state.task.is_some() || state.busy { 9 } else { 4 }),
+            Constraint::Min(4),    // log
+            Constraint::Length(1), // footer
+        ])
+        .split(f.area());
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("kuro", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" › games › ", Style::default().fg(Color::DarkGray)),
+            Span::styled(game_name, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(server, Style::default().fg(Color::DarkGray)),
+            Span::styled("    Esc back", Style::default().fg(Color::DarkGray)),
+        ])),
+        chunks[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(status_box_lines(
+            status,
+            state.busy,
+            state.quality_sel.get(state.active).copied().flatten(),
+        ))
+        .wrap(Wrap { trim: true })
+        .block(
+            panel("status").border_style(Style::default().fg(if state.focus == Focus::Status {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            })),
+        ),
+        chunks[1],
+    );
+
+    render_task(f, state, chunks[2], state.focus == Focus::Task);
+    render_log(f, state, chunks[3], state.focus == Focus::Log);
+    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[4]);
+}
+
+fn task_lines(state: &UiState) -> Vec<Line<'_>> {
+    match &state.task {
         None => vec![Line::raw("idle")],
         Some(t) => {
             let mut v = vec![
@@ -1599,27 +1825,24 @@ fn ui(f: &mut Frame, state: &UiState) {
             }
             v
         }
-    };
-    f.render_widget(
-        Paragraph::new(task_lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("task")
-                .border_style(Style::default().fg(if state.focus == Focus::Task {
-                    Color::Yellow
-                } else {
-                    Color::Reset
-                })),
-        ),
-        chunks[1],
-    );
+    }
+}
 
-    // ---- log panel: wrap + scroll window (PgUp/PgDn) ----
+fn render_task(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect, focused: bool) {
+    f.render_widget(
+        Paragraph::new(task_lines(state)).wrap(Wrap { trim: true }).block(
+            panel("task").border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray })),
+        ),
+        area,
+    );
+}
+
+fn log_lines(state: &UiState) -> Vec<Line<'_>> {
     // Build only the 60 rows on screen. Materialising the whole 200-line window
     // and cloning it every frame was work the Paragraph never sees.
     let max_scroll = state.logs.len().min(200).saturating_sub(1);
     let scroll = state.log_scroll.min(max_scroll);
-    let log_lines: Vec<Line> = state
+    state
         .logs
         .iter()
         .rev()
@@ -1627,50 +1850,90 @@ fn ui(f: &mut Frame, state: &UiState) {
         .skip(scroll)
         .take(60)
         .map(|l| Line::raw(l.as_str()))
-        .collect();
+        .collect()
+}
+
+fn render_log(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect, focused: bool) {
     f.render_widget(
-        Paragraph::new(log_lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("log (↑/↓ PgUp/PgDn)")
-                .border_style(Style::default().fg(if state.focus == Focus::Log {
-                    Color::Yellow
-                } else {
-                    Color::Reset
-                })),
+        Paragraph::new(log_lines(state)).wrap(Wrap { trim: true }).block(
+            panel("log (↑/↓ PgUp/PgDn)").border_style(Style::default().fg(if focused {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            })),
         ),
-        chunks[2],
+        area,
     );
+}
 
-    let footer = format!(
-        "{} | p: play  k: kill  r: refresh  s: sync  i: install  Q: quality  h: help  q: quit{}",
-        if state.paths.len() > 1 {
-            format!("Tab: focus  ←/→: game ({}/{})", state.active + 1, state.paths.len())
-        } else {
-            "Tab: focus".to_string()
-        },
-        if state.busy { "   [busy]" } else { "" }
-    );
-    f.render_widget(Paragraph::new(Line::raw(footer)), chunks[3]);
+fn footer(state: &UiState, width: u16) -> Line<'static> {
+    let mut spans = Vec::new();
+    let keys: &[(&str, &str)] = match (state.screen, width < 84) {
+        (Screen::Games, false) => &[
+            ("↑↓", "select"),
+            ("Enter", "open"),
+            ("i", "install"),
+            ("r", "refresh"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        (Screen::Games, true) => &[("↑↓", "select"), ("Enter", "open"), ("i", "install"), ("q", "quit")],
+        (Screen::Detail, false) => &[
+            ("Esc", "back"),
+            ("p", "play"),
+            ("d", "update"),
+            ("s", "sync"),
+            ("Q", "quality"),
+            ("r", "refresh"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        (Screen::Detail, true) => &[
+            ("Esc", "back"),
+            ("p", "play"),
+            ("d", "update"),
+            ("s", "sync"),
+            ("q", "quit"),
+        ],
+    };
+    for (i, (key, label)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray)));
+    }
+    if state.busy {
+        spans.push(Span::styled(
+            "   [busy]",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
 
-    // overlays: help / install modal
+/// Modals overlay whichever screen is active. They are shared, so the list and
+/// the detail do not grow their own copies.
+fn render_overlays(f: &mut Frame, state: &UiState) {
     if state.show_help {
         let help_lines: Vec<Line> = vec![
             Line::raw("kuro — Kuro Games launcher"),
             Line::raw(""),
-            Line::raw("  p play         k force-kill      Q quality"),
-            Line::raw("  i install      r refresh         a apply update"),
-            Line::raw("  d update / predownload   s sync / repair   c switch server"),
-            Line::raw("  Tab focus   <-/-> game   Up/Down scroll log   q quit"),
+            Line::raw("  Games  ↑↓ select · Enter open · i install · r refresh · q quit"),
+            Line::raw("  Game   Esc back · p play · d update · s sync · a apply"),
+            Line::raw("         Q quality · c switch server · k force-kill · r refresh"),
+            Line::raw("         Tab focus panels · ↑↓ / PgUp / PgDn scroll the log"),
             Line::raw(""),
             Line::raw("Install dialog"),
-            Line::raw("  w/p game   c/b/g server   f pack   t path   s Steam   Enter go"),
+            Line::raw("  w/p game · c/b/g server · f pack · t path · s Steam · Enter go"),
             Line::raw(""),
             Line::raw("From a shell"),
-            Line::raw("  kuro install wuwa cn ~/Games/WutheringWaves --quality hd"),
-            Line::raw("  kuro sync ~/Games/WutheringWaves --quality uhd"),
-            Line::raw("  kuro pack ~/Games/WutheringWaves uhd"),
-            Line::raw("  kuro install pgr global ~/PGR"),
+            Line::raw("  kuro update FOLDER --check"),
+            Line::raw("  kuro sync FOLDER"),
+            Line::raw("  kuro pack FOLDER hd"),
             Line::raw(""),
             Line::raw("h / ? / Esc to close"),
         ];
@@ -1885,7 +2148,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, default_folder, parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, UiState,
+        body_choice, default_folder, parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, Screen,
+        UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, Quality, Server};
 
@@ -1948,6 +2212,10 @@ mod tests {
         state.show_help = false;
         state.install = Some(InstallDraft::new("/tmp/kuro-demo".into()));
         println!("=== INSTALL PANEL ===\n{}", render_to_string(&state, 100, 34));
+
+        state.install = None;
+        state.screen = Screen::Detail;
+        println!("=== DETAIL ===\n{}", render_to_string(&state, 100, 34));
     }
 
     /// The help overlay is the densest panel; assert it fits (nothing clipped)
@@ -2024,6 +2292,7 @@ mod tests {
     #[test]
     fn status_quality_line_is_wuwa_only() {
         let state = |game, server| UiState {
+            screen: Screen::Detail,
             paths: vec!["/games/x".into()],
             statuses: vec![Some(Ok(GameStatus {
                 game,
@@ -2035,14 +2304,67 @@ mod tests {
             ..UiState::default()
         };
 
-        let pgr = render_to_string(&state(Game::Pgr, Server::Global), 60, 20);
+        let pgr = render_to_string(&state(Game::Pgr, Server::Global), 80, 30);
         assert!(!pgr.contains("quality:"), "PGR box shows a quality line:\n{pgr}");
 
-        let wuwa = render_to_string(&state(Game::WuWa, Server::Cn), 60, 20);
+        let wuwa = render_to_string(&state(Game::WuWa, Server::Cn), 80, 30);
         assert!(
             wuwa.contains("quality: not set"),
             "WuWa box lost its quality line:\n{wuwa}"
         );
+    }
+
+    fn two_games() -> UiState {
+        let status = |game, server, local: &str, remote: &str| {
+            Some(Ok(GameStatus {
+                game,
+                server,
+                local_version: Some(local.into()),
+                remote_version: remote.into(),
+                update_available: local != remote,
+            }))
+        };
+        UiState {
+            paths: vec!["/games/Wuthering Waves".into(), "/games/Punishing Gray Raven".into()],
+            statuses: vec![
+                status(Game::WuWa, Server::Cn, "3.7.1", "3.8.0"),
+                status(Game::Pgr, Server::Global, "4.9.0", "4.9.0"),
+            ],
+            quality_sel: vec![Some(Quality::Hd), None],
+            ..UiState::default()
+        }
+    }
+
+    /// The root screen lists both games as rows, never as side-by-side status
+    /// boxes. This is the "one page, one game" contract at the list level.
+    #[test]
+    fn games_screen_lists_rows_without_detail_boxes() {
+        let out = render_to_string(&two_games(), 100, 30);
+        assert!(out.contains("GAME"), "games table header missing:\n{out}");
+        assert!(out.contains("Wuthering Waves"), "WuWa row missing:\n{out}");
+        assert!(out.contains("Punishing: Gray Raven"), "PGR row missing:\n{out}");
+        assert!(
+            out.contains("update available"),
+            "the list lost the update state:\n{out}"
+        );
+        assert!(!out.contains("game:"), "the list leaked a detail status box:\n{out}");
+        assert!(!out.contains("server:"), "the list leaked a detail status box:\n{out}");
+    }
+
+    /// The detail screen renders exactly one game. The other game must not be
+    /// anywhere in the frame, which is the user's explicit requirement.
+    #[test]
+    fn detail_screen_shows_only_the_open_game() {
+        let mut state = two_games();
+        state.screen = Screen::Detail;
+        state.active = 0;
+        let out = render_to_string(&state, 100, 30);
+        assert!(out.contains("Wuthering Waves"), "open game missing:\n{out}");
+        assert!(
+            !out.contains("Punishing: Gray Raven"),
+            "another game is on the detail page:\n{out}"
+        );
+        assert!(out.contains("Esc back"), "detail page lost the back hint:\n{out}");
     }
 
     #[test]
