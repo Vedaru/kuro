@@ -1706,6 +1706,7 @@ async fn run(
                             Err(e) => TaskEnd::Failed(e.clone()),
                         });
                         t.handle = None;
+                        t.files.clear();
                         target
                     };
                     match &r {

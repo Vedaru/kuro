@@ -465,7 +465,6 @@ impl GameManager {
             let size = res.size;
             let chunk_infos = res.chunk_infos.clone();
             let md5 = res.md5.clone();
-            let dest = res.dest.clone();
             let name = item.name.clone();
             let item_size = item.size;
             let http = self.http.clone();
@@ -482,7 +481,7 @@ impl GameManager {
                         total: item_size,
                     })
                     .await;
-                download_file(&http, &urls, &tmp, size, &chunk_infos, &md5, &dest, Some(&tx), &budget).await?;
+                download_file(&http, &urls, &tmp, size, &chunk_infos, &md5, &name, Some(&tx), &budget).await?;
                 std::fs::rename(&tmp, &staged)?;
                 let _ = tx.send(ProgressEvent::GroupDone { name, bytes: item_size }).await;
                 Ok::<_, Error>(())
@@ -1342,61 +1341,72 @@ impl GameManager {
             let _ = tx.send(ProgressEvent::SetQueued { count: to_fix.len() }).await;
         }
         let sem = Arc::new(tokio::sync::Semaphore::new(FILE_CONCURRENCY));
-        let mut handles = tokio::task::JoinSet::new();
         let cdn_nodes: Arc<Vec<String>> = Arc::new(cdn_nodes.iter().map(|s| s.to_string()).collect());
-        for item in to_fix {
-            let sem = sem.clone();
-            let http = self.http.clone();
-            let budget = self.budget.clone();
-            let game_folder = self.game_folder.clone();
-            let cache = cache.clone();
-            let cdn_nodes = cdn_nodes.clone();
-            let base = base.to_string();
-            let tx = tx.clone();
-            handles.spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
-                let urls = node_urls(&cdn_nodes, |n| ApiClient::resource_url(n, &from, &item.dest));
-                let key = normalise(&item.dest);
-                let game_path = game_folder.join(&key);
-                std::fs::create_dir_all(game_path.parent().unwrap())?;
-                let tmp = tmp_sibling(&game_path, "sync");
-                download_file(
-                    &http,
-                    &urls,
-                    &tmp,
-                    item.size,
-                    &item.chunk_infos,
-                    &item.md5,
-                    &item.dest,
-                    tx.as_ref(),
-                    &budget,
-                )
-                .await?;
-                safe_replace(&tmp, &game_path)?;
-                cache.record_file(&key, &game_path, &item.md5);
-                Ok::<_, Error>((item.dest, item.size))
-            });
-        }
-        // GroupDone in completion order, not spawn order: a slow first file
-        // must not stall progress reporting for every file after it.
-        while let Some(joined) = handles.join_next().await {
-            let inner: std::result::Result<(String, u64), Error> =
-                joined.map_err(|e| Error::Patch(format!("repair join: {e}")))?;
-            match inner {
-                Ok((dest, size)) => {
-                    report.repaired += 1;
-                    report.repaired_bytes += size;
-                    if let Some(tx) = &tx {
-                        let _ = tx
-                            .send(ProgressEvent::GroupDone {
-                                name: dest,
-                                bytes: size,
-                            })
-                            .await;
+        // Spawn repair work in bounded batches. `FILE_CONCURRENCY` limits how
+        // many downloads run, but a task per manifest item would hold one
+        // future per file for the whole run (PGR has ~85k), which is exactly
+        // the second copy a concurrent install cannot afford.
+        let mut pending = to_fix.into_iter();
+        loop {
+            let batch: Vec<_> = pending.by_ref().take(FILE_CONCURRENCY * 16).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let mut handles = tokio::task::JoinSet::new();
+            for item in batch {
+                let sem = sem.clone();
+                let http = self.http.clone();
+                let budget = self.budget.clone();
+                let game_folder = self.game_folder.clone();
+                let cache = cache.clone();
+                let cdn_nodes = cdn_nodes.clone();
+                let base = base.to_string();
+                let tx = tx.clone();
+                handles.spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let from = item.from_folder.clone().unwrap_or_else(|| base.clone());
+                    let urls = node_urls(&cdn_nodes, |n| ApiClient::resource_url(n, &from, &item.dest));
+                    let key = normalise(&item.dest);
+                    let game_path = game_folder.join(&key);
+                    std::fs::create_dir_all(game_path.parent().unwrap())?;
+                    let tmp = tmp_sibling(&game_path, "sync");
+                    download_file(
+                        &http,
+                        &urls,
+                        &tmp,
+                        item.size,
+                        &item.chunk_infos,
+                        &item.md5,
+                        &item.dest,
+                        tx.as_ref(),
+                        &budget,
+                    )
+                    .await?;
+                    safe_replace(&tmp, &game_path)?;
+                    cache.record_file(&key, &game_path, &item.md5);
+                    Ok::<_, Error>((item.dest, item.size))
+                });
+            }
+            // GroupDone in completion order, not spawn order: a slow first file
+            // must not stall progress reporting for every file after it.
+            while let Some(joined) = handles.join_next().await {
+                let inner: std::result::Result<(String, u64), Error> =
+                    joined.map_err(|e| Error::Patch(format!("repair join: {e}")))?;
+                match inner {
+                    Ok((dest, size)) => {
+                        report.repaired += 1;
+                        report.repaired_bytes += size;
+                        if let Some(tx) = &tx {
+                            let _ = tx
+                                .send(ProgressEvent::GroupDone {
+                                    name: dest,
+                                    bytes: size,
+                                })
+                                .await;
+                        }
                     }
+                    Err(e) => report.failed.push(e.to_string()),
                 }
-                Err(e) => report.failed.push(e.to_string()),
             }
         }
 
