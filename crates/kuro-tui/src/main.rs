@@ -194,16 +194,8 @@ struct InstallDraft {
     game: Game,
     server: Server,
     target: String,
-    suggested: String,
-    /// True while typing the target path.
-    edit_target: bool,
-    /// Which row the arrows act on: 0 game, 1 server, 2 pack, 3 folder, 4 install.
-    field: usize,
     /// The first typed key replaces the path instead of appending to it.
-    fresh_target: bool,
-    /// Which quality pack's body to fetch. WuWa only — PGR (Unity) has no
-    /// `Client/Content/<TIER>` bodies, so it stays on `All`.
-    body: BodyChoice,
+    fresh: bool,
 }
 
 impl InstallDraft {
@@ -211,70 +203,8 @@ impl InstallDraft {
         Self {
             game: Game::WuWa,
             server: Server::Cn,
-            target: target.clone(),
-            suggested: target,
-            edit_target: false,
-            field: 3,
-            fresh_target: false,
-            body: BodyChoice::All,
-        }
-    }
-
-    /// Cycle the pack this install fetches: all → sd → hd → uhd → all.
-    ///
-    /// PGR has no bodies at all, so there is nothing to cycle and the choice
-    /// stays `All` — picking one would only earn a manifest that cannot serve
-    /// it (see `body_choice`).
-    fn cycle_body(&mut self) {
-        if !self.game.uses_quality_tiers() {
-            self.body = BodyChoice::All;
-            return;
-        }
-        self.body = match self.body {
-            BodyChoice::All | BodyChoice::Prefer(_) => BodyChoice::Only(Quality::Sd),
-            BodyChoice::Only(Quality::Sd) => BodyChoice::Only(Quality::Hd),
-            BodyChoice::Only(Quality::Hd) => BodyChoice::Only(Quality::Uhd),
-            BodyChoice::Only(Quality::Uhd) => BodyChoice::All,
-        };
-    }
-
-    /// Switch title in the dialog. A folder the user has not edited follows
-    /// the game's default so PGR does not install into the WuWa path.
-    fn set_game(&mut self, game: Game) {
-        if self.target == self.suggested {
-            self.suggested = default_folder_for(game);
-            self.target = self.suggested.clone();
-        }
-        self.game = game;
-        if game == Game::Pgr {
-            self.body = BodyChoice::All;
-            self.server = Server::Global;
-        } else {
-            self.server = Server::Cn;
-        }
-    }
-}
-
-/// How a body choice reads in the UI.
-fn body_label(body: BodyChoice) -> String {
-    match body {
-        BodyChoice::All => "all".to_string(),
-        BodyChoice::Only(q) | BodyChoice::Prefer(q) => q.as_arg().to_ascii_lowercase(),
-    }
-}
-
-/// Left/right server cycle. PGR has no Bilibili channel.
-fn next_server(game: Game, server: Server) -> Server {
-    if game == Game::Pgr {
-        match server {
-            Server::Global => Server::Cn,
-            _ => Server::Global,
-        }
-    } else {
-        match server {
-            Server::Cn => Server::Bilibili,
-            Server::Bilibili => Server::Global,
-            Server::Global => Server::Cn,
+            target,
+            fresh: true,
         }
     }
 }
@@ -340,7 +270,6 @@ fn draft_for_active(state: &UiState) -> InstallDraft {
     if pgr {
         draft.game = Game::Pgr;
         draft.server = Server::Global;
-        draft.body = BodyChoice::All;
     }
     draft
 }
@@ -1359,70 +1288,35 @@ async fn run(
                     continue;
                 }
 
-                let mut start_install: Option<(Game, Server, String, BodyChoice)> = None;
+                let mut start_install: Option<(Game, Server, String)> = None;
                 if let Some(draft) = state.install.as_mut() {
-                    if draft.edit_target {
-                        // typing the target path
-                        match key.code {
-                            KeyCode::Char(c) => {
-                                if draft.fresh_target {
-                                    draft.target.clear();
-                                    draft.fresh_target = false;
-                                }
-                                draft.target.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                if draft.fresh_target {
-                                    draft.target.clear();
-                                    draft.fresh_target = false;
-                                } else {
-                                    draft.target.pop();
-                                }
-                            }
-                            KeyCode::Enter | KeyCode::Esc => {
-                                if draft.target.trim().is_empty() {
-                                    draft.target = draft.suggested.clone();
-                                }
-                                draft.edit_target = false;
-                                draft.field = 4;
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
                     match key.code {
-                        KeyCode::Up => draft.field = draft.field.saturating_sub(1),
-                        KeyCode::Down => draft.field = (draft.field + 1).min(4),
-                        KeyCode::Left | KeyCode::Right => match draft.field {
-                            0 => draft.set_game(if draft.game == Game::WuWa {
-                                Game::Pgr
-                            } else {
-                                Game::WuWa
-                            }),
-                            1 => draft.server = next_server(draft.game, draft.server),
-                            2 => draft.cycle_body(),
-                            _ => {}
-                        },
-                        KeyCode::Enter => {
-                            if draft.field == 3 {
-                                draft.edit_target = true;
-                                draft.fresh_target = true;
-                            } else if draft.field == 4 {
-                                if draft.target.trim().is_empty() {
-                                    draft.target = draft.suggested.clone();
-                                }
-                                start_install = Some((draft.game, draft.server, draft.target.clone(), draft.body));
+                        KeyCode::Char(c) => {
+                            if draft.fresh {
+                                draft.target.clear();
+                                draft.fresh = false;
                             }
+                            draft.target.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            if draft.fresh {
+                                draft.target.clear();
+                                draft.fresh = false;
+                            } else {
+                                draft.target.pop();
+                            }
+                        }
+                        KeyCode::Enter if !draft.target.trim().is_empty() => {
+                            start_install = Some((draft.game, draft.server, draft.target.clone()));
                         }
                         KeyCode::Esc => state.install = None,
                         _ => {}
                     }
-                    // stay in the modal unless Enter was pressed
                     if start_install.is_none() {
                         continue;
                     }
                 }
-                if let Some((game, server, target, body)) = start_install {
+                if let Some((game, server, target)) = start_install {
                     state.install = None;
                     if !state.busy {
                         state.busy = true;
@@ -1433,20 +1327,10 @@ async fn run(
                         });
                         notify(
                             &mut state,
-                            match body {
-                                BodyChoice::All => {
-                                    format!("installing {} ({}) into {target}", pretty_game(game), server)
-                                }
-                                _ => format!(
-                                    "installing {} ({}) into {target} — quality pack {}",
-                                    pretty_game(game),
-                                    server,
-                                    body_label(body)
-                                ),
-                            },
+                            format!("installing {} ({}) into {target}", pretty_game(game), server),
                         );
                         state.install_target = Some(target.clone());
-                        state.task_handle = Some(spawn_install(&tx, &target, game, server, body));
+                        state.task_handle = Some(spawn_install(&tx, &target, game, server, BodyChoice::All));
                     }
                     // The Enter that started the install belongs to the modal,
                     // not to the games list (otherwise it also opens Detail).
@@ -2563,7 +2447,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             Line::raw("       Tab: status / activity"),
             Line::raw("Clean  Q -> x removes the highlighted tier"),
             Line::raw("Stop   Ctrl+C stops a running download · Esc backs out"),
-            Line::raw("Install i · ↑↓ select · ←→ change · Enter edit folder/install"),
+            Line::raw("Install i · type the folder · Enter install · Esc cancel"),
             Line::raw("Shell  kuro update FOLDER --check|--download|--apply"),
             Line::raw("       kuro pack FOLDER hd --remove"),
             Line::raw("Debug  kuro --debug -> ~/.local/state/kuro/kuro.log"),
@@ -2631,74 +2515,20 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             area,
         );
     } else if let Some(draft) = state.install.as_ref() {
-        let modal_lines: Vec<Line> = if draft.edit_target {
-            vec![
-                Line::styled("Install to?", Style::default().add_modifier(Modifier::BOLD)),
-                Line::from(vec![
-                    Span::raw("  "),
-                    if draft.target.is_empty() {
-                        dim(draft.suggested.clone())
-                    } else {
-                        strong(format!("{}_", draft.target))
-                    },
-                ]),
-                Line::styled("Enter done · Esc back", Style::default().fg(Color::Cyan)),
-            ]
+        let folder = if draft.fresh {
+            display_path(&draft.target)
         } else {
-            let selected = |i: usize| draft.field == i;
-            let cursor = |i: usize| {
-                if selected(i) {
-                    accent("▶ ")
-                } else {
-                    Span::raw("  ")
-                }
-            };
-            let row = |i: usize, label: &'static str, value: String| {
-                Line::from(vec![
-                    cursor(i),
-                    dim(label),
-                    if selected(i) { accent(value) } else { strong(value) },
-                ])
-            };
-            let game = if matches!(draft.game, Game::WuWa) {
-                "wuwa"
-            } else {
-                "pgr"
-            };
-            let pack = if draft.game.uses_quality_tiers() {
-                body_label(draft.body)
-            } else {
-                "—".into()
-            };
-            vec![
-                Line::styled("Install a new game", Style::default().add_modifier(Modifier::BOLD)),
-                row(0, "game    ", game.to_string()),
-                row(1, "server  ", draft.server.to_string()),
-                row(2, "pack    ", pack),
-                Line::from(vec![
-                    cursor(3),
-                    dim("folder  "),
-                    if selected(3) {
-                        accent(display_path(&draft.target))
-                    } else {
-                        strong(display_path(&draft.target))
-                    },
-                ]),
-                Line::from(vec![
-                    cursor(4),
-                    if selected(4) { accent("install") } else { dim("install") },
-                ]),
-                Line::styled(
-                    match draft.field {
-                        3 => "↑↓ select · Enter edit folder",
-                        4 => "↑↓ select · Enter install",
-                        _ => "↑↓ select · ←→ change",
-                    },
-                    Style::default().fg(Color::Cyan),
-                ),
-            ]
+            draft.target.clone()
         };
-        let area = centered_rect(75, 50, f.area());
+        let modal_lines = vec![
+            Line::styled(
+                format!("Install {} ({})", short_game_name(draft.game), draft.server),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from(vec![Span::raw("  "), strong(format!("{folder}_"))]),
+            Line::styled("Enter install · Esc cancel", Style::default().fg(Color::Cyan)),
+        ];
+        let area = centered_rect(65, 35, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(modal_lines)
@@ -2822,9 +2652,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, checkout_possible, cli_bar, debug_log, default_folder, default_folder_for, draft_for_active,
-        init_debug, install_target_for, parse_quality_arg, remember_install_path, split_play_args, ui, CliProgress,
-        InstallDraft, QualityDraft, Screen, UiState,
+        body_choice, checkout_possible, cli_bar, debug_log, default_folder, draft_for_active, init_debug,
+        install_target_for, parse_quality_arg, remember_install_path, split_play_args, ui, CliProgress, InstallDraft,
+        QualityDraft, Screen, UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, ProgressEvent, Quality, Server};
 
@@ -3178,29 +3008,15 @@ mod tests {
         let draft = draft_for_active(&state);
         assert_eq!(draft.game, Game::Pgr);
         assert_eq!(draft.server, Server::Global);
-        assert_eq!(draft.suggested, "/tmp/Punishing Gray Raven");
+        assert_eq!(draft.target, "/tmp/Punishing Gray Raven");
+        assert!(draft.fresh);
     }
 
     #[test]
-    fn install_modal_starts_on_the_folder_not_typing() {
+    fn install_starts_with_the_suggested_folder() {
         let draft = InstallDraft::new("/tmp/x".into());
-        assert!(!draft.edit_target);
-        assert_eq!(draft.field, 3);
         assert_eq!(draft.target, "/tmp/x");
-    }
-
-    #[test]
-    fn switching_game_moves_an_untouched_folder() {
-        let mut draft = InstallDraft::new("/tmp/custom".into());
-        draft.set_game(Game::Pgr);
-        assert_eq!(draft.game, Game::Pgr);
-        assert_eq!(draft.server, Server::Global);
-        assert_eq!(draft.target, default_folder_for(Game::Pgr));
-
-        let mut edited = InstallDraft::new("/tmp/custom".into());
-        edited.target = "/tmp/override".into();
-        edited.set_game(Game::Pgr);
-        assert_eq!(edited.target, "/tmp/override");
+        assert!(draft.fresh);
     }
 
     /// The CLI bar is one running total, not a per-file row. Verify fills it
@@ -3278,25 +3094,6 @@ mod tests {
         assert_eq!(body_choice(Some(Game::Pgr), &args(&[])), Ok(BodyChoice::All));
     }
 
-    #[test]
-    fn install_dialog_cycles_packs_and_pgr_has_none() {
-        let mut draft = InstallDraft::new("/tmp/kuro-demo".into());
-        assert_eq!(draft.body, BodyChoice::All);
-        draft.cycle_body();
-        assert_eq!(draft.body, BodyChoice::Only(Quality::Sd));
-        draft.cycle_body();
-        assert_eq!(draft.body, BodyChoice::Only(Quality::Hd));
-        draft.cycle_body();
-        assert_eq!(draft.body, BodyChoice::Only(Quality::Uhd));
-        draft.cycle_body();
-        assert_eq!(draft.body, BodyChoice::All);
-
-        // Switching the dialog to PGR resets the pack: PGR can serve none.
-        draft.cycle_body();
-        draft.game = Game::Pgr;
-        draft.cycle_body();
-        assert_eq!(draft.body, BodyChoice::All);
-    }
     /// The allocator must keep jemalloc's default 10 s dirty decay. A
     /// `_rjem_malloc_conf` override (the zero-decay experiment) would change
     /// this and raise the CPU cost; catch that here, not on a laptop.
