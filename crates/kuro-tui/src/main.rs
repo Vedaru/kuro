@@ -183,8 +183,9 @@ struct QualityDraft {
 struct InstallDraft {
     game: Game,
     server: Server,
-    /// Install target folder (editable).
+    /// Empty until the user types; Enter adopts `suggested`.
     target: String,
+    suggested: String,
     /// True while typing the target path.
     edit_target: bool,
     /// Which quality pack's body to fetch. WuWa only — PGR (Unity) has no
@@ -197,8 +198,9 @@ impl InstallDraft {
         Self {
             game: Game::WuWa,
             server: Server::Cn,
-            target,
-            edit_target: false,
+            target: String::new(),
+            suggested: target,
+            edit_target: true,
             body: BodyChoice::All,
         }
     }
@@ -1287,7 +1289,12 @@ async fn run(
                             KeyCode::Backspace => {
                                 draft.target.pop();
                             }
-                            KeyCode::Enter | KeyCode::Esc => draft.edit_target = false,
+                            KeyCode::Enter | KeyCode::Esc => {
+                                if draft.target.trim().is_empty() {
+                                    draft.target = draft.suggested.clone();
+                                }
+                                draft.edit_target = false;
+                            }
                             _ => {}
                         }
                         continue;
@@ -1308,11 +1315,19 @@ async fn run(
                         KeyCode::Char('f') => draft.cycle_body(),
                         KeyCode::Char('s') => {
                             if let Some(steam) = &state.steam {
-                                draft.target = default_game_dir(steam, draft.game).to_string_lossy().into_owned();
+                                let path = default_game_dir(steam, draft.game).to_string_lossy().into_owned();
+                                draft.suggested = path.clone();
+                                draft.target = path;
                             }
                         }
-                        KeyCode::Char('t') => draft.edit_target = true,
+                        KeyCode::Char('t') => {
+                            draft.target.clear();
+                            draft.edit_target = true;
+                        }
                         KeyCode::Enter => {
+                            if draft.target.trim().is_empty() {
+                                draft.target = draft.suggested.clone();
+                            }
                             start_install = Some((draft.game, draft.server, draft.target.clone(), draft.body));
                         }
                         KeyCode::Esc => state.install = None,
@@ -1411,6 +1426,11 @@ async fn run(
                                     format!("{} has no quality tiers — it launches as-is", pretty_game(game)),
                                 );
                             }
+                        }
+                    }
+                    KeyCode::Char('i') => {
+                        if !state.busy {
+                            state.install = Some(InstallDraft::new(install_target_for(&state)));
                         }
                     }
                     KeyCode::Tab => {
@@ -1964,7 +1984,10 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                         Server::Cn => Server::Bilibili,
                         _ => Server::Cn,
                     };
-                    let report = mgr.checkout(target).await.map_err(|e| e.to_string())?;
+                    let report = mgr
+                        .checkout_inner(target, None, None, ptx.take())
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok(format!(
                         "checkout complete — {} → {}, {} file(s) swapped, {} removed, now v{}",
                         report.from_server,
@@ -2324,6 +2347,7 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
             ("d", "predownload"),
             ("a", "apply"),
             ("s", "sync"),
+            ("i", "install"),
             ("Q", "quality"),
             ("r", "refresh"),
             ("?", "help"),
@@ -2375,7 +2399,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             Line::raw("       Tab: status / activity"),
             Line::raw("Clean  Q -> x removes the highlighted tier"),
             Line::raw("Stop   Ctrl+C stops a running download · Esc backs out"),
-            Line::raw("Install i from Games · w/p game · c/b/g server · f pack · t path"),
+            Line::raw("Install i from Games or a game page · w/p game · c/b/g server · f pack · t path"),
             Line::raw("Shell  kuro update FOLDER --check|--download|--apply"),
             Line::raw("       kuro pack FOLDER hd --remove"),
             Line::raw("Debug  kuro --debug -> ~/.local/state/kuro/kuro.log"),
@@ -2444,7 +2468,11 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
         );
     } else if let Some(draft) = state.install.as_ref() {
         let mut modal_lines: Vec<Line> = vec![
-            Line::raw("Install a new game"),
+            Line::raw(if draft.edit_target {
+                "Where should the game be installed?"
+            } else {
+                "Install a new game"
+            }),
             Line::raw(""),
             Line::raw(format!(
                 "  game    [w] wuwa  [p] pgr                → {}",
@@ -2466,13 +2494,24 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             } else {
                 format!("  pack    n/a — {} has no quality packs", pretty_game(draft.game))
             }),
+            Line::raw("  folder"),
             Line::raw(if draft.edit_target {
-                "  target  [typing — Enter/Esc to stop]"
+                if draft.target.is_empty() {
+                    format!("    {}  (suggested)", draft.suggested)
+                } else {
+                    format!("    {}_", draft.target)
+                }
             } else {
-                "  target"
+                format!("    {}", draft.target)
             }),
-            Line::raw(format!("          {}", draft.target)),
-            Line::raw("          [t] type path    [s] Steam default"),
+            Line::styled(
+                if draft.edit_target {
+                    "    type a path · Enter continue · Esc stop typing"
+                } else {
+                    "    [t] type path    [s] Steam default"
+                },
+                Style::default().fg(Color::Cyan),
+            ),
             Line::raw(""),
         ];
         match &state.steam {
@@ -2481,7 +2520,11 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
         }
         modal_lines.push(Line::raw(""));
         modal_lines.push(Line::styled(
-            "  Enter install      Esc cancel",
+            if draft.edit_target {
+                "  Enter continue      Esc stop typing"
+            } else {
+                "  Enter install      Esc cancel"
+            },
             Style::default().fg(Color::Cyan),
         ));
         modal_lines.push(Line::raw(""));

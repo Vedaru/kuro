@@ -113,6 +113,7 @@ async fn checkout_swaps_the_manifest_delta_and_updates_appid() {
             Server::Bilibili,
             Some(&format!("{server}/target.json")),
             Some(&format!("{server}/source.json")),
+            None,
         )
         .await
         .unwrap();
@@ -172,6 +173,7 @@ async fn checkout_refuses_a_version_skew() {
             Server::Bilibili,
             Some(&format!("{target}/index.json")),
             Some(&format!("{server}/index.json")),
+            None,
         )
         .await
         .unwrap_err()

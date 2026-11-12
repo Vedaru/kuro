@@ -962,7 +962,7 @@ impl GameManager {
     /// updating the appId (CN <-> Bilibili). Global is a different package —
     /// not supported for fast-switch (mirrors ww-manager).
     pub async fn checkout(&self, target: Server) -> Result<CheckoutReport> {
-        self.checkout_inner(target, None, None).await
+        self.checkout_inner(target, None, None, None).await
     }
 
     /// Checkout core, testable with the two channel APIs pointed at local
@@ -977,6 +977,7 @@ impl GameManager {
         target: Server,
         target_api: Option<&str>,
         source_api: Option<&str>,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<CheckoutReport> {
         if matches!(target, Server::Global) || matches!(self.server, Server::Global) {
             return Err(Error::Unsupported(
@@ -1045,6 +1046,20 @@ impl GameManager {
             .iter()
             .filter(|r| !target_dests.contains(r.dest.as_str()))
             .collect();
+        let total: u64 = to_fetch.iter().map(|r| r.size).sum();
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(ProgressEvent::Log(format!(
+                    "switch {} → {}: {} file(s), {:.1} GiB",
+                    self.server,
+                    target,
+                    to_fetch.len(),
+                    total as f64 / (1u64 << 30) as f64
+                )))
+                .await;
+            let _ = tx.send(ProgressEvent::SetTotal { bytes: total }).await;
+            let _ = tx.send(ProgressEvent::SetQueued { count: to_fetch.len() }).await;
+        }
 
         let base = target_cfg.base_url.clone();
         let mut swapped = 0;
@@ -1061,10 +1076,29 @@ impl GameManager {
             let http = self.http.clone();
             let budget = self.budget.clone();
             let sem = sem.clone();
+            let tx = tx.clone();
             handles.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                download_single(&http, &urls, &tmp, Some(size), Some(md5.as_str()), &dest, None, &budget).await?;
+                download_single(
+                    &http,
+                    &urls,
+                    &tmp,
+                    Some(size),
+                    Some(md5.as_str()),
+                    &dest,
+                    tx.as_ref(),
+                    &budget,
+                )
+                .await?;
                 safe_replace(&tmp, &game_path)?;
+                if let Some(tx) = &tx {
+                    let _ = tx
+                        .send(ProgressEvent::GroupDone {
+                            name: dest.clone(),
+                            bytes: size,
+                        })
+                        .await;
+                }
                 Ok::<_, Error>(())
             });
         }
