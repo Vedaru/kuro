@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -134,6 +134,8 @@ struct UiState {
     /// Last user-facing message, shown in the task panel when it is idle.
     notice: Option<String>,
     task: Option<TaskUi>,
+    /// Abort handle for the running task, when it is safe to stop it.
+    task_abort: Option<tokio::task::AbortHandle>,
     busy: bool,
     /// Game folders in the manager; ←/→ switches between them.
     paths: Vec<String>,
@@ -160,6 +162,8 @@ struct QualityDraft {
     game: Game,
     choice: Quality,
     info: QualityInfo,
+    /// Second `x` deletes the highlighted tier.
+    confirm_remove: bool,
 }
 
 /// In-progress install selection.
@@ -218,6 +222,19 @@ fn notify(state: &mut UiState, msg: impl Into<String>) {
     let msg = msg.into();
     debug_log(&msg);
     state.notice = Some(msg);
+}
+
+fn cancel_task(state: &mut UiState) {
+    let Some(handle) = state.task_abort.take() else {
+        notify(state, "this task cannot be stopped");
+        return;
+    };
+    handle.abort();
+    if let Some(task) = state.task.as_mut() {
+        task.finished = Some(Err("cancelled".into()));
+    }
+    state.busy = false;
+    notify(state, "cancelled — partial downloads are resumable");
 }
 
 /// Human-friendly game name for messages.
@@ -350,7 +367,7 @@ usage: kuro [game-folder ...]            launch the TUI (default: auto-detect)
        kuro status [folder]
        kuro sync [folder] [--quality sd|hd|uhd]
        kuro quality <folder> [sd|hd|uhd]
-       kuro pack [folder] <sd|hd|uhd> [--check]   install a quality pack
+       kuro pack [folder] <sd|hd|uhd> [--check|--remove]   install or remove a tier
        kuro update [folder] [--check|--download|--apply]   common + tier deltas
        kuro play <folder> [--quality <sd|hd|uhd>]
        kuro kill <folder>
@@ -542,6 +559,7 @@ fn cli_quality(args: &[String]) -> std::io::Result<()> {
         println!("prefix:   {}", launch::resolve_prefix(path).display());
         println!("\nusage: kuro quality <folder> <sd|hd|uhd>  to set");
         println!("       kuro pack [folder] <sd|hd|uhd>       to install the paks");
+        println!("       kuro pack [folder] <sd|hd|uhd> --remove   to delete them");
         println!("       kuro play [folder] [sd|hd|uhd]       to launch");
         return Ok(());
     };
@@ -728,7 +746,8 @@ async fn cli_update(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `kuro pack [folder] [--quality <sd|hd|uhd>] [--check]` — install a quality
+/// `kuro pack [folder] [--quality <sd|hd|uhd>] [--check|--remove]` — install
+/// or delete a quality
 /// pack from the launcher's pack document, then register it with the launcher.
 ///
 /// This is the only way to get SD or UHD on WuWa 3.7: the channel manifests
@@ -738,7 +757,15 @@ async fn cli_update(args: &[String]) -> std::io::Result<()> {
 async fn cli_pack(args: &[String]) -> std::io::Result<()> {
     let (folder, rest) = split_play_args(args);
     let check_only = rest.iter().any(|a| a == "--check");
-    let rest: Vec<String> = rest.into_iter().filter(|a| a != "--check").collect();
+    let remove = rest.iter().any(|a| a == "--remove");
+    let rest: Vec<String> = rest
+        .into_iter()
+        .filter(|a| !matches!(a.as_str(), "--check" | "--remove"))
+        .collect();
+    if check_only && remove {
+        println!("usage: kuro pack [folder] <sd|hd|uhd> [--check|--remove]");
+        return Ok(());
+    }
     let tier = match parse_quality_arg(&rest) {
         Ok(Some(s)) => match Quality::parse(s) {
             Some(q) => q,
@@ -748,7 +775,7 @@ async fn cli_pack(args: &[String]) -> std::io::Result<()> {
             }
         },
         Ok(None) => {
-            println!("usage: kuro pack [folder] <sd|hd|uhd> [--check]");
+            println!("usage: kuro pack [folder] <sd|hd|uhd> [--check|--remove]");
             return Ok(());
         }
         Err(msg) => {
@@ -765,6 +792,18 @@ async fn cli_pack(args: &[String]) -> std::io::Result<()> {
     };
     if !mgr.game.uses_quality_tiers() {
         println!("{} has no quality packs", pretty_game(mgr.game));
+        return Ok(());
+    }
+    if remove {
+        match mgr.remove_pack(tier).await {
+            Ok(report) => println!(
+                "removed {}: {} file(s), {} freed, launcher records cleared",
+                tier.as_arg(),
+                report.files,
+                fmt_bytes(report.bytes)
+            ),
+            Err(e) => println!("remove error: {e}"),
+        }
         return Ok(());
     }
     match mgr.sync_pack(tier, !check_only, None).await {
@@ -967,6 +1006,15 @@ async fn run(
                 }
                 let path = state.paths[state.active].clone();
 
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if state.busy {
+                        cancel_task(&mut state);
+                    } else {
+                        break;
+                    }
+                    continue;
+                }
+
                 // modal shortcuts take priority
                 if state.show_help {
                     match key.code {
@@ -984,6 +1032,10 @@ async fn run(
                 if let Some(mut draft) = state.quality_modal.take() {
                     let mut close = false;
                     let mut install: Option<Quality> = None;
+                    let mut remove: Option<Quality> = None;
+                    if key.code != KeyCode::Char('x') {
+                        draft.confirm_remove = false;
+                    }
                     match key.code {
                         KeyCode::Char('s') => draft.choice = Quality::Sd,
                         KeyCode::Char('h') => draft.choice = Quality::Hd,
@@ -992,6 +1044,14 @@ async fn run(
                         // leaving the modal, so the status column updates in
                         // place and Enter can then apply it.
                         KeyCode::Char('i') => install = Some(draft.choice),
+                        KeyCode::Char('x') if draft.info.is_installed(draft.choice) => {
+                            if draft.confirm_remove {
+                                remove = Some(draft.choice);
+                                close = true;
+                            } else {
+                                draft.confirm_remove = true;
+                            }
+                        }
                         KeyCode::Enter => {
                             let choice = draft.choice;
                             // Selecting a tier whose paks are not on disk is the
@@ -1020,7 +1080,27 @@ async fn run(
                                 &mut state,
                                 format!("installing {} paks — the game must be closed", tier.as_arg()),
                             );
-                            spawn_simple(&tx, &path, TaskKind::Pack(tier));
+                            state.task_abort = Some(spawn_simple(&tx, &path, TaskKind::Pack(tier)));
+                        } else {
+                            notify(&mut state, "busy — wait for the current task to finish");
+                        }
+                    }
+                    if let Some(tier) = remove {
+                        if !state.busy {
+                            state.busy = true;
+                            state.task = Some(TaskUi {
+                                kind: format!("clean-{}", tier.as_arg().to_ascii_lowercase()),
+                                ..Default::default()
+                            });
+                            state.focus = Focus::Task;
+                            notify(
+                                &mut state,
+                                format!(
+                                    "removing {} paks — launcher records are cleared after the files",
+                                    tier.as_arg()
+                                ),
+                            );
+                            state.task_abort = Some(spawn_simple(&tx, &path, TaskKind::RemovePack(tier)));
                         } else {
                             notify(&mut state, "busy — wait for the current task to finish");
                         }
@@ -1103,7 +1183,7 @@ async fn run(
                                 ),
                             },
                         );
-                        spawn_install(&tx, &target, game, server, body);
+                        state.task_abort = Some(spawn_install(&tx, &target, game, server, body));
                     }
                 }
 
@@ -1118,8 +1198,6 @@ async fn run(
                         KeyCode::Enter => {
                             if let Some(path) = state.paths.get(state.active).cloned() {
                                 state.screen = Screen::Detail;
-                                let opened = pretty_game(active_game(&state));
-                                notify(&mut state, format!("opened {opened}"));
                                 if state.statuses.get(state.active).and_then(|s| s.as_ref()).is_none() {
                                     spawn_status(&tx, &path, state.active);
                                 }
@@ -1139,6 +1217,7 @@ async fn run(
                             }
                         }
                         KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
+                        KeyCode::Esc if state.busy => cancel_task(&mut state),
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         _ => {}
                     }
@@ -1146,6 +1225,7 @@ async fn run(
                 }
 
                 match key.code {
+                    KeyCode::Esc if state.busy => cancel_task(&mut state),
                     KeyCode::Esc => state.screen = Screen::Games,
                     KeyCode::Char('q') => break,
                     KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
@@ -1187,7 +1267,7 @@ async fn run(
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
-                            spawn_predownload(&tx, &path);
+                            state.task_abort = Some(spawn_predownload(&tx, &path));
                         }
                     }
                     KeyCode::Char('a') => {
@@ -1198,6 +1278,7 @@ async fn run(
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
+                            state.task_abort = None;
                             spawn_simple(&tx, &path, TaskKind::Apply);
                         }
                     }
@@ -1209,7 +1290,7 @@ async fn run(
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
-                            spawn_simple(&tx, &path, TaskKind::Sync);
+                            state.task_abort = Some(spawn_simple(&tx, &path, TaskKind::Sync));
                         }
                     }
                     KeyCode::Char('c') if !state.busy => {
@@ -1219,6 +1300,7 @@ async fn run(
                             ..Default::default()
                         });
                         state.focus = Focus::Task;
+                        state.task_abort = None;
                         spawn_simple(&tx, &path, TaskKind::Checkout);
                     }
                     _ => {}
@@ -1313,6 +1395,10 @@ async fn run(
                         t.finished = Some(r);
                     }
                     state.busy = false;
+                    state.task_abort = None;
+                    if let Some(path) = state.paths.get(state.active).cloned() {
+                        state.quality_sel[state.active] = quality::selected(std::path::Path::new(&path));
+                    }
                 }
             }
         }
@@ -1351,7 +1437,12 @@ fn open_quality_draft(folder: &str, state: &UiState) -> QualityDraft {
     let game = active_game(state);
     let info = quality::info(p);
     let choice = info.default_choice();
-    QualityDraft { game, choice, info }
+    QualityDraft {
+        game,
+        choice,
+        info,
+        confirm_remove: false,
+    }
 }
 
 /// Save the chosen preset; log it (the writable marker `-krqlv=` is added
@@ -1466,7 +1557,7 @@ fn auto_detect_games() -> Vec<String> {
     deduped
 }
 
-fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
+fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) -> tokio::task::AbortHandle {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1532,10 +1623,17 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
         }
         .await;
         let _ = tx.send(UiEvent::TaskDone(result)).await;
-    });
+    })
+    .abort_handle()
 }
 
-fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game, server: Server, body: BodyChoice) {
+fn spawn_install(
+    tx: &tokio::sync::mpsc::Sender<UiEvent>,
+    path: &str,
+    game: Game,
+    server: Server,
+    body: BodyChoice,
+) -> tokio::task::AbortHandle {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1559,7 +1657,8 @@ fn spawn_install(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, game: Game
             Err(e) => Err(e.to_string()),
         };
         let _ = tx.send(UiEvent::TaskDone(result)).await;
-    });
+    })
+    .abort_handle()
 }
 
 enum TaskKind {
@@ -1568,9 +1667,11 @@ enum TaskKind {
     Checkout,
     /// Install one quality pack (files + launcher records).
     Pack(Quality),
+    /// Delete one quality pack (files + launcher records).
+    RemovePack(Quality),
 }
 
-fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskKind) {
+fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskKind) -> tokio::task::AbortHandle {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1651,6 +1752,15 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                         )
                     })
                 }
+                TaskKind::RemovePack(tier) => {
+                    let report = mgr.remove_pack(tier).await.map_err(|e| e.to_string())?;
+                    Ok(format!(
+                        "removed {} paks — {} file(s), {:.1} GiB freed, launcher records cleared",
+                        tier.as_arg(),
+                        report.files,
+                        report.bytes as f64 / (1 << 30) as f64
+                    ))
+                }
                 TaskKind::Checkout => {
                     // toggle between cn and bilibili
                     let target = match mgr.server {
@@ -1667,7 +1777,8 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
         }
         .await;
         let _ = tx.send(UiEvent::TaskDone(result)).await;
-    });
+    })
+    .abort_handle()
 }
 
 fn ui(f: &mut Frame, state: &UiState) {
@@ -1708,11 +1819,14 @@ fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
 /// The root screen: one row per installed game, one game per row. The detail
 /// view is a separate screen, so two games are never compared side by side.
 fn ui_games(f: &mut Frame, state: &UiState) {
+    let active = state.task.is_some() || state.busy;
+    let notice_h = u16::from(!active && state.notice.is_some());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5), // games table
-            Constraint::Length(if state.task.is_some() || state.busy { 6 } else { 3 }),
+            Constraint::Length(if active { 6 } else { 0 }),
+            Constraint::Length(notice_h),
             Constraint::Length(1), // footer
         ])
         .split(f.area());
@@ -1847,8 +1961,13 @@ fn ui_games(f: &mut Frame, state: &UiState) {
         .with_offset(offset);
     f.render_stateful_widget(table, chunks[0], &mut ts);
 
-    render_task(f, state, chunks[1], false);
-    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[2]);
+    if active {
+        render_task(f, state, chunks[1], false);
+    }
+    if notice_h > 0 {
+        render_notice(f, state, chunks[2]);
+    }
+    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[3]);
 }
 
 fn folder_name(path: &str) -> String {
@@ -1863,6 +1982,8 @@ fn short_game_name(game: Game) -> &'static str {
 }
 
 fn ui_detail(f: &mut Frame, state: &UiState) {
+    let active = state.task.is_some() || state.busy;
+    let notice_h = u16::from(!active && state.notice.is_some());
     let folder = state.paths.get(state.active).map(String::as_str).unwrap_or("");
     let status = state.statuses.get(state.active).and_then(|s| s.as_ref());
     let game_name = status
@@ -1877,9 +1998,10 @@ fn ui_detail(f: &mut Frame, state: &UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // breadcrumb: kuro › games › <game> › <server>
-            Constraint::Length(9), // status: the open game only
-            Constraint::Min(3),    // activity: task progress or the last message
+            Constraint::Length(1),                       // breadcrumb: kuro › games › <game> › <server>
+            Constraint::Length(9),                       // status: the open game only
+            Constraint::Min(if active { 3 } else { 0 }), // activity while a task runs
+            Constraint::Length(notice_h),
             Constraint::Length(1), // footer
         ])
         .split(f.area());
@@ -1912,16 +2034,18 @@ fn ui_detail(f: &mut Frame, state: &UiState) {
         chunks[1],
     );
 
-    render_task(f, state, chunks[2], state.focus == Focus::Task);
-    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[3]);
+    if active {
+        render_task(f, state, chunks[2], state.focus == Focus::Task);
+    }
+    if notice_h > 0 {
+        render_notice(f, state, chunks[3]);
+    }
+    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[4]);
 }
 
 fn task_lines(state: &UiState) -> Vec<Line<'_>> {
     match &state.task {
-        None => match &state.notice {
-            Some(msg) => vec![Line::raw(msg.as_str())],
-            None => vec![Line::raw("idle")],
-        },
+        None => vec![Line::raw("idle")],
         Some(t) => {
             let mut v = vec![
                 Line::raw(format!("task: {}", t.kind)),
@@ -1951,6 +2075,12 @@ fn task_lines(state: &UiState) -> Vec<Line<'_>> {
                     }),
                 ));
             }
+            if state.busy && state.task_abort.is_some() {
+                v.push(Line::styled(
+                    "Esc / Ctrl+C stops this task",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             v
         }
     }
@@ -1963,6 +2093,15 @@ fn render_task(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect, focu
         ),
         area,
     );
+}
+
+fn render_notice(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect) {
+    if let Some(msg) = &state.notice {
+        f.render_widget(
+            Paragraph::new(Line::styled(format!(" {msg}"), Style::default().fg(Color::DarkGray))),
+            area,
+        );
+    }
 }
 
 fn footer(state: &UiState, width: u16) -> Line<'static> {
@@ -1998,6 +2137,7 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
         ],
     };
     for (i, (key, label)) in keys.iter().enumerate() {
+        let label = if *key == "Esc" && state.busy { "stop" } else { label };
         if i > 0 {
             spans.push(Span::raw("  "));
         }
@@ -2012,6 +2152,12 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
             "   [busy]",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
+        if state.screen == Screen::Games && state.task_abort.is_some() {
+            spans.push(Span::styled(
+                "  Esc stop",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
     }
     Line::from(spans)
 }
@@ -2026,8 +2172,11 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             Line::raw("Game   Esc back · p play · d predownload · a apply"),
             Line::raw("       s sync · Q quality · c switch server · k force-kill"),
             Line::raw("       Tab: status / activity"),
+            Line::raw("Clean  Q -> x removes the highlighted tier"),
+            Line::raw("Stop   Esc / Ctrl+C stops a running download"),
             Line::raw("Install i from Games · w/p game · c/b/g server · f pack · t path"),
             Line::raw("Shell  kuro update FOLDER --check|--download|--apply"),
+            Line::raw("       kuro pack FOLDER hd --remove"),
             Line::raw("Debug  kuro --debug -> ~/.local/state/kuro/kuro.log"),
             Line::raw("h / ? / Esc to close"),
         ];
@@ -2068,14 +2217,23 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "  [s] [h] [u] pick     [i] install",
+            "  [s] [h] [u] pick     [i] install     [x] remove",
             Style::default().fg(Color::Cyan),
         ));
+        if draft.confirm_remove {
+            lines.push(Line::styled(
+                format!(
+                    "  press x again to delete {} paks + launcher records",
+                    draft.choice.as_arg()
+                ),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
         lines.push(Line::styled(
             "  Enter pick + install     Esc close",
             Style::default().fg(Color::Cyan),
         ));
-        let area = centered_rect(68, 46, f.area());
+        let area = centered_rect(68, 52, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(lines)
@@ -2294,6 +2452,7 @@ mod tests {
                 game: Game::WuWa,
                 choice: Quality::Hd,
                 info,
+                confirm_remove: false,
             }),
             ..UiState::default()
         };
@@ -2333,6 +2492,7 @@ mod tests {
             game: Game::WuWa,
             choice: Quality::Hd,
             info,
+            confirm_remove: false,
         });
         let q = render_to_string(&state, 100, 34);
         assert!(q.contains("not installed"), "quality panel missing plain status:\n{q}");
@@ -2340,6 +2500,7 @@ mod tests {
             q.contains("Enter pick + install"),
             "quality panel missing the install hint:\n{q}"
         );
+        assert!(q.contains("[x] remove"), "quality panel missing the remove hint:\n{q}");
         assert!(!q.contains("-krqlv"), "quality panel leaks the raw flag:\n{q}");
     }
 
@@ -2461,6 +2622,37 @@ mod tests {
         );
         assert!(out.contains("Esc back"), "detail page lost the back hint:\n{out}");
         assert!(!out.contains("log ("), "the log panel is still rendered:\n{out}");
+    }
+
+    /// The activity panel is a task view, not a permanent dashboard widget.
+    #[test]
+    fn idle_screens_have_no_activity_panel() {
+        let state = two_games();
+        let games = render_to_string(&state, 100, 30);
+        assert!(
+            !games.contains("activity"),
+            "idle games screen shows the activity panel:\n{games}"
+        );
+        let mut detail = two_games();
+        detail.screen = Screen::Detail;
+        let detail_out = render_to_string(&detail, 100, 30);
+        assert!(
+            !detail_out.contains("activity"),
+            "idle detail screen shows the activity panel:\n{detail_out}"
+        );
+    }
+
+    #[test]
+    fn a_running_task_shows_the_activity_panel() {
+        let mut state = two_games();
+        state.task = Some(super::TaskUi {
+            kind: "predownload".into(),
+            ..Default::default()
+        });
+        state.busy = true;
+        let out = render_to_string(&state, 100, 30);
+        assert!(out.contains("activity"), "activity panel missing:\n{out}");
+        assert!(out.contains("task: predownload"), "task line missing:\n{out}");
     }
 
     #[test]

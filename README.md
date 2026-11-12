@@ -117,7 +117,7 @@ kuro sync <folder> [--quality <sd|hd|uhd>]              # CLI: pack update + ver
 kuro update <folder> [--check | --download | --apply]   # CLI: common + tier deltas
 kuro install <wuwa|pgr> <cn|bilibili|global> <folder> [--quality <sd|hd|uhd>]
 kuro quality <folder> [sd|hd|uhd]                       # CLI: which pack the client mounts
-kuro pack [folder] <sd|hd|uhd> [--check]                # CLI: install one tier + register it
+kuro pack [folder] <sd|hd|uhd> [--check|--remove]       # CLI: install or delete one tier
 kuro --debug [command...]                               # write debug logs to a file
 ```
 
@@ -163,17 +163,28 @@ never compared side by side. There is no log panel.
 
 | Key | Action |
 |-----|--------|
-| `Esc` | back to the games list |
+| `Esc` | back to the games list (stops a running task first) |
 | `p` | play |
 | `d` | predownload (pack document for WuWa CN/Bilibili, base index otherwise) |
 | `a` | apply the downloaded pack predownload, or the base predownload on PGR / WuWa Global |
 | `s` | sync / repair |
 | `c` | checkout server (CN ⇄ Bilibili) |
 | `k` | force-kill a hung client |
-| `Q` | quality preset (`s`/`h`/`u` pick · `i` install that tier's paks · Enter pick + install · saved for `p`) |
+| `Q` | quality preset (`s`/`h`/`u` pick · `i` install · `x` remove · Enter pick + install · saved for `p`) |
 | `r` | refresh this game's status |
 | `Tab` | cycle focus: status → activity |
 | `q` | quit |
+
+While a download, install, sync, or pack task runs, `Esc` or `Ctrl+C` stops
+it. Partial files stay on disk and the next run resumes.
+
+### Cleaning packs
+
+`kuro pack FOLDER hd --remove` deletes `Client/Content/HD` and clears the two
+launcher records. In the TUI, `Q` opens the quality panel and `x` removes the
+highlighted installed tier after a second `x` confirmation. Removing the tier
+that is the saved preset also clears the preset, so `play` falls back to an
+installed one.
 
 ### Debug log
 

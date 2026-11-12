@@ -8,7 +8,7 @@ use common::md5_bytes;
 use std::path::{Path, PathBuf};
 
 use kuro_api::{LocalConfig, PackBundle, PackCdnNode, PackConfig, PackEntry, PackPatch};
-use kuro_core::{pack, GameManager, Quality};
+use kuro_core::{pack, quality, GameManager, Quality};
 
 fn setup_game(base: &Path, app_id: &str) -> PathBuf {
     let game = base.join("game");
@@ -1015,4 +1015,56 @@ async fn nested_predownload_is_used_only_after_the_formal_update() {
     assert!(!plan.predownload, "the formal update was skipped for a preinstall");
     assert_eq!(plan.version, "3.8.0");
     assert_eq!(plan.parts.len(), 2);
+}
+
+#[tokio::test]
+async fn remove_pack_deletes_the_tier_and_clears_the_records() {
+    let base = tempfile::Builder::new().prefix("kuro-pack-remove-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
+    let tier_dir = game.join("Client/Content/HD");
+    std::fs::create_dir_all(&tier_dir).unwrap();
+    std::fs::write(tier_dir.join("a.pak"), vec![1u8; 100]).unwrap();
+    std::fs::write(tier_dir.join("b.pak"), vec![2u8; 200]).unwrap();
+
+    let marker_dir = game.join("launcherDownloadConfig");
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(
+        marker_dir.join("hd.json"),
+        serde_json::json!({ "packName": "hd", "version": "3.7.1" }).to_string(),
+    )
+    .unwrap();
+    let mut cfg: LocalConfig =
+        serde_json::from_str(&std::fs::read_to_string(game.join("launcherDownloadConfig.json")).unwrap()).unwrap();
+    cfg.extra.insert(
+        "bundles".to_string(),
+        serde_json::json!({ "HD": { "version": "3.7.1", "resourcePacks": ["common", "hd"] } }),
+    );
+    std::fs::write(
+        game.join("launcherDownloadConfig.json"),
+        serde_json::to_string_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
+    let mut record = pack::PackRecord::default();
+    std::fs::create_dir_all(game.join(".kuro_cache")).unwrap();
+    record.installed.insert("hd".into(), "3.7.1".into());
+    record.files.insert(
+        "hd".into(),
+        vec!["Client/Content/HD/a.pak".into(), "Client/Content/HD/b.pak".into()],
+    );
+    std::fs::write(pack::record_path(&game), serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    quality::set_selected(&game, Quality::Hd).unwrap();
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let report = mgr.remove_pack(Quality::Hd).await.unwrap();
+    assert_eq!(report.files, 2, "{report:?}");
+    assert_eq!(report.bytes, 300, "{report:?}");
+    assert!(!tier_dir.exists(), "the tier directory survived");
+    assert!(!marker_dir.join("hd.json").exists(), "the launcher marker survived");
+    let root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(game.join("launcherDownloadConfig.json")).unwrap()).unwrap();
+    assert!(root["bundles"].get("HD").is_none(), "the bundle record survived");
+    let record = pack::read_record(&game);
+    assert!(!record.installed.contains_key("hd"));
+    assert!(!record.files.contains_key("hd"));
+    assert_eq!(quality::selected(&game), None, "the removed tier stayed selected");
 }

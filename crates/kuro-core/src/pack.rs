@@ -106,7 +106,7 @@ use crate::download::{download_file, FILE_CONCURRENCY};
 use crate::game::is_krpdiff;
 use crate::md5_cache::Md5Cache;
 use crate::path::{key as path_key, normalise, tmp_sibling};
-use crate::quality::Quality;
+use crate::quality::{self, Quality};
 use crate::state;
 
 /// `launcherDownloadConfig/` — the launcher's per-pack version records.
@@ -182,6 +182,14 @@ pub struct PackUpdatePlanPart {
     pub bytes: u64,
 }
 
+/// What an installed tier removal freed.
+#[derive(Debug, Clone)]
+pub struct PackRemoveReport {
+    pub tier: Quality,
+    pub files: usize,
+    pub bytes: u64,
+}
+
 /// One pack's delta the official update path would apply.
 #[derive(Debug, Clone)]
 struct PackUpdateStep {
@@ -223,6 +231,28 @@ fn pack_staging_dir(game_folder: &Path, name: &str) -> PathBuf {
 
 fn pack_plan_path(game_folder: &Path) -> PathBuf {
     state::incremental_dir(game_folder).join("packs").join(PACK_PLAN_FILE)
+}
+
+fn tree_totals(root: &Path) -> (usize, u64) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return (0, 0);
+    };
+    for entry in rd.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            let (f, b) = tree_totals(&entry.path());
+            files += f;
+            bytes += b;
+        } else if kind.is_file() {
+            files += 1;
+            bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    (files, bytes)
 }
 
 /// The pack document's predownload block is the *next* version's pack set.
@@ -1080,6 +1110,45 @@ impl crate::GameManager {
         let _ = std::fs::remove_dir_all(state::incremental_dir(&self.game_folder).join("packs"));
         report.version = common_target;
         Ok(report)
+    }
+
+    /// Delete an installed tier's body and launcher records.
+    ///
+    /// The tier directory is removed whole, matching the official
+    /// `resource --remove`. Optional packs under `Client/Saved/Resources` are
+    /// left alone; the body is the bulk of the footprint.
+    pub async fn remove_pack(&self, tier: Quality) -> Result<PackRemoveReport> {
+        if !self.game.uses_quality_tiers() {
+            return Err(Error::Unsupported(
+                "this game has no quality packs — only Wuthering Waves has Client/Content/<TIER>",
+            ));
+        }
+        let dir = quality::content_dir(&self.game_folder).join(tier.dir_name());
+        let (files, bytes) = tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            move || tree_totals(&dir)
+        })
+        .await
+        .map_err(|e| Error::Patch(format!("remove walk: {e}")))?;
+        tokio::task::spawn_blocking(move || match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => std::fs::remove_file(&dir),
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&dir),
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        })
+        .await
+        .map_err(|e| Error::Patch(format!("remove join: {e}")))??;
+
+        unregister(&self.game_folder, tier)?;
+        let mut record = read_record(&self.game_folder);
+        record.installed.remove(&tier.pack_key());
+        record.files.remove(&tier.pack_key());
+        write_record(&self.game_folder, &record)?;
+        if quality::selected(&self.game_folder) == Some(tier) {
+            let _ = std::fs::remove_file(state::quality_file(&self.game_folder));
+        }
+        Ok(PackRemoveReport { tier, files, bytes })
     }
 
     /// Plan a pack update without downloading or writing anything.

@@ -90,6 +90,11 @@ edits.
   `predownload` block is used only when the formal packs are current. A
   missing source-version delta is a refusal, never a full-body or other-tier
   fallback.
+- **Only cancellable tasks get an abort handle.** The TUI stores one for
+  predownload, sync, install, pack install, and tier removal. Apply and
+  checkout do not, because interrupting a swap leaves a half-applied tree.
+  `remove_pack` deletes the tier directory and both launcher records, and
+  leaves the versioned `Client/Saved/Resources` payloads alone.
 - **The tier body is matched as spelled, not case-folded.** The game reads
   `Client/Content/HD`; on a case-sensitive host a manifest spelling
   `client/content/hd` would write files the game never reads. Leading slashes
