@@ -27,6 +27,15 @@
 //! Tier bodies are disjoint from each other and `common ∩ full` is identical
 //! (`hd` happens to duplicate the channel's HD body byte for byte).
 //!
+//! Since 3.8.0 a tier manifest also carries its optional map/event packs,
+//! which live outside the body under
+//! `Client/Saved/Resources/<version>/Option_Pack_<tag>[_<TIER>]/Base/`.
+//! `common` owns the unsuffixed form and each tier owns its `_SD`/`_HD`/`_UHD`
+//! form, so the tier installs them in the same run. They are the only subtree
+//! outside `Client/Content/<TIER>` a pack may write: the rest of
+//! `Client/Saved` (Config, LocalStorage, the client's Resource/Lang/Video
+//! directories) is live game state and stays off limits.
+//!
 //! # Why the launcher must be told
 //!
 //! Files alone do not make a tier "installed". The launcher reads two records:
@@ -726,9 +735,18 @@ impl crate::GameManager {
                 continue;
             }
             let key = path_key(&item.dest);
-            if is_common && !channel_agrees(channel, &key, item) {
-                skipped += 1;
-                continue;
+            if is_common {
+                // `common` is reconciled against the channel because the pack
+                // document is shared across CN/Bilibili/Global. Optional packs
+                // are the exception: the channel manifest describes the base
+                // client and does not list `Client/Saved/Resources` at all, so
+                // "absent from the channel" there is normal, not a channel
+                // difference. If the channel does describe one, it still wins.
+                let optional = optional_pack_tier(&item.dest).is_some();
+                if !channel_agrees(channel, &key, item) && (channel.contains_key(&key) || !optional) {
+                    skipped += 1;
+                    continue;
+                }
             }
             total += item.size;
             // `key` is the case-folded comparison form; the file itself keeps
@@ -995,17 +1013,36 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
             // reads. A manifest that spells it that way would register the
             // tier as complete with its files somewhere else.
             if !crate::path::normalise(dest).starts_with(spelled.as_str()) {
-                return Err(Error::Patch(format!(
-                    "`{name}` manifest entry outside Client/Content/{}: {dest}",
-                    tier.map(|t| t.dir_name()).unwrap_or_default()
-                )));
+                // Since 3.8.0 a tier manifest also carries its optional map /
+                // event packs under `Client/Saved/Resources/<version>/`. They
+                // are shipped content, not save state, and the launcher
+                // installs them with the tier — so they are the one subtree a
+                // tier may write outside its own body.
+                let belongs = matches!(optional_pack_tier(dest), Some(Some(q)) if Some(q) == tier);
+                if !belongs {
+                    return Err(Error::Patch(format!(
+                        "`{name}` manifest entry outside Client/Content/{}: {dest}",
+                        tier.map(|t| t.dir_name()).unwrap_or_default()
+                    )));
+                }
             }
         }
-        if is_common && body_prefixes.iter().any(|p| key.starts_with(p.as_str())) {
-            return Err(Error::Patch(format!(
-                "`common` manifest entry inside a quality-tier body: {dest} — \
-                 those files belong to the sd/hd/uhd pack"
-            )));
+        if is_common {
+            if body_prefixes.iter().any(|p| key.starts_with(p.as_str())) {
+                return Err(Error::Patch(format!(
+                    "`common` manifest entry inside a quality-tier body: {dest} — \
+                     those files belong to the sd/hd/uhd pack"
+                )));
+            }
+            // `common` owns the unsuffixed optional packs. A `_SD`/`_HD`/`_UHD`
+            // body belongs to that tier's manifest, and letting `common` write
+            // it would put a different quality's pak under the active tier.
+            if let Some(Some(q)) = optional_pack_tier(dest) {
+                return Err(Error::Patch(format!(
+                    "`common` manifest entry inside the {} optional-pack set: {dest}",
+                    q.as_arg()
+                )));
+            }
         }
         Ok(())
     };
@@ -1061,6 +1098,69 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Which optional-pack tier a `Client/Saved/Resources/...` entry belongs to.
+///
+/// Since WuWa 3.8.0 the launcher's tier manifests carry optional map / event
+/// packs next to the body, in the shape
+///
+/// ```text
+/// Client/Saved/Resources/<version>/Option_Pack_<tag>[_<TIER>]/Base/<file>
+/// ```
+///
+/// The unsuffixed form is installed by `common`, the `_SD`/`_HD`/`_UHD` forms
+/// by that tier. The shape is checked literally rather than by a broad
+/// `Client/Saved/Resources/` prefix: the game reads
+/// `Client/Saved/Resources/<version>`, and everything beside it (Config,
+/// LocalStorage, the client's own Resource/Lang/Video directories) is live
+/// game state a pack must never write. `normalise` only rewrites separators,
+/// so a `.`/`..` segment has to be rejected here before it reaches a join.
+fn optional_pack_tier(dest: &str) -> Option<Option<Quality>> {
+    let normalised = normalise(dest);
+    let rest = normalised.strip_prefix("Client/Saved/Resources/")?;
+    let mut parts = rest.split('/');
+    let version = parts.next()?;
+    let dir = parts.next()?;
+    let base = parts.next()?;
+    let file = parts.next()?;
+    // Exactly the four published segments. A deeper path is not the shape the
+    // launcher ships, and accepting it would let a manifest walk into any
+    // directory under the resource version.
+    if parts.next().is_some() || file.is_empty() || base != "Base" {
+        return None;
+    }
+    if [version, dir, base, file].iter().any(|s| *s == "." || *s == "..") {
+        return None;
+    }
+    if !is_dotted_version(version) {
+        return None;
+    }
+    let tag = dir.strip_prefix("Option_Pack_")?;
+    if tag.is_empty() || tag.starts_with('_') || tag.ends_with('_') {
+        return None;
+    }
+    for q in Quality::ALL {
+        if let Some(stem) = tag.strip_suffix(&format!("_{}", q.dir_name())) {
+            if !stem.is_empty() {
+                return Some(Some(q));
+            }
+        }
+    }
+    Some(None)
+}
+
+/// A dotted-numeric version (`3.8.0`, `3.8`), which is how the resource
+/// directory is named. Everything else is a name the game does not read.
+fn is_dotted_version(v: &str) -> bool {
+    let mut parts = 0;
+    for part in v.split('.') {
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        parts += 1;
+    }
+    parts >= 2
 }
 
 #[cfg(test)]
@@ -1197,6 +1297,79 @@ mod tests {
                 "Engine/Binaries/ThirdParty/x.dll",
                 "Client/Content/Paks/pakchunk0.pak",
             ])
+        )
+        .is_ok());
+    }
+
+    /// 3.8.0's tier manifests carry optional map/event packs outside the body.
+    /// They are installed by the tier and must not be mistaken for a stray
+    /// path, but another tier's copy is still refused.
+    #[test]
+    fn a_tier_may_ship_its_own_optional_pack_resources() {
+        for (tier, tag) in [
+            ("sd", "Option_Pack_Map_SD"),
+            ("hd", "Option_Pack_Map_HD"),
+            ("uhd", "Option_Pack_Map_UHD"),
+        ] {
+            let dest = format!("Client/Saved/Resources/3.8.0/{tag}/Base/pakchunk50.pak");
+            assert!(
+                validate_pack_manifest(tier, &manifest(&[&dest])).is_ok(),
+                "{tier} rejected its own optional pack: {dest}"
+            );
+        }
+        for dest in [
+            // Another tier's body.
+            "Client/Saved/Resources/3.8.0/Option_Pack_Map_SD/Base/pakchunk50.pak",
+            // The common (unsuffixed) copy belongs to `common`, not a tier.
+            "Client/Saved/Resources/3.8.0/Option_Pack_Map/Base/pakchunk50.pak",
+        ] {
+            assert!(
+                validate_pack_manifest("hd", &manifest(&[dest])).is_err(),
+                "an HD pack was allowed to write {dest}"
+            );
+        }
+    }
+
+    #[test]
+    fn common_may_ship_the_unsuffixed_optional_packs_only() {
+        assert!(validate_pack_manifest(
+            "common",
+            &manifest(&["Client/Saved/Resources/3.8.0/Option_Pack_Map/Base/pakchunk50.pak"])
+        )
+        .is_ok());
+        for tier in ["SD", "HD", "UHD"] {
+            let dest = format!("Client/Saved/Resources/3.8.0/Option_Pack_Map_{tier}/Base/pakchunk50.pak");
+            assert!(
+                validate_pack_manifest("common", &manifest(&[&dest])).is_err(),
+                "`common` was allowed to write the {tier} pack: {dest}"
+            );
+        }
+    }
+
+    /// The optional-pack permission is a path *shape*, not a prefix: the rest
+    /// of `Client/Saved` is live game state and stays off limits.
+    #[test]
+    fn an_optional_pack_path_must_have_the_published_shape() {
+        for bad in [
+            "Client/Saved/Config/GameUserSettings.ini",
+            "Client/Saved/LocalStorage/x.txt",
+            "Client/Saved/Resources/3.8.0/Resource/pakchunk50.pak",
+            "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Data/pakchunk50.pak",
+            "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/sub/pakchunk50.pak",
+            "Client/Saved/Resources/latest/Option_Pack_Map_HD/Base/pakchunk50.pak",
+            "Client/Saved/Resources/3.8.0/Option_Pack__HD/Base/pakchunk50.pak",
+            "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/../../x.pak",
+        ] {
+            assert!(
+                validate_pack_manifest("hd", &manifest(&[bad])).is_err(),
+                "{bad} was accepted as an optional pack"
+            );
+        }
+        // A leading slash and backslashes are the CDN's spelling of the same
+        // relative path, exactly as for the body.
+        assert!(validate_pack_manifest(
+            "hd",
+            &manifest(&["/Client\\Saved\\Resources\\3.8.0\\Option_Pack_Map_HD\\Base\\pakchunk50.pak"])
         )
         .is_ok());
     }

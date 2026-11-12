@@ -252,7 +252,11 @@ workspace member, and its two dead-code warnings are not ours to fix.
 - The CDN manifest describes the base client only, so it is **not** an inventory
   of a WuWa install: the game's own resource channel (`Client/Saved/**`, i.e.
   Video/Lang/Resource packs — not the `Client/Content/Paks` base paks) is
-  fetched by the client itself and is invisible to Kuro
+  fetched by the client itself and is invisible to Kuro. The one exception is
+  the launcher's *pack* document: since 3.8.0 a tier's manifest also lists its
+  optional map/event packs under `Client/Saved/Resources/<version>/`, and
+  `kuro pack` installs those with the tier. The client's own
+  Resource/Lang/Video channel is still fetched by the game.
 - WuWa CN hotfixes (e.g. 3.6.0 → 3.6.1) have no `krpdiff` groups and no
   `fromFolder`: `predownload` stages the changed files as full files, and
   `apply` refuses to record the new version unless every target file is already

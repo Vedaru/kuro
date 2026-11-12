@@ -143,6 +143,77 @@ async fn installs_a_tier_and_registers_it_with_the_launcher() {
     assert_eq!(state.recorded_version.as_deref(), Some("3.7.1"));
 }
 
+/// Since 3.8.0 a tier ships optional map/event packs under
+/// `Client/Saved/Resources/<version>/`. They live outside the body, are absent
+/// from the channel manifest, and must still be fetched by the tier that owns
+/// them: the common copy by `common`, the `_HD` copy by `hd`.
+#[tokio::test]
+async fn optional_pack_resources_are_installed_outside_the_body() {
+    let base = tempfile::Builder::new()
+        .prefix("kuro-pack-optional-")
+        .tempdir()
+        .unwrap();
+    let game = setup_game(base.path(), "10003");
+
+    let common_bin = b"CLIENT-BINARY".to_vec();
+    let common_pack = b"COMMON-OPTION-PACK".to_vec();
+    let hd = b"HD-PAK".to_vec();
+    let hd_pack = b"HD-OPTION-PACK".to_vec();
+
+    let common_dest = "Client/Saved/Resources/3.8.0/Option_Pack_Map/Base/pakchunk50.pak";
+    let hd_dest = "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/pakchunk50-HD.pak";
+
+    let server = common::spawn_http_server(vec![
+        (
+            "/common/indexFile.json".into(),
+            manifest_json(&[
+                ("Client/Binaries/Win64/Client-Win64-Shipping.exe", &common_bin),
+                (common_dest, &common_pack),
+            ]),
+        ),
+        (
+            "/hd/indexFile.json".into(),
+            manifest_json(&[
+                ("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak", &hd),
+                (hd_dest, &hd_pack),
+            ]),
+        ),
+        (
+            "/zip/Client/Binaries/Win64/Client-Win64-Shipping.exe".into(),
+            common_bin.clone(),
+        ),
+        (format!("/zip/{common_dest}"), common_pack.clone()),
+        (
+            "/zip/Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak".into(),
+            hd.clone(),
+        ),
+        (format!("/zip/{hd_dest}"), hd_pack.clone()),
+    ])
+    .await;
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let cfg = config(&server, "3.8.0");
+    let mut channel = HashMap::new();
+    channel.insert(
+        "client/binaries/win64/client-win64-shipping.exe".to_string(),
+        (common_bin.len() as u64, md5_bytes(&common_bin)),
+    );
+
+    let report = mgr
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), &channel, true, None)
+        .await
+        .unwrap();
+
+    assert!(report.broken.is_empty(), "unexpected failures: {:?}", report.broken);
+    assert!(report.registered);
+    assert_eq!(
+        report.parts[0].skipped, 0,
+        "the common optional pack was skipped as a channel difference"
+    );
+    assert_eq!(std::fs::read(game.join(common_dest)).unwrap(), common_pack);
+    assert_eq!(std::fs::read(game.join(hd_dest)).unwrap(), hd_pack);
+}
+
 /// A failed download must not leave a record claiming the tier is installed.
 #[tokio::test]
 async fn failed_download_does_not_register_the_tier() {
