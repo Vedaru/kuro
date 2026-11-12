@@ -239,7 +239,7 @@ impl InstallDraft {
 /// How a body choice reads in the UI.
 fn body_label(body: BodyChoice) -> String {
     match body {
-        BodyChoice::All => "all (whatever the channel serves)".to_string(),
+        BodyChoice::All => "all".to_string(),
         BodyChoice::Only(q) | BodyChoice::Prefer(q) => q.as_arg().to_ascii_lowercase(),
     }
 }
@@ -2584,7 +2584,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
         let mut modal_lines: Vec<Line> = vec![
             Line::styled(
                 if draft.edit_target {
-                    "Where should the game be installed?"
+                    "Install to?"
                 } else {
                     "Install a new game"
                 },
@@ -2592,72 +2592,60 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             ),
             Line::raw(""),
             Line::from(vec![
-                Span::raw("  game    [w] wuwa  [p] pgr                → "),
+                Span::raw("  "),
+                if draft.edit_target {
+                    if draft.target.is_empty() {
+                        dim(draft.suggested.clone())
+                    } else {
+                        strong(format!("{}_", draft.target))
+                    }
+                } else {
+                    strong(draft.target.clone())
+                },
+            ]),
+            Line::from(vec![
+                dim("  game    "),
                 accent(if matches!(draft.game, Game::WuWa) {
                     "wuwa"
                 } else {
                     "pgr"
                 }),
+                dim("   (w/p)"),
             ]),
             Line::from(vec![
-                Span::raw("  server  [c] cn  [b] bilibili  [g] global  → "),
+                dim("  server  "),
                 accent(draft.server.to_string()),
+                dim("   (c/b/g)"),
             ]),
-            if draft.game.uses_quality_tiers() {
-                Line::from(vec![
-                    Span::raw("  pack    [f] all / sd / hd / uhd          → "),
-                    accent(body_label(draft.body)),
-                ])
-            } else {
-                Line::from(vec![dim(format!(
-                    "  pack    n/a — {} has no quality packs",
-                    pretty_game(draft.game)
-                ))])
-            },
-            Line::styled("  folder", Style::default().fg(Color::DarkGray)),
-            if draft.edit_target {
-                if draft.target.is_empty() {
-                    Line::from(vec![
-                        Span::raw("    "),
-                        dim(format!("{}  (suggested)", draft.suggested)),
-                    ])
-                } else {
-                    Line::from(vec![Span::raw("    "), strong(format!("{}_", draft.target))])
-                }
-            } else {
-                Line::from(vec![Span::raw("    "), strong(draft.target.clone())])
-            },
-            Line::styled(
-                if draft.edit_target {
-                    "    type a path · Enter continue · Esc stop typing"
-                } else {
-                    "    [t] type path    [s] Steam default"
-                },
-                Style::default().fg(Color::Cyan),
-            ),
-            Line::raw(""),
         ];
-        match &state.steam {
-            Some(steam) => modal_lines.push(Line::raw(format!("  Steam:  {}", steam.steam_root.display()))),
-            None => modal_lines.push(Line::raw("  Steam:  not detected")),
+        if draft.game.uses_quality_tiers() {
+            modal_lines.push(Line::from(vec![
+                dim("  pack    "),
+                accent(body_label(draft.body)),
+                dim("   (f)"),
+            ]));
         }
         modal_lines.push(Line::raw(""));
+        match &state.steam {
+            Some(steam) if !draft.edit_target => modal_lines.push(Line::from(vec![
+                dim("  s Steam  "),
+                Span::raw(steam.steam_root.display().to_string()),
+            ])),
+            _ => {}
+        }
         modal_lines.push(Line::styled(
             if draft.edit_target {
-                "  Enter continue      Esc stop typing"
+                if draft.target.is_empty() {
+                    "Enter accept · type to replace · Esc cancel"
+                } else {
+                    "Enter continue · Esc cancel"
+                }
             } else {
-                "  Enter install      Esc cancel"
+                "Enter install · t edit · Esc cancel"
             },
             Style::default().fg(Color::Cyan),
         ));
-        modal_lines.push(Line::raw(""));
-        modal_lines.push(Line::raw(
-            "  Game files only. `all` takes every pack the channel serves; a single",
-        ));
-        modal_lines.push(Line::raw(
-            "  pack (sd/hd/uhd) fetches just that body — the channel must serve it.",
-        ));
-        let area = centered_rect(70, 48, f.area());
+        let area = centered_rect(75, 50, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(modal_lines)
