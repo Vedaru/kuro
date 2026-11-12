@@ -174,7 +174,7 @@ never compared side by side. There is no log panel.
 |-----|--------|
 | `↑` / `↓` (or `j` / `k`) | select a game |
 | `Enter` | open the selected game |
-| `i` | install the highlighted game (type the folder · Enter install · Esc cancel) |
+| `i` | install the highlighted game (`↑↓` select · `←→` change server/pack · Enter edits folder or installs) |
 | `r` | refresh every game's status |
 | `h` / `?` | help overlay |
 | `q` / `Esc` | quit |

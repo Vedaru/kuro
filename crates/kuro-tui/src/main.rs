@@ -189,13 +189,24 @@ struct QualityDraft {
 }
 
 /// In-progress install selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallRow {
+    Server,
+    Pack,
+    Folder,
+    Install,
+    Typing,
+}
+
 #[derive(Clone)]
 struct InstallDraft {
     game: Game,
     server: Server,
+    body: BodyChoice,
     target: String,
+    row: InstallRow,
     /// The first typed key replaces the path instead of appending to it.
-    fresh: bool,
+    replace: bool,
 }
 
 impl InstallDraft {
@@ -203,9 +214,61 @@ impl InstallDraft {
         Self {
             game: Game::WuWa,
             server: Server::Cn,
+            body: BodyChoice::All,
             target,
-            fresh: true,
+            row: InstallRow::Folder,
+            replace: false,
         }
+    }
+
+    fn move_row(&mut self, down: bool) {
+        use InstallRow::{Folder, Install, Pack, Server, Typing};
+        self.row = match (self.row, down) {
+            (Server, true) | (Install, false) => Pack,
+            (Server, false) | (Folder, true) => Install,
+            (Pack, true) => Folder,
+            (Pack, false) => Server,
+            (Folder, false) => Pack,
+            (Install, true) => Server,
+            (Typing, _) => Install,
+        };
+    }
+
+    fn cycle_server(&mut self) {
+        self.server = if self.game == Game::Pgr {
+            match self.server {
+                Server::Global => Server::Cn,
+                _ => Server::Global,
+            }
+        } else {
+            match self.server {
+                Server::Cn => Server::Bilibili,
+                Server::Bilibili => Server::Global,
+                Server::Global => Server::Cn,
+            }
+        };
+    }
+
+    /// Cycle the pack this install fetches: all → sd → hd → uhd → all.
+    fn cycle_body(&mut self) {
+        if !self.game.uses_quality_tiers() {
+            self.body = BodyChoice::All;
+            return;
+        }
+        self.body = match self.body {
+            BodyChoice::All | BodyChoice::Prefer(_) => BodyChoice::Only(Quality::Sd),
+            BodyChoice::Only(Quality::Sd) => BodyChoice::Only(Quality::Hd),
+            BodyChoice::Only(Quality::Hd) => BodyChoice::Only(Quality::Uhd),
+            BodyChoice::Only(Quality::Uhd) => BodyChoice::All,
+        };
+    }
+}
+
+/// How a body choice reads in the UI.
+fn body_label(body: BodyChoice) -> String {
+    match body {
+        BodyChoice::All => "all".to_string(),
+        BodyChoice::Only(q) | BodyChoice::Prefer(q) => q.as_arg().to_ascii_lowercase(),
     }
 }
 
@@ -1288,27 +1351,56 @@ async fn run(
                     continue;
                 }
 
-                let mut start_install: Option<(Game, Server, String)> = None;
+                let mut start_install: Option<(Game, Server, String, BodyChoice)> = None;
                 if let Some(draft) = state.install.as_mut() {
+                    if draft.row == InstallRow::Typing {
+                        match key.code {
+                            KeyCode::Char(c) => {
+                                if draft.replace {
+                                    draft.target.clear();
+                                    draft.replace = false;
+                                }
+                                draft.target.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                if draft.replace {
+                                    draft.target.clear();
+                                    draft.replace = false;
+                                } else {
+                                    draft.target.pop();
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Esc => {
+                                if draft.target.trim().is_empty() {
+                                    draft.target = default_folder_for(draft.game);
+                                }
+                                draft.row = InstallRow::Install;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
-                        KeyCode::Char(c) => {
-                            if draft.fresh {
-                                draft.target.clear();
-                                draft.fresh = false;
+                        KeyCode::Up => draft.move_row(false),
+                        KeyCode::Down => draft.move_row(true),
+                        KeyCode::Left | KeyCode::Right => match draft.row {
+                            InstallRow::Server => draft.cycle_server(),
+                            InstallRow::Pack => draft.cycle_body(),
+                            _ => {}
+                        },
+                        KeyCode::Enter => match draft.row {
+                            InstallRow::Folder => {
+                                draft.row = InstallRow::Typing;
+                                draft.replace = true;
                             }
-                            draft.target.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            if draft.fresh {
-                                draft.target.clear();
-                                draft.fresh = false;
-                            } else {
-                                draft.target.pop();
+                            InstallRow::Install => {
+                                if draft.target.trim().is_empty() {
+                                    draft.target = default_folder_for(draft.game);
+                                }
+                                start_install = Some((draft.game, draft.server, draft.target.clone(), draft.body));
                             }
-                        }
-                        KeyCode::Enter if !draft.target.trim().is_empty() => {
-                            start_install = Some((draft.game, draft.server, draft.target.clone()));
-                        }
+                            _ => {}
+                        },
                         KeyCode::Esc => state.install = None,
                         _ => {}
                     }
@@ -1316,7 +1408,7 @@ async fn run(
                         continue;
                     }
                 }
-                if let Some((game, server, target)) = start_install {
+                if let Some((game, server, target, body)) = start_install {
                     state.install = None;
                     if !state.busy {
                         state.busy = true;
@@ -1330,7 +1422,7 @@ async fn run(
                             format!("installing {} ({}) into {target}", pretty_game(game), server),
                         );
                         state.install_target = Some(target.clone());
-                        state.task_handle = Some(spawn_install(&tx, &target, game, server, BodyChoice::All));
+                        state.task_handle = Some(spawn_install(&tx, &target, game, server, body));
                     }
                     // The Enter that started the install belongs to the modal,
                     // not to the games list (otherwise it also opens Detail).
@@ -2054,6 +2146,15 @@ fn kv(label: &'static str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![dim(label), strong(value)])
 }
 
+/// One install-form row: arrow marker, dim label, highlighted value.
+fn form_row(active: bool, label: &'static str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        if active { accent("▶ ") } else { Span::raw("  ") },
+        dim(label),
+        if active { accent(value) } else { strong(value) },
+    ])
+}
+
 /// The root screen: one row per installed game, one game per row. The detail
 /// view is a separate screen, so two games are never compared side by side.
 fn ui_games(f: &mut Frame, state: &UiState) {
@@ -2447,7 +2548,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             Line::raw("       Tab: status / activity"),
             Line::raw("Clean  Q -> x removes the highlighted tier"),
             Line::raw("Stop   Ctrl+C stops a running download · Esc backs out"),
-            Line::raw("Install i · type the folder · Enter install · Esc cancel"),
+            Line::raw("Install i · ↑↓ select · ←→ server/pack · Enter folder/install"),
             Line::raw("Shell  kuro update FOLDER --check|--download|--apply"),
             Line::raw("       kuro pack FOLDER hd --remove"),
             Line::raw("Debug  kuro --debug -> ~/.local/state/kuro/kuro.log"),
@@ -2515,20 +2616,48 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             area,
         );
     } else if let Some(draft) = state.install.as_ref() {
-        let folder = if draft.fresh {
-            display_path(&draft.target)
+        let modal_lines: Vec<Line> = if draft.row == InstallRow::Typing {
+            vec![
+                Line::styled(
+                    format!("Install {} to?", pretty_game(draft.game)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::from(vec![
+                    Span::raw("  "),
+                    if draft.target.is_empty() {
+                        dim(default_folder_for(draft.game))
+                    } else {
+                        strong(format!("{}_", draft.target))
+                    },
+                ]),
+                Line::styled("Enter done · Esc back", Style::default().fg(Color::Cyan)),
+            ]
         } else {
-            draft.target.clone()
+            let pack = if draft.game.uses_quality_tiers() {
+                body_label(draft.body)
+            } else {
+                "—".into()
+            };
+            vec![
+                Line::styled(
+                    format!("Install {}", pretty_game(draft.game)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                form_row(draft.row == InstallRow::Server, "server  ", draft.server.to_string()),
+                form_row(draft.row == InstallRow::Pack, "pack    ", pack),
+                form_row(draft.row == InstallRow::Folder, "folder  ", display_path(&draft.target)),
+                form_row(draft.row == InstallRow::Install, "", "install"),
+                Line::styled(
+                    match draft.row {
+                        InstallRow::Folder => "↑↓ select · Enter edit folder",
+                        InstallRow::Install => "↑↓ select · Enter install",
+                        _ => "↑↓ select · ←→ change",
+                    },
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]
         };
-        let modal_lines = vec![
-            Line::styled(
-                format!("Install {} ({})", short_game_name(draft.game), draft.server),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::from(vec![Span::raw("  "), strong(format!("{folder}_"))]),
-            Line::styled("Enter install · Esc cancel", Style::default().fg(Color::Cyan)),
-        ];
-        let area = centered_rect(65, 35, f.area());
+        let area = centered_rect(75, 50, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(modal_lines)
@@ -2654,7 +2783,7 @@ mod tests {
     use super::{
         body_choice, checkout_possible, cli_bar, debug_log, default_folder, draft_for_active, init_debug,
         install_target_for, parse_quality_arg, remember_install_path, split_play_args, ui, CliProgress, InstallDraft,
-        QualityDraft, Screen, UiState,
+        InstallRow, QualityDraft, Screen, UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, ProgressEvent, Quality, Server};
 
@@ -3009,14 +3138,51 @@ mod tests {
         assert_eq!(draft.game, Game::Pgr);
         assert_eq!(draft.server, Server::Global);
         assert_eq!(draft.target, "/tmp/Punishing Gray Raven");
-        assert!(draft.fresh);
+        assert_eq!(draft.row, InstallRow::Folder);
+        assert!(!draft.replace);
+        assert_eq!(draft.body, BodyChoice::All);
     }
 
     #[test]
     fn install_starts_with_the_suggested_folder() {
         let draft = InstallDraft::new("/tmp/x".into());
         assert_eq!(draft.target, "/tmp/x");
-        assert!(draft.fresh);
+        assert_eq!(draft.row, InstallRow::Folder);
+        assert!(!draft.replace);
+    }
+
+    #[test]
+    fn install_pack_and_server_are_configurable() {
+        let mut draft = InstallDraft::new("/tmp/x".into());
+        assert_eq!(draft.body, BodyChoice::All);
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::Only(Quality::Sd));
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::Only(Quality::Hd));
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::Only(Quality::Uhd));
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::All);
+
+        draft.game = Game::Pgr;
+        draft.cycle_body();
+        assert_eq!(draft.body, BodyChoice::All, "PGR has no bodies");
+
+        draft.game = Game::WuWa;
+        draft.server = Server::Cn;
+        draft.cycle_server();
+        assert_eq!(draft.server, Server::Bilibili);
+        draft.cycle_server();
+        assert_eq!(draft.server, Server::Global);
+        draft.cycle_server();
+        assert_eq!(draft.server, Server::Cn);
+
+        draft.game = Game::Pgr;
+        draft.server = Server::Global;
+        draft.cycle_server();
+        assert_eq!(draft.server, Server::Cn);
+        draft.cycle_server();
+        assert_eq!(draft.server, Server::Global);
     }
 
     /// The CLI bar is one running total, not a per-file row. Verify fills it
