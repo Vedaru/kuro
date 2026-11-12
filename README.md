@@ -174,7 +174,7 @@ never compared side by side. There is no log panel.
 |-----|--------|
 | `↑` / `↓` (or `j` / `k`) | select a game |
 | `Enter` | open the selected game |
-| `i` | install a new game (`w`/`p` game · `c`/`b`/`g` server · `f` quality pack · `t` path · `s` Steam default) |
+| `i` | install a new game (`↑↓` select · `←→` change · Enter edits the folder, then installs) |
 | `r` | refresh every game's status |
 | `h` / `?` | help overlay |
 | `q` / `Esc` | quit |
