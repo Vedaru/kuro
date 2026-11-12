@@ -310,7 +310,7 @@ usage: kuro [game-folder ...]            launch the TUI (default: auto-detect)
        kuro sync [folder] [--quality sd|hd|uhd]
        kuro quality <folder> [sd|hd|uhd]
        kuro pack [folder] <sd|hd|uhd> [--check]   install a quality pack
-       kuro update [folder] [--check]            apply common + tier patchConfig deltas
+       kuro update [folder] [--check|--download|--apply]   common + tier deltas
        kuro play <folder> [--quality <sd|hd|uhd>]
        kuro kill <folder>
        kuro help | --help | -h
@@ -515,18 +515,25 @@ fn cli_quality(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `kuro update [folder] [--check]` — the official pack-document update.
+/// `kuro update [folder] [--check | --download | --apply]` — the official
+/// pack-document update.
 ///
 /// `common` and the active tier each apply their own `patchConfig` delta, then
-/// the game version is recorded. This is the path that moves 3.7.1 to 3.8.0
-/// without downloading a full 42 GiB body. `--check` reports the download
-/// without writing anything.
+/// the game version is recorded. `--download` stages the deltas and writes a
+/// resumable plan without touching the game, `--apply` applies that plan, and
+/// `--check` previews it. The default does all three.
 async fn cli_update(args: &[String]) -> std::io::Result<()> {
     let (folder, rest) = split_play_args(args);
-    let check_only = rest.iter().any(|a| a == "--check");
-    let rest: Vec<String> = rest.into_iter().filter(|a| a != "--check").collect();
-    if !rest.is_empty() {
-        println!("usage: kuro update [folder] [--check]");
+    let check = rest.iter().any(|a| a == "--check");
+    let download = rest.iter().any(|a| a == "--download");
+    let apply = rest.iter().any(|a| a == "--apply");
+    let modes = [check, download, apply].into_iter().filter(|b| *b).count();
+    let rest: Vec<String> = rest
+        .into_iter()
+        .filter(|a| !matches!(a.as_str(), "--check" | "--download" | "--apply"))
+        .collect();
+    if !rest.is_empty() || modes > 1 {
+        println!("usage: kuro update [folder] [--check | --download | --apply]");
         return Ok(());
     }
     let mgr = match GameManager::open(PathBuf::from(&folder)).await {
@@ -549,7 +556,7 @@ async fn cli_update(args: &[String]) -> std::io::Result<()> {
         })
         .unwrap_or(Quality::Hd);
 
-    if check_only {
+    if check {
         match mgr.pack_update_plan(tier).await {
             Ok(plan) => {
                 if plan.parts.is_empty() {
@@ -566,7 +573,8 @@ async fn cli_update(args: &[String]) -> std::io::Result<()> {
                         );
                     }
                     println!(
-                        "update -> {}: {} file(s), {}",
+                        "{} -> {}: {} file(s), {}",
+                        if plan.predownload { "preinstall" } else { "update" },
                         plan.version,
                         plan.parts.iter().map(|p| p.files).sum::<usize>(),
                         fmt_bytes(plan.parts.iter().map(|p| p.bytes).sum())
@@ -574,6 +582,74 @@ async fn cli_update(args: &[String]) -> std::io::Result<()> {
                 }
             }
             Err(e) => println!("update check error: {e}"),
+        }
+        return Ok(());
+    }
+
+    if download {
+        match mgr.pack_download(tier, None).await {
+            Ok(plan) => {
+                if plan.parts.is_empty() {
+                    println!("up to date at {}", plan.version);
+                } else {
+                    for part in &plan.parts {
+                        println!(
+                            "  {:<6} {} -> {}  {} file(s), {}",
+                            part.name,
+                            part.from_version,
+                            part.to_version,
+                            part.files,
+                            fmt_bytes(part.bytes)
+                        );
+                    }
+                    println!(
+                        "{} complete -> {}: {} file(s), {}",
+                        if plan.predownload {
+                            "preinstall download"
+                        } else {
+                            "predownload"
+                        },
+                        plan.version,
+                        plan.parts.iter().map(|p| p.files).sum::<usize>(),
+                        fmt_bytes(plan.parts.iter().map(|p| p.bytes).sum())
+                    );
+                    println!("apply with `kuro update \"{folder}\" --apply` (or the TUI `a` key)");
+                }
+            }
+            Err(e) => println!("predownload error: {e}"),
+        }
+        return Ok(());
+    }
+
+    if apply {
+        match mgr.pack_apply(None).await {
+            Ok(report) => {
+                if report.parts.is_empty() {
+                    println!("up to date at {}", report.version);
+                } else {
+                    for part in &report.parts {
+                        println!(
+                            "  {:<6} {} -> {}  merged {}, skipped {}, swapped {}",
+                            part.name,
+                            part.from_version,
+                            part.to_version,
+                            part.report.merged,
+                            part.report.skipped,
+                            part.report.swapped
+                        );
+                    }
+                    println!(
+                        "{} to {}",
+                        if report.predownload {
+                            "preinstall applied"
+                        } else {
+                            "updated"
+                        },
+                        report.version
+                    );
+                }
+            }
+            Err(e) => println!("apply error: {e}"),
         }
         return Ok(());
     }
@@ -594,7 +670,15 @@ async fn cli_update(args: &[String]) -> std::io::Result<()> {
                         part.report.swapped
                     );
                 }
-                println!("updated to {}", report.version);
+                println!(
+                    "{} to {}",
+                    if report.predownload {
+                        "preinstall applied"
+                    } else {
+                        "updated"
+                    },
+                    report.version
+                );
             }
         }
         Err(e) => println!("update error: {e}"),
@@ -1062,11 +1146,7 @@ async fn run(
                         if !state.busy {
                             state.busy = true;
                             state.task = Some(TaskUi {
-                                kind: if active_game(&state).uses_quality_tiers() {
-                                    "update".into()
-                                } else {
-                                    "predownload".into()
-                                },
+                                kind: "predownload".into(),
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
@@ -1377,11 +1457,21 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
                         let _ = tx2.send(UiEvent::Progress(ev)).await;
                     }
                 });
-                let report = mgr.pack_update(tier, Some(ptx)).await.map_err(|e| e.to_string())?;
+                let report = mgr.pack_download(tier, Some(ptx)).await.map_err(|e| e.to_string())?;
                 return Ok::<_, String>(if report.parts.is_empty() {
                     format!("up to date at {}", report.version)
                 } else {
-                    format!("pack update applied → {}", report.version)
+                    let files: usize = report.parts.iter().map(|p| p.files).sum();
+                    let bytes: u64 = report.parts.iter().map(|p| p.bytes).sum();
+                    format!(
+                        "{} complete — {files} file(s), {:.1} GiB staged — press a to apply",
+                        if report.predownload {
+                            "preinstall download"
+                        } else {
+                            "predownload"
+                        },
+                        bytes as f64 / (1u64 << 30) as f64
+                    )
                 });
             }
             let plan = mgr.plan_predownload().await.map_err(|e| e.to_string())?;
@@ -1470,15 +1560,25 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                 .map_err(|e| e.to_string())?;
             match kind {
                 TaskKind::Apply => {
-                    let report = mgr.apply_with_progress(ptx.take()).await.map_err(|e| e.to_string())?;
-                    Ok(format!(
-                        "apply complete — merged {}, skipped {}, fallback {}, swapped {}, deleted {}",
-                        report.merged,
-                        report.skipped,
-                        report.fallback,
-                        report.swapped,
-                        report.deleted.len()
-                    ))
+                    if mgr.game.uses_quality_tiers() && !mgr.server_entry().pack_config_urls.is_empty() {
+                        let report = mgr.pack_apply(ptx.take()).await.map_err(|e| e.to_string())?;
+                        let merged: usize = report.parts.iter().map(|p| p.report.merged).sum();
+                        let swapped: usize = report.parts.iter().map(|p| p.report.swapped).sum();
+                        Ok(format!(
+                            "pack update applied — {merged} group(s) merged, {swapped} file(s) swapped, now {}",
+                            report.version
+                        ))
+                    } else {
+                        let report = mgr.apply_with_progress(ptx.take()).await.map_err(|e| e.to_string())?;
+                        Ok(format!(
+                            "apply complete — merged {}, skipped {}, fallback {}, swapped {}, deleted {}",
+                            report.merged,
+                            report.skipped,
+                            report.fallback,
+                            report.swapped,
+                            report.deleted.len()
+                        ))
+                    }
                 }
                 TaskKind::Sync => {
                     let report = mgr.sync_with_progress(ptx.take()).await.map_err(|e| e.to_string())?;
@@ -1881,7 +1981,8 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
         (Screen::Detail, false) => &[
             ("Esc", "back"),
             ("p", "play"),
-            ("d", "update"),
+            ("d", "predownload"),
+            ("a", "apply"),
             ("s", "sync"),
             ("Q", "quality"),
             ("r", "refresh"),
@@ -1891,7 +1992,8 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
         (Screen::Detail, true) => &[
             ("Esc", "back"),
             ("p", "play"),
-            ("d", "update"),
+            ("d", "predownload"),
+            ("a", "apply"),
             ("s", "sync"),
             ("q", "quit"),
         ],
@@ -1923,7 +2025,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             Line::raw("kuro — Kuro Games launcher"),
             Line::raw(""),
             Line::raw("  Games  ↑↓ select · Enter open · i install · r refresh · q quit"),
-            Line::raw("  Game   Esc back · p play · d update · s sync · a apply"),
+            Line::raw("  Game   Esc back · p play · d predownload · a apply · s sync"),
             Line::raw("         Q quality · c switch server · k force-kill · r refresh"),
             Line::raw("         Tab focus panels · ↑↓ / PgUp / PgDn scroll the log"),
             Line::raw(""),
@@ -1932,6 +2034,8 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             Line::raw(""),
             Line::raw("From a shell"),
             Line::raw("  kuro update FOLDER --check"),
+            Line::raw("  kuro update FOLDER --download"),
+            Line::raw("  kuro update FOLDER --apply"),
             Line::raw("  kuro sync FOLDER"),
             Line::raw("  kuro pack FOLDER hd"),
             Line::raw(""),

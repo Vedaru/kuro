@@ -260,6 +260,23 @@ impl GameManager {
         from_version: &str,
         to_version: &str,
     ) -> PredownloadPlan {
+        self.plan_from_patch_index_in(
+            patch_index,
+            from_version,
+            to_version,
+            &incremental_dir(&self.game_folder),
+        )
+    }
+
+    /// [`Self::plan_from_patch_index`] with an explicit staging root, so the
+    /// pack update can isolate each pack's staged files.
+    pub(crate) fn plan_from_patch_index_in(
+        &self,
+        patch_index: &PatchIndex,
+        from_version: &str,
+        to_version: &str,
+        inc: &Path,
+    ) -> PredownloadPlan {
         let mut patch_groups = Vec::new();
         let mut full_files = Vec::new();
         let mut total = 0u64;
@@ -273,7 +290,7 @@ impl GameManager {
             }
             let info = res_by_dest.get(group.dest.as_str()).copied();
             let size = info.map(|r| r.size).unwrap_or(0);
-            let staged = state::staged_patch_path(&self.game_folder, &group.dest);
+            let staged = inc.join(&group.dest);
             let ready = file_matches(&staged, size, info.map(|r| r.md5.as_str()).unwrap_or(""));
             if !ready {
                 total += size;
@@ -293,7 +310,7 @@ impl GameManager {
             // base (see `resource_base`). Demanding it here is how a real WuWa
             // CN update (3.6.0 -> 3.6.1: 173 files, 1.49 GiB, *no* fromFolder
             // on any entry) ended up planning zero bytes instead.
-            let staged = state::staged_resource_path(&self.game_folder, &item.dest);
+            let staged = inc.join("resources").join(item.dest.trim_start_matches('/'));
             let ready = file_matches(&staged, item.size, &item.md5);
             if !ready {
                 total += item.size;
@@ -343,7 +360,15 @@ impl GameManager {
             .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
         let base_refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
         let patch_index = self.api.fetch_manifest(&base_refs, &patch_cfg.index_file).await?;
-        self.predownload_index(plan, &patch_index, patch_cfg, &nodes, tx).await
+        self.predownload_index(
+            plan,
+            &patch_index,
+            patch_cfg,
+            &nodes,
+            &incremental_dir(&self.game_folder),
+            tx,
+        )
+        .await
     }
 
     /// Download a plan against an already-resolved patch index.
@@ -357,10 +382,10 @@ impl GameManager {
         patch_index: &PatchIndex,
         patch_cfg: &PatchConfig,
         nodes: &[String],
+        inc: &Path,
         tx: tokio::sync::mpsc::Sender<ProgressEvent>,
     ) -> Result<()> {
-        let dir = incremental_dir(&self.game_folder);
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(inc)?;
 
         // nothing to download (already up to date)
         if plan.patch_groups.is_empty() && plan.full_files.is_empty() {
@@ -384,7 +409,7 @@ impl GameManager {
                 continue;
             }
             let urls = node_urls(nodes, |base| ApiClient::krpdiff_url(base, patch_cfg, &group.name));
-            let staged = state::staged_patch_path(&self.game_folder, &group.name);
+            let staged = inc.join(&group.name);
             let tmp = tmp_sibling(&staged, "krpdiff");
             let name = group.name.clone();
             let size = group.size;
@@ -418,7 +443,7 @@ impl GameManager {
                 .ok_or_else(|| Error::MissingField("resource entry"))?;
             let from = resource_base(res, patch_cfg);
             let urls = node_urls(nodes, |base| ApiClient::resource_url(base, &from, &res.dest));
-            let staged = state::staged_resource_path(&self.game_folder, &res.dest);
+            let staged = inc.join("resources").join(res.dest.trim_start_matches('/'));
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = tmp_sibling(&staged, "dl");
             let size = res.size;
@@ -466,18 +491,6 @@ impl GameManager {
         &self,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<ApplyReport> {
-        // WuWa CN/Bilibili apply the pack document in one step (`pack_update`);
-        // there is no separate staged plan to apply here.
-        if self.game.uses_quality_tiers() && !self.server_entry().pack_config_urls.is_empty() {
-            if let Some(tx) = &tx {
-                let _ = tx
-                    .send(ProgressEvent::Log(
-                        "pack updates apply in one step — use d / `kuro update`".into(),
-                    ))
-                    .await;
-            }
-            return Ok(ApplyReport::default());
-        }
         let from_version = self
             .local_version()?
             .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
@@ -531,8 +544,17 @@ impl GameManager {
         to_version: &str,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<ApplyReport> {
-        self.apply_inner_mode(patch_index, cdn_nodes, patch_cfg, to_version, tx, true)
-            .await
+        self.apply_inner_mode(
+            patch_index,
+            cdn_nodes,
+            patch_cfg,
+            to_version,
+            &incremental_dir(&self.game_folder),
+            true,
+            tx,
+            true,
+        )
+        .await
     }
 
     /// Apply one pack's `patchConfig` index without recording a game version.
@@ -540,16 +562,28 @@ impl GameManager {
     /// The official launcher writes `launcherDownloadConfig.version` only
     /// after `common` **and** the active tier have both applied, so the pack
     /// path owns the record and calls this for each part.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn apply_pack_index(
         &self,
         patch_index: &PatchIndex,
         cdn_nodes: &[&str],
         patch_cfg: &PatchConfig,
         to_version: &str,
+        inc: &Path,
+        clean_staging: bool,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<ApplyReport> {
-        self.apply_inner_mode(patch_index, cdn_nodes, patch_cfg, to_version, tx, false)
-            .await
+        self.apply_inner_mode(
+            patch_index,
+            cdn_nodes,
+            patch_cfg,
+            to_version,
+            inc,
+            clean_staging,
+            tx,
+            false,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -559,10 +593,11 @@ impl GameManager {
         cdn_nodes: &[&str],
         patch_cfg: &PatchConfig,
         to_version: &str,
+        inc: &Path,
+        clean_staging: bool,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
         record_version: bool,
     ) -> Result<ApplyReport> {
-        let inc = incremental_dir(&self.game_folder);
         if !inc.exists() {
             return Err(Error::MissingField(".incremental_download — run predownload first"));
         }
@@ -617,7 +652,7 @@ impl GameManager {
         for (idx, group) in groups.into_iter().enumerate() {
             let sem = sem.clone();
             let game_folder = self.game_folder.clone();
-            let inc = inc.clone();
+            let inc = inc.to_path_buf();
             let name = group.dest.clone();
             // The merge is one opaque KrDiff call, so a group is the finest
             // granularity this phase can report.
@@ -679,7 +714,7 @@ impl GameManager {
                 _ => (patch_cfg.base_url.clone(), vec![]),
             };
             let urls = node_urls(cdn_nodes, |base| ApiClient::resource_url(base, &from, &dst.dest));
-            let staged = state::staged_patch_path(&self.game_folder, &dst.dest);
+            let staged = inc.join(dst.dest.trim_start_matches('/'));
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = tmp_sibling(&staged, "dl");
             let size = dst.size;
@@ -720,7 +755,7 @@ impl GameManager {
                 if complete_dests.contains(&dst.dest) {
                     continue; // handled in the complete-files pass
                 }
-                let staged = state::staged_patch_path(&self.game_folder, &dst.dest);
+                let staged = inc.join(dst.dest.trim_start_matches('/'));
                 if !staged.exists() {
                     return Err(Error::Patch(format!(
                         "staged output missing for {} — rerun predownload/apply",
@@ -766,7 +801,7 @@ impl GameManager {
             if is_krpdiff(&item.dest) {
                 continue;
             }
-            let staged = state::staged_resource_path(&self.game_folder, &item.dest);
+            let staged = inc.join("resources").join(item.dest.trim_start_matches('/'));
             if !staged.exists() {
                 continue; // not downloaded (already current or not needed)
             }
@@ -835,7 +870,9 @@ impl GameManager {
         // Best-effort: the version is already recorded, so failing the whole
         // apply because staging was busy/locked would report failure for a
         // successful update. The next predownload reuses or clears the dir.
-        let _ = std::fs::remove_dir_all(&inc);
+        if clean_staging {
+            let _ = std::fs::remove_dir_all(inc);
+        }
 
         Ok(report)
     }

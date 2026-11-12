@@ -847,3 +847,172 @@ async fn pack_update_refuses_without_a_matching_patch() {
         .expect_err("a missing patchConfig entry was accepted");
     assert!(err.to_string().contains("no 3.7.1"), "unexpected error: {err}");
 }
+
+/// The predownload phase stages the deltas and writes a resumable plan. The
+/// game folder is untouched until `pack_apply`, which is what makes the TUI's
+/// `d` / `a` pair safe across a maintenance window.
+#[tokio::test]
+async fn pack_predownload_stages_without_touching_the_game() {
+    let base = tempfile::Builder::new()
+        .prefix("kuro-pack-predownload-")
+        .tempdir()
+        .unwrap();
+    let game = setup_game(base.path(), "10003");
+
+    let old_bin = b"OLD-COMMON-BIN".to_vec();
+    let new_bin = b"NEW-COMMON-BIN".to_vec();
+    let new_hd = b"NEW-HD-PAK".to_vec();
+    let common_dest = "Client/Binaries/Win64/Client-Win64-Shipping.exe";
+    let hd_dest = "Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak";
+    std::fs::create_dir_all(game.join("Client/Binaries/Win64")).unwrap();
+    std::fs::write(game.join(common_dest), &old_bin).unwrap();
+
+    let server = common::spawn_http_server(vec![
+        ("/common/patch.json".into(), manifest_json(&[(common_dest, &new_bin)])),
+        ("/hd/patch.json".into(), manifest_json(&[(hd_dest, &new_hd)])),
+        (format!("/zip/{common_dest}"), new_bin.clone()),
+        (format!("/zip/{hd_dest}"), new_hd.clone()),
+    ])
+    .await;
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let cfg = patch_config(&server);
+    let plan = mgr
+        .pack_download_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), None)
+        .await
+        .unwrap();
+    assert_eq!(plan.parts.len(), 2);
+    assert!(!plan.predownload);
+    assert_eq!(
+        std::fs::read(game.join(common_dest)).unwrap(),
+        old_bin,
+        "the download touched the game"
+    );
+    assert!(!game.join(hd_dest).exists(), "the download created a target file");
+
+    let plan_path = game.join(".incremental_download/packs/plan.json");
+    let plan_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&plan_path).unwrap()).unwrap();
+    assert_eq!(plan_json["ready"], true);
+    assert!(
+        game.join(".incremental_download/packs/common").is_dir(),
+        "common staging directory missing"
+    );
+    assert!(
+        game.join(".incremental_download/packs/hd").is_dir(),
+        "hd staging directory missing"
+    );
+
+    let report = mgr.pack_apply(None).await.unwrap();
+    assert_eq!(report.version, "3.8.0");
+    assert_eq!(std::fs::read(game.join(common_dest)).unwrap(), new_bin);
+    assert_eq!(std::fs::read(game.join(hd_dest)).unwrap(), new_hd);
+    assert!(!plan_path.exists(), "the applied plan was left behind");
+}
+
+/// Applying with no downloaded plan is an error, not a full-body fallback.
+#[tokio::test]
+async fn pack_apply_refuses_without_a_predownload() {
+    let base = tempfile::Builder::new().prefix("kuro-pack-noapply-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let err = mgr.pack_apply(None).await.expect_err("an empty apply was accepted");
+    assert!(
+        err.to_string().contains("no downloaded pack update"),
+        "unexpected error: {err}"
+    );
+}
+
+fn config_with_predownload(server: &str, formal: &str, pre: &str) -> PackConfig {
+    let pack = |version: &str, prefix: &str| PackEntry {
+        version: version.to_string(),
+        patch_config: vec![PackPatch {
+            version: "3.7.1".to_string(),
+            index_file: format!("{prefix}/patch.json"),
+            base_url: "zip".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut cfg = PackConfig::default();
+    cfg.cdn_list.push(PackCdnNode {
+        p: 1,
+        url: server.to_string(),
+        k1: Some(1),
+        k2: Some(1),
+    });
+    for name in ["common", "hd"] {
+        cfg.resource_packs.insert(name.to_string(), pack(formal, name));
+    }
+    cfg.bundles.insert(
+        "HD".to_string(),
+        PackBundle {
+            resource_packs: vec!["common".into(), "hd".into()],
+        },
+    );
+    let mut pre_cfg = PackConfig::default();
+    for name in ["common", "hd"] {
+        pre_cfg
+            .resource_packs
+            .insert(name.to_string(), pack(pre, &format!("pre-{name}")));
+    }
+    pre_cfg.bundles.insert(
+        "HD".to_string(),
+        PackBundle {
+            resource_packs: vec!["common".into(), "hd".into()],
+        },
+    );
+    cfg.predownload = Some(Box::new(pre_cfg));
+    cfg
+}
+
+/// `ww-manager`'s rule: the nested `predownload` block is the next version,
+/// and it is consumed only once the formal packs are current. While the formal
+/// update is still pending, the formal packs win.
+#[tokio::test]
+async fn nested_predownload_is_used_only_after_the_formal_update() {
+    let base = tempfile::Builder::new()
+        .prefix("kuro-pack-nested-pre-")
+        .tempdir()
+        .unwrap();
+    let game = setup_game(base.path(), "10003");
+    let server = common::spawn_http_server(vec![
+        (
+            "/common/patch.json".into(),
+            manifest_json(&[("Client/Binaries/Win64/a.dll", b"a")]),
+        ),
+        (
+            "/hd/patch.json".into(),
+            manifest_json(&[("Client/Content/HD/a.pak", b"b")]),
+        ),
+        (
+            "/pre-common/patch.json".into(),
+            manifest_json(&[("Client/Binaries/Win64/a.dll", b"c")]),
+        ),
+        (
+            "/pre-hd/patch.json".into(),
+            manifest_json(&[("Client/Content/HD/a.pak", b"d")]),
+        ),
+    ])
+    .await;
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+
+    // Formal 3.7.1 is current, so the nested 3.8.0 block is the target.
+    let pre_cfg = config_with_predownload(&server, "3.7.1", "3.8.0");
+    let plan = mgr
+        .pack_update_plan_inner(Quality::Hd, &pre_cfg, std::slice::from_ref(&server))
+        .await
+        .unwrap();
+    assert!(plan.predownload, "the nested predownload block was ignored");
+    assert_eq!(plan.version, "3.8.0");
+    assert_eq!(plan.parts.len(), 2);
+
+    // Formal 3.8.0 is pending, so the nested 3.9.0 block is not consumed yet.
+    let formal_cfg = config_with_predownload(&server, "3.8.0", "3.9.0");
+    let plan = mgr
+        .pack_update_plan_inner(Quality::Hd, &formal_cfg, std::slice::from_ref(&server))
+        .await
+        .unwrap();
+    assert!(!plan.predownload, "the formal update was skipped for a preinstall");
+    assert_eq!(plan.version, "3.8.0");
+    assert_eq!(plan.parts.len(), 2);
+}

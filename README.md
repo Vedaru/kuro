@@ -50,13 +50,14 @@ the wine dependency is removed by applying patches via
 - **install** — from-zero client download for any supported game
 - **quality packs and the official pack update (SD / HD / UHD)** — WuWa
   CN/Bilibili publish the game version and the tiers through the launcher's
-  pack document. `kuro update` applies `common` + the active tier through their
-  `patchConfig` deltas, which is the official 3.7.1 → 3.8.0 path: ~12 GiB of
-  patches instead of a 54 GiB full body. `kuro sync` uses the same path for
-  those channels. `kuro pack <folder> <sd|hd|uhd>` installs one tier from its
-  full `resourcePacks[<tier>]` manifest and writes the two launcher records.
-  `--check` writes nothing. Channels without a pack document (Global, PGR) stay
-  on the base index. PGR (Unity) has no quality packs at all
+  pack document. `kuro update` downloads and applies `common` + the active
+  tier through their `patchConfig` deltas, which is the official 3.7.1 → 3.8.0
+  path: ~12 GiB of patches instead of a 54 GiB full body. `--download` stages
+  a resumable predownload, `--apply` applies it, and `--check` previews it.
+  `kuro sync` uses the same path for those channels. `kuro pack <folder>
+  <sd|hd|uhd>` installs one tier from its full `resourcePacks[<tier>]` manifest
+  and writes the two launcher records. Channels without a pack document
+  (Global, PGR) stay on the base index. PGR (Unity) has no quality packs at all
 - **checkout** — CN ⇄ Bilibili channel switch for WuWa (diff-file swap + appId)
 - **built-in launcher** — `kuro play` starts the game itself. Since WuWa 3.7
   the client refuses to boot without `-krqlv=<SD|HD|UHD>` on its command line,
@@ -113,7 +114,7 @@ kuro                    # TUI — auto-detects installed games in Steam librarie
 kuro <folder>...        # or point at game folders explicitly
 kuro status <folder>    # CLI: print local/remote versions
 kuro sync <folder> [--quality <sd|hd|uhd>]              # CLI: pack update + verify
-kuro update <folder> [--check]                          # CLI: common + tier patchConfig update
+kuro update <folder> [--check | --download | --apply]   # CLI: common + tier deltas
 kuro install <wuwa|pgr> <cn|bilibili|global> <folder> [--quality <sd|hd|uhd>]
 kuro quality <folder> [sd|hd|uhd]                       # CLI: which pack the client mounts
 kuro pack [folder] <sd|hd|uhd> [--check]                # CLI: install one tier + register it
@@ -121,9 +122,12 @@ kuro pack [folder] <sd|hd|uhd> [--check]                # CLI: install one tier 
 
 For WuWa CN/Bilibili the pack document is the single update path. `kuro sync`
 applies `common` + the active tier's `patchConfig` deltas and reports the
-result. `kuro update` is the same operation as an explicit command, with
-`--check` to see the download first. `common` is the base client, so a tier
-install (`kuro pack`) never touches it.
+result. `kuro update` is the same operation as an explicit command: `--check`
+previews it, `--download` stages it, `--apply` applies the staged plan, and no
+flag does both. `common` is the base client, so a tier install (`kuro pack`)
+never touches it. The pack document's nested `predownload` block is consumed
+only once the formal packs are current, and the resulting preinstall plan is
+applied only on an explicit `a` / `--apply`.
 
 A pack manifest has exactly one path rule: a tier owns
 `Client/Content/<TIER>/`, and any pack may write the target version's
@@ -160,8 +164,8 @@ are never compared side by side.
 |-----|--------|
 | `Esc` | back to the games list |
 | `p` | play |
-| `d` | update (pack document for WuWa CN/Bilibili, base predownload otherwise) |
-| `a` | apply a stage-only predownload (PGR / WuWa Global) |
+| `d` | predownload (pack document for WuWa CN/Bilibili, base index otherwise) |
+| `a` | apply the downloaded pack predownload, or the base predownload on PGR / WuWa Global |
 | `s` | sync / repair |
 | `c` | checkout server (CN ⇄ Bilibili) |
 | `k` | force-kill a hung client |
@@ -255,7 +259,9 @@ workspace member, and its two dead-code warnings are not ours to fix.
 - The pack update path needs a `patchConfig` entry matching the installed
   version. If the channel has not published one, kuro refuses rather than
   downloading a full body or switching tiers. The nested `predownload` block
-  (the launcher's preinstall channel) is not consumed yet.
+  is consumed only once the formal packs are current, and a preinstall plan is
+  applied only on an explicit `a` / `--apply`, with a warning that the version
+  is not formal yet.
 - `kuro pack` installs one tier at a time; nothing switches between installed
   tiers on disk. Each tier is a disjoint ~20–62 GiB body, so keeping more than
   one installed is a disk-space decision, and the `-krqlv=` argument is what

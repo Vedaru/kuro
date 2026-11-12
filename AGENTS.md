@@ -83,10 +83,13 @@ edits.
   discriminator; there is no per-option-pack tag or tier-suffix check. The rest
   of `Client/Saved` is game state. `common` is the base client, so a tier
   install (`kuro pack`) never touches it.
-- **Pack updates go through `patchConfig`, not a full body.** `pack_update`
-  applies `common` first, then the active tier, and writes
-  `launcherDownloadConfig.version` only after both land. A missing source
-  version delta is a refusal, never a full-body or other-tier fallback.
+- **Pack updates go through `patchConfig`, not a full body.** `pack_download`
+  stages into `.incremental_download/packs/<name>` and writes a resumable
+  `plan.json`; `pack_apply` applies `common` first, then the active tier, and
+  writes `launcherDownloadConfig.version` only after both land. The nested
+  `predownload` block is used only when the formal packs are current. A
+  missing source-version delta is a refusal, never a full-body or other-tier
+  fallback.
 - **The tier body is matched as spelled, not case-folded.** The game reads
   `Client/Content/HD`; on a case-sensitive host a manifest spelling
   `client/content/hd` would write files the game never reads. Leading slashes

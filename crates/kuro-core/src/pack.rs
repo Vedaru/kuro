@@ -86,6 +86,14 @@
 //! then the tier, and only then write `launcherDownloadConfig.version =
 //! resourcePacks.common.version`. A missing source-version delta is a refusal,
 //! never a full-body fallback or a switch to another tier.
+//!
+//! The two phases are also exposed separately. [`GameManager::pack_download`]
+//! stages into `.incremental_download/packs/<name>` (one directory per pack,
+//! so their `.krpdiff` names can never collide) and writes a resumable
+//! `plan.json`. [`GameManager::pack_apply`] applies that plan and only then
+//! writes the version. The pack document's nested `predownload` block is the
+//! next version's pack set: it is used only once the formal `common` and tier
+//! versions are installed, matching `ww-manager`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,6 +159,9 @@ pub struct PackUpdatePart {
 pub struct PackUpdateReport {
     /// The game version recorded after the update, i.e. `common`'s target.
     pub version: String,
+    /// True when this came from the pack document's nested `predownload`
+    /// block, not the formal packs.
+    pub predownload: bool,
     pub parts: Vec<PackUpdatePart>,
 }
 
@@ -158,6 +169,7 @@ pub struct PackUpdateReport {
 #[derive(Debug, Clone, Default)]
 pub struct PackUpdatePlan {
     pub version: String,
+    pub predownload: bool,
     pub parts: Vec<PackUpdatePlanPart>,
 }
 
@@ -177,6 +189,74 @@ struct PackUpdateStep {
     from: String,
     to: String,
     patch: kuro_api::PackPatch,
+}
+
+const PACK_PLAN_FILE: &str = "plan.json";
+
+/// A downloaded, not-yet-applied pack update. The indexes are persisted so the
+/// apply step verifies the exact bytes the download step resolved, even if the
+/// CDN republishes in between.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PackPlanFile {
+    schema: u32,
+    server: String,
+    tier: String,
+    bases: Vec<String>,
+    bundle: Vec<String>,
+    predownload: bool,
+    ready: bool,
+    parts: Vec<PackPlanPart>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PackPlanPart {
+    name: String,
+    from: String,
+    to: String,
+    patch: kuro_api::PackPatch,
+    index: PatchIndex,
+}
+
+fn pack_staging_dir(game_folder: &Path, name: &str) -> PathBuf {
+    state::incremental_dir(game_folder).join("packs").join(name)
+}
+
+fn pack_plan_path(game_folder: &Path) -> PathBuf {
+    state::incremental_dir(game_folder).join("packs").join(PACK_PLAN_FILE)
+}
+
+/// The pack document's predownload block is the *next* version's pack set.
+/// The formal packs stay the priority while they still have a delta, exactly
+/// like `ww-manager`; only once `common` and the active tier are at the formal
+/// versions does the nested block become the target.
+fn effective_pack_config<'a>(
+    config: &'a PackConfig,
+    tier: Quality,
+    local: &str,
+    current_tier: &str,
+) -> Result<(&'a PackConfig, bool)> {
+    let formal_current = config.resource_packs.get("common").is_some_and(|e| e.version == local)
+        && config
+            .resource_packs
+            .get(&tier.pack_key())
+            .is_some_and(|e| e.version == current_tier);
+    if formal_current {
+        if let Some(pre) = &config.predownload {
+            if pre.resource_packs.is_empty() {
+                return Err(Error::Patch(
+                    "the pack document's predownload block has no resourcePacks".into(),
+                ));
+            }
+            if !pre.bundles.contains_key(tier.as_arg()) {
+                return Err(Error::Patch(format!(
+                    "the predownload block has no bundle for {}",
+                    tier.as_arg()
+                )));
+            }
+            return Ok((pre.as_ref(), true));
+        }
+    }
+    Ok((config, false))
 }
 
 /// Build the `common` + tier delta list. A missing `patchConfig` entry is a
@@ -728,28 +808,25 @@ impl crate::GameManager {
     }
 
     /// The official launcher's pack update: `common` **and** the active tier,
-    /// each through its own `patchConfig` delta, applied together.
+    /// each through its own `patchConfig` delta, downloaded together and
+    /// applied together.
     ///
-    /// This is the path that moves a CN/Bilibili install from, say, 3.7.1 to
-    /// 3.8.0 without downloading a full 42 GiB body. It deliberately refuses
-    /// when a matching delta is missing rather than falling back to a full
-    /// tier or another tier.
+    /// This is the one-step form used by `kuro update`. The TUI exposes the
+    /// two phases separately: [`Self::pack_download`] then [`Self::pack_apply`].
     pub async fn pack_update(
         &self,
         tier: Quality,
         tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
     ) -> Result<PackUpdateReport> {
-        if !self.game.uses_quality_tiers() {
-            return Err(Error::Unsupported(
-                "this game has no quality packs — only Wuthering Waves has Client/Content/<TIER>",
-            ));
+        let plan = self.pack_download(tier, tx.clone()).await?;
+        if plan.parts.is_empty() {
+            return Ok(PackUpdateReport {
+                version: plan.version,
+                predownload: plan.predownload,
+                parts: Vec::new(),
+            });
         }
-        let config = self.pack_config().await?;
-        let bases: Vec<String> = ApiClient::pack_cdn_candidates(&config)?
-            .iter()
-            .map(|n| n.url.clone())
-            .collect();
-        self.pack_update_inner(tier, &config, &bases, tx).await
+        self.pack_apply(tx).await
     }
 
     /// [`GameManager::pack_update`] with the pack document and CDN already
@@ -761,55 +838,125 @@ impl crate::GameManager {
         bases: &[String],
         tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
     ) -> Result<PackUpdateReport> {
+        let plan = self.pack_download_inner(tier, config, bases, tx.clone()).await?;
+        if plan.parts.is_empty() {
+            return Ok(PackUpdateReport {
+                version: plan.version,
+                predownload: plan.predownload,
+                parts: Vec::new(),
+            });
+        }
+        self.pack_apply(tx).await
+    }
+
+    /// Stage the `common` + tier deltas without touching the game folder.
+    ///
+    /// The plan and the staged payloads live under
+    /// `.incremental_download/packs/`, one directory per pack, so `common` and
+    /// `hd` can never overwrite each other's `.krpdiff` files.
+    pub async fn pack_download(
+        &self,
+        tier: Quality,
+        tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
+    ) -> Result<PackUpdatePlan> {
         if !self.game.uses_quality_tiers() {
             return Err(Error::Unsupported(
                 "this game has no quality packs — only Wuthering Waves has Client/Content/<TIER>",
             ));
         }
+        let config = self.pack_config().await?;
+        let bases: Vec<String> = ApiClient::pack_cdn_candidates(&config)?
+            .iter()
+            .map(|n| n.url.clone())
+            .collect();
+        self.pack_download_inner(tier, &config, &bases, tx).await
+    }
+
+    /// [`GameManager::pack_download`] with an injected document and CDN.
+    pub async fn pack_download_inner(
+        &self,
+        tier: Quality,
+        config: &PackConfig,
+        bases: &[String],
+        tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
+    ) -> Result<PackUpdatePlan> {
         if bases.is_empty() {
             return Err(Error::NoCdnNode);
         }
         let local = self
             .local_version()?
             .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
-
-        let tier_key = tier.pack_key();
         let current_tier = installed_tier_version(&self.game_folder, tier, &local)?;
-
-        let work = pack_update_steps(tier, config, &local, &current_tier)?;
+        let (effective, is_predownload) = effective_pack_config(config, tier, &local, &current_tier)?;
+        let work = pack_update_steps(tier, effective, &local, &current_tier)?;
 
         if work.is_empty() {
-            return Ok(PackUpdateReport {
+            let _ = std::fs::remove_dir_all(state::incremental_dir(&self.game_folder).join("packs"));
+            return Ok(PackUpdatePlan {
                 version: local,
-                ..Default::default()
+                predownload: is_predownload,
+                parts: Vec::new(),
             });
         }
 
-        let mut report = PackUpdateReport {
-            version: local.clone(),
+        let common_target = work
+            .iter()
+            .find(|p| p.name == "common")
+            .map(|p| p.to.clone())
+            .unwrap_or_else(|| local.clone());
+        let mut plan_file = PackPlanFile {
+            schema: 1,
+            server: self.server.to_string(),
+            tier: tier.as_arg().to_string(),
+            bases: bases.to_vec(),
+            bundle: bundle_packs(effective, tier),
+            predownload: is_predownload,
+            ready: false,
             parts: Vec::new(),
         };
+        let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
         for part in &work {
-            if let Some(tx) = &tx {
-                let _ = tx
-                    .send(crate::ProgressEvent::Log(format!(
-                        "pack update {}: {} → {}",
-                        part.name, part.from, part.to
-                    )))
-                    .await;
-            }
-            let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
             let index = self
                 .api_client()
                 .fetch_manifest_verified(&base_refs, &part.patch.index_file, &part.patch.index_file_md5)
                 .await?;
             validate_pack_update_index(&part.name, &part.to, &index)?;
+            plan_file.parts.push(PackPlanPart {
+                name: part.name.clone(),
+                from: part.from.clone(),
+                to: part.to.clone(),
+                patch: part.patch.clone(),
+                index,
+            });
+        }
+        let plan_path = pack_plan_path(&self.game_folder);
+        state::write_atomic(&plan_path, &serde_json::to_string_pretty(&plan_file)?)?;
+
+        let mut report = PackUpdatePlan {
+            version: common_target,
+            predownload: is_predownload,
+            parts: Vec::new(),
+        };
+        for part in &plan_file.parts {
+            let stage = pack_staging_dir(&self.game_folder, &part.name);
             let patch_cfg = kuro_api::PatchConfig {
                 version: part.from.clone(),
                 index_file: part.patch.index_file.clone(),
                 base_url: part.patch.base_url.clone(),
             };
-            let plan = self.plan_from_patch_index(&index, &part.from, &part.to);
+            let part_plan = self.plan_from_patch_index_in(&part.index, &part.from, &part.to, &stage);
+            if let Some(tx) = &tx {
+                let _ = tx
+                    .send(crate::ProgressEvent::Log(format!(
+                        "predownload {}: {} → {} ({} file(s), {:.1} GiB)",
+                        part.name,
+                        part.from,
+                        part.to,
+                        part_plan.patch_groups.len() + part_plan.full_files.len(),
+                        part_plan.total_bytes as f64 / (1u64 << 30) as f64
+                    )))
+                    .await;
+            }
             let download_tx = match &tx {
                 Some(tx) => tx.clone(),
                 None => {
@@ -817,10 +964,92 @@ impl crate::GameManager {
                     tx
                 }
             };
-            self.predownload_index(&plan, &index, &patch_cfg, bases, download_tx)
+            self.predownload_index(&part_plan, &part.index, &patch_cfg, bases, &stage, download_tx)
                 .await?;
+            report.parts.push(PackUpdatePlanPart {
+                name: part.name.clone(),
+                from_version: part.from.clone(),
+                to_version: part.to.clone(),
+                files: part_plan.patch_groups.len() + part_plan.full_files.len(),
+                bytes: part_plan.total_bytes,
+            });
+        }
+        plan_file.ready = true;
+        state::write_atomic(&plan_path, &serde_json::to_string_pretty(&plan_file)?)?;
+        Ok(report)
+    }
+
+    /// Apply a completed pack predownload. `common` first, then the active
+    /// tier. The version and tier records are written only after both land.
+    pub async fn pack_apply(
+        &self,
+        tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
+    ) -> Result<PackUpdateReport> {
+        let path = pack_plan_path(&self.game_folder);
+        let data = std::fs::read_to_string(&path)
+            .map_err(|_| Error::Patch("no downloaded pack update — run the predownload first".into()))?;
+        let plan: PackPlanFile = serde_json::from_str(&data)?;
+        if plan.schema != 1 {
+            return Err(Error::Patch("unsupported pack update plan".into()));
+        }
+        if !plan.ready {
+            return Err(Error::Patch(
+                "the pack predownload did not finish — run it again".into(),
+            ));
+        }
+        if plan.predownload {
+            if let Some(tx) = &tx {
+                let _ = tx
+                    .send(crate::ProgressEvent::Log(
+                        "this is a preinstall — the version is not formal yet; apply after it opens".into(),
+                    ))
+                    .await;
+            }
+        }
+        let local = self
+            .local_version()?
+            .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
+        let tier = Quality::parse(&plan.tier)
+            .ok_or_else(|| Error::Patch(format!("unknown tier `{}` in the pack plan", plan.tier)))?;
+        let current_tier = installed_tier_version(&self.game_folder, tier, &local)?;
+
+        for part in &plan.parts {
+            let current = if part.name == "common" { &local } else { &current_tier };
+            if current != &part.from && current != &part.to {
+                return Err(Error::Patch(format!(
+                    "{} changed from {} to {} since the predownload — download it again",
+                    part.name, part.from, current
+                )));
+            }
+        }
+
+        let base_refs: Vec<&str> = plan.bases.iter().map(String::as_str).collect();
+        let mut report = PackUpdateReport {
+            version: local.clone(),
+            predownload: plan.predownload,
+            parts: Vec::new(),
+        };
+        for part in &plan.parts {
+            let current = if part.name == "common" { &local } else { &current_tier };
+            if current == &part.to {
+                continue; // already applied, finish the records below
+            }
+            let stage = pack_staging_dir(&self.game_folder, &part.name);
+            let patch_cfg = kuro_api::PatchConfig {
+                version: part.from.clone(),
+                index_file: part.patch.index_file.clone(),
+                base_url: part.patch.base_url.clone(),
+            };
+            if let Some(tx) = &tx {
+                let _ = tx
+                    .send(crate::ProgressEvent::Log(format!(
+                        "applying {}: {} → {}",
+                        part.name, part.from, part.to
+                    )))
+                    .await;
+            }
             let applied = self
-                .apply_pack_index(&index, &base_refs, &patch_cfg, &part.to, tx.clone())
+                .apply_pack_index(&part.index, &base_refs, &patch_cfg, &part.to, &stage, true, tx.clone())
                 .await?;
             report.parts.push(PackUpdatePart {
                 name: part.name.clone(),
@@ -830,14 +1059,16 @@ impl crate::GameManager {
             });
         }
 
-        let common_target = work
+        let common_target = plan
+            .parts
             .iter()
             .find(|p| p.name == "common")
             .map(|p| p.to.clone())
             .unwrap_or_else(|| local.clone());
-        let tier_target = work
+        let tier_target = plan
+            .parts
             .iter()
-            .find(|p| p.name == tier_key)
+            .find(|p| p.name == tier.pack_key())
             .map(|p| p.to.clone())
             .unwrap_or_else(|| current_tier.clone());
 
@@ -845,8 +1076,8 @@ impl crate::GameManager {
             .unwrap_or_else(|| kuro_api::LocalConfig::new(common_target.clone(), self.server_entry().app_id))
             .retargeted(common_target.clone(), self.server_entry().app_id);
         state::write_local_config(&self.game_folder, &cfg)?;
-        let bundle = bundle_packs(config, tier);
-        register(&self.game_folder, tier, &tier_target, Some(&bundle), None)?;
+        register(&self.game_folder, tier, &tier_target, Some(&plan.bundle), None)?;
+        let _ = std::fs::remove_dir_all(state::incremental_dir(&self.game_folder).join("packs"));
         report.version = common_target;
         Ok(report)
     }
@@ -880,7 +1111,8 @@ impl crate::GameManager {
             .local_version()?
             .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
         let current_tier = installed_tier_version(&self.game_folder, tier, &local)?;
-        let work = pack_update_steps(tier, config, &local, &current_tier)?;
+        let (effective, is_predownload) = effective_pack_config(config, tier, &local, &current_tier)?;
+        let work = pack_update_steps(tier, effective, &local, &current_tier)?;
         let common_target = work
             .iter()
             .find(|p| p.name == "common")
@@ -894,7 +1126,8 @@ impl crate::GameManager {
                 .fetch_manifest_verified(&base_refs, &part.patch.index_file, &part.patch.index_file_md5)
                 .await?;
             validate_pack_update_index(&part.name, &part.to, &index)?;
-            let plan = self.plan_from_patch_index(&index, &part.from, &part.to);
+            let stage = pack_staging_dir(&self.game_folder, &part.name);
+            let plan = self.plan_from_patch_index_in(&index, &part.from, &part.to, &stage);
             parts.push(PackUpdatePlanPart {
                 name: part.name.clone(),
                 from_version: part.from.clone(),
@@ -905,6 +1138,7 @@ impl crate::GameManager {
         }
         Ok(PackUpdatePlan {
             version: common_target,
+            predownload: is_predownload,
             parts,
         })
     }
