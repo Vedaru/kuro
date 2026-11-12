@@ -96,8 +96,8 @@ fn default_folder_for(game: Game) -> String {
 enum UiEvent {
     /// Status result for one game (index into `UiState::statuses`).
     Status(usize, Result<GameStatus, String>),
-    Progress(ProgressEvent),
-    TaskDone(Result<String, String>),
+    Progress(usize, ProgressEvent),
+    TaskDone(usize, Result<String, String>),
 }
 
 #[derive(Default)]
@@ -113,6 +113,8 @@ struct TaskUi {
     done_bytes: u64,
     /// In-flight files (parallel downloads), each with its own bar.
     files: Vec<FileState>,
+    /// Present only for tasks that are safe to stop.
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// How a task ended. Stopped is deliberately not an error: the user aborted
@@ -153,11 +155,8 @@ struct UiState {
     screen: Screen,
     /// Last user-facing message, shown in the task panel when it is idle.
     notice: Option<String>,
-    task: Option<TaskUi>,
-    /// Handle for the running task, when it is safe to stop it. The handle is
-    /// awaited on stop so `stopped` means the task is gone, not merely asked.
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-    busy: bool,
+    /// One task slot per game, so WuWa and PGR can install at the same time.
+    tasks: Vec<Option<TaskUi>>,
     /// Game folders in the manager; ←/→ switches between them.
     paths: Vec<String>,
     active: usize,
@@ -165,9 +164,6 @@ struct UiState {
     focus: Focus,
     /// Open install modal (game + server selection).
     install: Option<InstallDraft>,
-    /// Folder the running install writes to, so its row can be added when it
-    /// finishes (a blank TUI has only the placeholder row).
-    install_target: Option<String>,
     /// Help overlay open.
     show_help: bool,
     /// Cached status per game path.
@@ -278,8 +274,46 @@ fn notify(state: &mut UiState, msg: impl Into<String>) {
     state.notice = Some(msg);
 }
 
-async fn stop_task(state: &mut UiState) {
-    let Some(handle) = state.task_handle.take() else {
+fn game_task(state: &UiState, idx: usize) -> Option<&TaskUi> {
+    state.tasks.get(idx).and_then(Option::as_ref)
+}
+
+fn running(state: &UiState, idx: usize) -> bool {
+    game_task(state, idx).is_some_and(|t| t.finished.is_none())
+}
+
+fn any_running(state: &UiState) -> bool {
+    state
+        .tasks
+        .iter()
+        .any(|t| t.as_ref().is_some_and(|t| t.finished.is_none()))
+}
+
+fn start_task(
+    state: &mut UiState,
+    idx: usize,
+    kind: impl Into<String>,
+    target: Option<String>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+) {
+    if idx >= state.tasks.len() {
+        return;
+    }
+    state.tasks[idx] = Some(TaskUi {
+        kind: kind.into(),
+        target,
+        handle,
+        ..Default::default()
+    });
+}
+
+async fn stop_task(state: &mut UiState, idx: usize) {
+    let Some(handle) = state
+        .tasks
+        .get_mut(idx)
+        .and_then(Option::as_mut)
+        .and_then(|t| t.handle.take())
+    else {
         notify(state, "this task cannot be stopped");
         return;
     };
@@ -288,12 +322,10 @@ async fn stop_task(state: &mut UiState) {
     // download cannot keep streaming into the staging tree while the user
     // starts the next one, and so "stopped" is not a guess.
     let _ = handle.await;
-    state.install_target = None;
-    if let Some(task) = state.task.as_mut() {
+    if let Some(task) = state.tasks.get_mut(idx).and_then(Option::as_mut) {
         task.finished = Some(TaskEnd::Stopped);
         task.files.clear();
     }
-    state.busy = false;
     notify(
         state,
         "stopped — partial files are kept; the next run continues from them",
@@ -354,6 +386,7 @@ fn remember_install_path(state: &mut UiState, target: &str) -> usize {
     }
     state.paths.push(target.to_string());
     state.statuses.push(None);
+    state.tasks.push(None);
     state.quality_sel.push(None);
     state.paths.len() - 1
 }
@@ -1225,6 +1258,7 @@ async fn run(
         ..Default::default()
     };
     state.statuses = vec![None; state.paths.len()];
+    state.tasks = (0..state.paths.len()).map(|_| None).collect();
     state.quality_sel = state
         .paths
         .iter()
@@ -1242,8 +1276,11 @@ async fn run(
                 let path = state.paths[state.active].clone();
 
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    if state.busy {
-                        stop_task(&mut state).await;
+                    if running(&state, state.active) {
+                        let idx = state.active;
+                        stop_task(&mut state, idx).await;
+                    } else if any_running(&state) {
+                        notify(&mut state, "another game has a task — select it to stop, or q to quit");
                     } else {
                         break;
                     }
@@ -1304,29 +1341,29 @@ async fn run(
                         _ => {}
                     }
                     if let Some(tier) = install {
-                        if !state.busy {
-                            state.busy = true;
-                            state.task = Some(TaskUi {
-                                kind: format!("pack-{}", tier.as_arg().to_ascii_lowercase()),
-                                ..Default::default()
-                            });
+                        if running(&state, state.active) {
+                            notify(&mut state, "this game already has a task");
+                        } else {
                             state.focus = Focus::Task;
                             notify(
                                 &mut state,
                                 format!("installing {} paks — the game must be closed", tier.as_arg()),
                             );
-                            state.task_handle = Some(spawn_simple(&tx, &path, TaskKind::Pack(tier)));
-                        } else {
-                            notify(&mut state, "busy — wait for the current task to finish");
+                            let idx = state.active;
+                            let handle = spawn_simple(&tx, &path, TaskKind::Pack(tier), idx);
+                            start_task(
+                                &mut state,
+                                idx,
+                                format!("pack-{}", tier.as_arg().to_ascii_lowercase()),
+                                Some(path.clone()),
+                                Some(handle),
+                            );
                         }
                     }
                     if let Some(tier) = remove {
-                        if !state.busy {
-                            state.busy = true;
-                            state.task = Some(TaskUi {
-                                kind: format!("clean-{}", tier.as_arg().to_ascii_lowercase()),
-                                ..Default::default()
-                            });
+                        if running(&state, state.active) {
+                            notify(&mut state, "this game already has a task");
+                        } else {
                             state.focus = Focus::Task;
                             notify(
                                 &mut state,
@@ -1335,9 +1372,15 @@ async fn run(
                                     tier.as_arg()
                                 ),
                             );
-                            state.task_handle = Some(spawn_simple(&tx, &path, TaskKind::RemovePack(tier)));
-                        } else {
-                            notify(&mut state, "busy — wait for the current task to finish");
+                            let idx = state.active;
+                            let handle = spawn_simple(&tx, &path, TaskKind::RemovePack(tier), idx);
+                            start_task(
+                                &mut state,
+                                idx,
+                                format!("clean-{}", tier.as_arg().to_ascii_lowercase()),
+                                Some(path.clone()),
+                                Some(handle),
+                            );
                         }
                     }
                     if !close {
@@ -1410,19 +1453,16 @@ async fn run(
                 }
                 if let Some((game, server, target, body)) = start_install {
                     state.install = None;
-                    if !state.busy {
-                        state.busy = true;
-                        state.task = Some(TaskUi {
-                            kind: "install".into(),
-                            target: Some(target.clone()),
-                            ..Default::default()
-                        });
+                    let idx = state.active;
+                    if running(&state, idx) {
+                        notify(&mut state, "this game already has a task");
+                    } else {
                         notify(
                             &mut state,
                             format!("installing {} ({}) into {target}", pretty_game(game), server),
                         );
-                        state.install_target = Some(target.clone());
-                        state.task_handle = Some(spawn_install(&tx, &target, game, server, body));
+                        let handle = spawn_install(&tx, &target, game, server, body, idx);
+                        start_task(&mut state, idx, "install", Some(target.clone()), Some(handle));
                     }
                     // The Enter that started the install belongs to the modal,
                     // not to the games list (otherwise it also opens Detail).
@@ -1439,7 +1479,11 @@ async fn run(
                         }
                         KeyCode::Enter => {
                             if is_blank_install(&state, state.active) {
-                                state.install = Some(draft_for_active(&state));
+                                if running(&state, state.active) {
+                                    notify(&mut state, "this game already has a task");
+                                } else {
+                                    state.install = Some(draft_for_active(&state));
+                                }
                             } else if let Some(path) = state.paths.get(state.active).cloned() {
                                 state.screen = Screen::Detail;
                                 if state.statuses.get(state.active).and_then(|s| s.as_ref()).is_none() {
@@ -1448,20 +1492,20 @@ async fn run(
                             }
                         }
                         KeyCode::Char('i') => {
-                            if !state.busy {
+                            if running(&state, state.active) {
+                                notify(&mut state, "this game already has a task");
+                            } else {
                                 state.install = Some(draft_for_active(&state));
                             }
                         }
                         KeyCode::Char('r') => {
-                            if !state.busy {
-                                for i in 0..state.paths.len() {
-                                    spawn_status(&tx, &state.paths[i], i);
-                                }
-                                notify(&mut state, "refreshing all games…");
+                            for i in 0..state.paths.len() {
+                                spawn_status(&tx, &state.paths[i], i);
                             }
+                            notify(&mut state, "refreshing all games…");
                         }
                         KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
-                        KeyCode::Esc if state.busy => {}
+                        KeyCode::Esc if any_running(&state) => {}
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         _ => {}
                     }
@@ -1473,13 +1517,13 @@ async fn run(
                     KeyCode::Char('q') => break,
                     KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
                     KeyCode::Char('p') => {
-                        if !state.busy {
+                        if !running(&state, state.active) {
                             play(&mut state, &path);
                         }
                     }
                     KeyCode::Char('k') => kill_game(&mut state, &path),
                     KeyCode::Char('Q') => {
-                        if !state.busy {
+                        if !running(&state, state.active) {
                             let game = active_game(&state);
                             if game.uses_quality_tiers() {
                                 state.quality_modal = Some(open_quality_draft(&path, &state));
@@ -1492,7 +1536,9 @@ async fn run(
                         }
                     }
                     KeyCode::Char('i') => {
-                        if !state.busy {
+                        if running(&state, state.active) {
+                            notify(&mut state, "this game already has a task");
+                        } else {
                             state.install = Some(draft_for_active(&state));
                         }
                     }
@@ -1503,67 +1549,60 @@ async fn run(
                         };
                     }
                     KeyCode::Char('r') => {
-                        if !state.busy {
-                            spawn_status(&tx, &path, state.active);
-                        }
+                        spawn_status(&tx, &path, state.active);
                     }
                     KeyCode::Char('d') => {
-                        if !state.busy {
-                            state.busy = true;
-                            state.task = Some(TaskUi {
-                                kind: "predownload".into(),
-                                ..Default::default()
-                            });
+                        if running(&state, state.active) {
+                            notify(&mut state, "this game already has a task");
+                        } else {
                             state.focus = Focus::Task;
-                            state.task_handle = Some(spawn_predownload(&tx, &path));
+                            let idx = state.active;
+                            let handle = spawn_predownload(&tx, &path, idx);
+                            start_task(&mut state, idx, "predownload", Some(path.clone()), Some(handle));
                         }
                     }
                     KeyCode::Char('a') => {
-                        if !state.busy {
-                            state.busy = true;
-                            state.task = Some(TaskUi {
-                                kind: "apply".into(),
-                                ..Default::default()
-                            });
+                        if running(&state, state.active) {
+                            notify(&mut state, "this game already has a task");
+                        } else {
                             state.focus = Focus::Task;
-                            state.task_handle = None;
-                            spawn_simple(&tx, &path, TaskKind::Apply);
+                            let idx = state.active;
+                            drop(spawn_simple(&tx, &path, TaskKind::Apply, idx));
+                            start_task(&mut state, idx, "apply", Some(path.clone()), None);
                         }
                     }
                     KeyCode::Char('s') => {
-                        if !state.busy {
-                            state.busy = true;
-                            state.task = Some(TaskUi {
-                                kind: "sync".into(),
-                                ..Default::default()
-                            });
+                        if running(&state, state.active) {
+                            notify(&mut state, "this game already has a task");
+                        } else {
                             state.focus = Focus::Task;
-                            state.task_handle = Some(spawn_simple(&tx, &path, TaskKind::Sync));
+                            let idx = state.active;
+                            let handle = spawn_simple(&tx, &path, TaskKind::Sync, idx);
+                            start_task(&mut state, idx, "sync", Some(path.clone()), Some(handle));
                         }
                     }
-                    KeyCode::Char('c') if !state.busy => {
-                        let game = active_game(&state);
-                        let server = state
-                            .statuses
-                            .get(state.active)
-                            .and_then(|s| s.as_ref())
-                            .and_then(|r| r.as_ref().ok())
-                            .map(|s| s.server);
-                        if !checkout_possible(game, server) {
-                            notify(
-                                &mut state,
-                                "no server to switch to — checkout is Wuthering Waves CN ↔ Bilibili only",
-                            );
+                    KeyCode::Char('c') => {
+                        if running(&state, state.active) {
+                            notify(&mut state, "this game already has a task");
                         } else {
-                            state.busy = true;
-                            state.task = Some(TaskUi {
-                                kind: "checkout (in place)".into(),
-                                target: Some(path.clone()),
-                                ..Default::default()
-                            });
-                            state.focus = Focus::Task;
-                            state.task_handle = None;
-                            spawn_simple(&tx, &path, TaskKind::Checkout);
+                            let game = active_game(&state);
+                            let server = state
+                                .statuses
+                                .get(state.active)
+                                .and_then(|s| s.as_ref())
+                                .and_then(|r| r.as_ref().ok())
+                                .map(|s| s.server);
+                            if !checkout_possible(game, server) {
+                                notify(
+                                    &mut state,
+                                    "no server to switch to — checkout is Wuthering Waves CN ↔ Bilibili only",
+                                );
+                            } else {
+                                state.focus = Focus::Task;
+                                let idx = state.active;
+                                drop(spawn_simple(&tx, &path, TaskKind::Checkout, idx));
+                                start_task(&mut state, idx, "checkout (in place)", Some(path.clone()), None);
+                            }
                         }
                     }
                     _ => {}
@@ -1572,16 +1611,6 @@ async fn run(
         }
 
         while let Ok(ev) = rx.try_recv() {
-            // A stopped task may still have progress (and even a Done) queued
-            // from before the abort landed. Do not let those revive it.
-            if matches!(ev, UiEvent::Progress(_) | UiEvent::TaskDone(_))
-                && matches!(
-                    state.task.as_ref().and_then(|t| t.finished.as_ref()),
-                    Some(TaskEnd::Stopped)
-                )
-            {
-                continue;
-            }
             match ev {
                 UiEvent::Status(idx, s) => {
                     let line = match &s {
@@ -1612,27 +1641,22 @@ async fn run(
                         state.statuses[idx] = Some(s);
                     }
                 }
-                UiEvent::Progress(p) => match p {
-                    ProgressEvent::Log(m) => debug_log(m),
-                    ProgressEvent::SetTotal { bytes } => {
-                        if let Some(t) = state.task.as_mut() {
+                UiEvent::Progress(idx, p) => {
+                    let Some(t) = state.tasks.get_mut(idx).and_then(Option::as_mut) else {
+                        continue;
+                    };
+                    if matches!(t.finished, Some(TaskEnd::Stopped)) {
+                        continue;
+                    }
+                    match p {
+                        ProgressEvent::Log(m) => debug_log(m),
+                        ProgressEvent::SetTotal { bytes } => {
                             t.total_bytes = bytes;
                             t.files.clear(); // repair phase starts; drop the verify bar
                         }
-                    }
-                    ProgressEvent::SetQueued { count } => {
-                        if let Some(t) = state.task.as_mut() {
-                            t.queued = count;
-                        }
-                    }
-                    ProgressEvent::GroupStart { name: _ } => {
-                        if let Some(t) = state.task.as_mut() {
-                            // queued for download; a row appears once it starts
-                            t.queued += 1;
-                        }
-                    }
-                    ProgressEvent::FileProgress { name, bytes, total } => {
-                        if let Some(t) = state.task.as_mut() {
+                        ProgressEvent::SetQueued { count } => t.queued = count,
+                        ProgressEvent::GroupStart { name: _ } => t.queued += 1,
+                        ProgressEvent::FileProgress { name, bytes, total } => {
                             match t.files.iter_mut().find(|f| f.name == name) {
                                 Some(f) => {
                                     f.done = bytes;
@@ -1645,58 +1669,53 @@ async fn run(
                                 }),
                             }
                         }
-                    }
-                    ProgressEvent::GroupDone { name, bytes } => {
-                        if let Some(t) = state.task.as_mut() {
+                        ProgressEvent::GroupDone { name, bytes } => {
                             t.files.retain(|f| f.name != name);
                             t.done += 1;
                             t.done_bytes += bytes;
                             t.queued = t.queued.saturating_sub(1);
                         }
+                        // TaskDone closes the task; Done is just the download
+                        // phase finishing before the writer returns.
+                        ProgressEvent::Done => {}
                     }
-                    ProgressEvent::Done => {
-                        if let Some(t) = state.task.as_mut() {
-                            t.finished = Some(TaskEnd::Done("download complete — press 'a' to apply".into()));
+                }
+                UiEvent::TaskDone(idx, r) => {
+                    let target = {
+                        let Some(t) = state.tasks.get_mut(idx).and_then(Option::as_mut) else {
+                            continue;
+                        };
+                        if matches!(t.finished, Some(TaskEnd::Stopped)) {
+                            continue;
                         }
-                        state.busy = false;
-                    }
-                },
-                UiEvent::TaskDone(r) => {
-                    let install_end = state.task.as_ref().is_some_and(|t| t.kind == "install");
-                    let install_ok = install_end && r.is_ok();
-                    let switched = r.is_ok() && state.task.as_ref().is_some_and(|t| t.kind.starts_with("checkout"));
+                        let target = if t.kind == "install" && r.is_ok() {
+                            t.target.clone()
+                        } else {
+                            None
+                        };
+                        t.finished = Some(match &r {
+                            Ok(msg) => TaskEnd::Done(msg.clone()),
+                            Err(e) => TaskEnd::Failed(e.clone()),
+                        });
+                        t.handle = None;
+                        target
+                    };
                     match &r {
                         Ok(msg) => notify(&mut state, msg.clone()),
                         Err(e) => notify(&mut state, format!("failed: {}", friendly_error(e))),
                     }
-                    if let Some(t) = state.task.as_mut() {
-                        t.finished = Some(match r {
-                            Ok(msg) => TaskEnd::Done(msg),
-                            Err(e) => TaskEnd::Failed(e),
-                        });
-                    }
-                    state.busy = false;
-                    state.task_handle = None;
-                    if install_end {
-                        if let Some(target) = state.install_target.take() {
-                            if install_ok {
-                                // A blank TUI only has a placeholder row; the
-                                // finished install must become a real row and
-                                // its status must be read from the new config.
-                                let idx = remember_install_path(&mut state, &target);
-                                state.active = idx;
-                                state.quality_sel[idx] = quality::selected(std::path::Path::new(&target));
-                                spawn_status(&tx, &target, idx);
-                            }
+                    let refresh = if let Some(target) = target {
+                        let new_idx = remember_install_path(&mut state, &target);
+                        if idx == state.active {
+                            state.active = new_idx;
                         }
-                    }
-                    if let Some(path) = state.paths.get(state.active).cloned() {
-                        state.quality_sel[state.active] = quality::selected(std::path::Path::new(&path));
-                        // Checkout changes the appId, so the cached "server:"
-                        // line is stale until a fresh status read.
-                        if switched {
-                            spawn_status(&tx, &path, state.active);
-                        }
+                        Some((new_idx, target))
+                    } else {
+                        state.paths.get(idx).cloned().map(|path| (idx, path))
+                    };
+                    if let Some((i, path)) = refresh {
+                        state.quality_sel[i] = quality::selected(std::path::Path::new(&path));
+                        spawn_status(&tx, &path, i);
                     }
                 }
             }
@@ -1862,7 +1881,7 @@ fn auto_detect_games() -> Vec<String> {
     deduped
 }
 
-fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) -> tokio::task::JoinHandle<()> {
+fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, idx: usize) -> tokio::task::JoinHandle<()> {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1879,7 +1898,7 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) -> tok
                 let tx2 = tx.clone();
                 tokio::spawn(async move {
                     while let Some(ev) = prx.recv().await {
-                        let _ = tx2.send(UiEvent::Progress(ev)).await;
+                        let _ = tx2.send(UiEvent::Progress(idx, ev)).await;
                     }
                 });
                 let report = mgr.pack_download(tier, Some(ptx)).await.map_err(|e| e.to_string())?;
@@ -1904,7 +1923,7 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) -> tok
             let tx2 = tx.clone();
             tokio::spawn(async move {
                 while let Some(ev) = prx.recv().await {
-                    let _ = tx2.send(UiEvent::Progress(ev)).await;
+                    let _ = tx2.send(UiEvent::Progress(idx, ev)).await;
                 }
             });
             let _ = ptx
@@ -1927,7 +1946,7 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) -> tok
             }
         }
         .await;
-        let _ = tx.send(UiEvent::TaskDone(result)).await;
+        let _ = tx.send(UiEvent::TaskDone(idx, result)).await;
     })
 }
 
@@ -1937,6 +1956,7 @@ fn spawn_install(
     game: Game,
     server: Server,
     body: BodyChoice,
+    idx: usize,
 ) -> tokio::task::JoinHandle<()> {
     let tx = tx.clone();
     let path = path.to_string();
@@ -1945,7 +1965,7 @@ fn spawn_install(
         let tx2 = tx.clone();
         tokio::spawn(async move {
             while let Some(ev) = prx.recv().await {
-                let _ = tx2.send(UiEvent::Progress(ev)).await;
+                let _ = tx2.send(UiEvent::Progress(idx, ev)).await;
             }
         });
         let folder = PathBuf::from(path);
@@ -1960,7 +1980,7 @@ fn spawn_install(
             }
             Err(e) => Err(e.to_string()),
         };
-        let _ = tx.send(UiEvent::TaskDone(result)).await;
+        let _ = tx.send(UiEvent::TaskDone(idx, result)).await;
     })
 }
 
@@ -1974,7 +1994,12 @@ enum TaskKind {
     RemovePack(Quality),
 }
 
-fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskKind) -> tokio::task::JoinHandle<()> {
+fn spawn_simple(
+    tx: &tokio::sync::mpsc::Sender<UiEvent>,
+    path: &str,
+    kind: TaskKind,
+    idx: usize,
+) -> tokio::task::JoinHandle<()> {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1983,7 +2008,7 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
         let tx2 = tx.clone();
         tokio::spawn(async move {
             while let Some(ev) = prx.recv().await {
-                let _ = tx2.send(UiEvent::Progress(ev)).await;
+                let _ = tx2.send(UiEvent::Progress(idx, ev)).await;
             }
         });
         let mut ptx = Some(ptx);
@@ -2086,7 +2111,7 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
             }
         }
         .await;
-        let _ = tx.send(UiEvent::TaskDone(result)).await;
+        let _ = tx.send(UiEvent::TaskDone(idx, result)).await;
     })
 }
 
@@ -2158,7 +2183,8 @@ fn form_row(active: bool, label: &'static str, value: impl Into<String>) -> Line
 /// The root screen: one row per installed game, one game per row. The detail
 /// view is a separate screen, so two games are never compared side by side.
 fn ui_games(f: &mut Frame, state: &UiState) {
-    let active = state.task.is_some() || state.busy;
+    let task = game_task(state, state.active);
+    let active = task.is_some();
     let notice_h = u16::from(!active && state.notice.is_some());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2258,6 +2284,23 @@ fn ui_games(f: &mut Frame, state: &UiState) {
                     Style::default().fg(Color::DarkGray),
                 ),
             };
+            let running = state
+                .tasks
+                .get(i)
+                .and_then(Option::as_ref)
+                .filter(|t| t.finished.is_none());
+            let (state_text, state_style) = if let Some(t) = running {
+                let label = if t.kind.starts_with("checkout") {
+                    "checkout"
+                } else if t.kind == "predownload" {
+                    "download"
+                } else {
+                    &t.kind
+                };
+                (format!("{label} {}", task_percent(t)), Style::default().fg(Color::Cyan))
+            } else {
+                (state_text.to_string(), state_style)
+            };
             let version = if local == remote {
                 local.clone()
             } else {
@@ -2308,7 +2351,8 @@ fn ui_games(f: &mut Frame, state: &UiState) {
     f.render_stateful_widget(table, chunks[0], &mut ts);
 
     if active {
-        render_task(f, state, chunks[1], false);
+        let stoppable = task.is_some_and(|t| t.handle.is_some());
+        render_task(f, task, stoppable, chunks[1], false);
     }
     if notice_h > 0 {
         render_notice(f, state, chunks[2]);
@@ -2339,7 +2383,9 @@ fn short_game_name(game: Game) -> &'static str {
 }
 
 fn ui_detail(f: &mut Frame, state: &UiState) {
-    let active = state.task.is_some() || state.busy;
+    let task = game_task(state, state.active);
+    let active = task.is_some();
+    let running = task.is_some_and(|t| t.finished.is_none());
     let notice_h = u16::from(!active && state.notice.is_some());
     let folder = state.paths.get(state.active).map(String::as_str).unwrap_or("");
     let status = state.statuses.get(state.active).and_then(|s| s.as_ref());
@@ -2377,7 +2423,7 @@ fn ui_detail(f: &mut Frame, state: &UiState) {
     f.render_widget(
         Paragraph::new(status_box_lines(
             status,
-            state.busy,
+            running,
             state.quality_sel.get(state.active).copied().flatten(),
         ))
         .wrap(Wrap { trim: true })
@@ -2392,7 +2438,8 @@ fn ui_detail(f: &mut Frame, state: &UiState) {
     );
 
     if active {
-        render_task(f, state, chunks[2], state.focus == Focus::Task);
+        let stoppable = task.is_some_and(|t| t.handle.is_some());
+        render_task(f, task, stoppable, chunks[2], state.focus == Focus::Task);
     }
     if notice_h > 0 {
         render_notice(f, state, chunks[3]);
@@ -2400,71 +2447,85 @@ fn ui_detail(f: &mut Frame, state: &UiState) {
     f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[4]);
 }
 
-fn task_lines(state: &UiState) -> Vec<Line<'_>> {
-    match &state.task {
-        None => vec![Line::raw("idle")],
-        Some(t) => {
-            let stopped = matches!(t.finished, Some(TaskEnd::Stopped));
-            let mut v = vec![Line::from(vec![dim("task: "), accent(t.kind.clone())])];
-            if let Some(target) = &t.target {
-                v.push(Line::from(vec![dim("at:   "), Span::raw(target.clone())]));
-            }
-            // A stopped task has no progress to show; its bar and in-flight
-            // rows are stale and would read as a paused 0%.
-            if !stopped {
-                v.push(Line::from(vec![
-                    dim("files: "),
-                    strong(t.done.to_string()),
-                    dim(" done · "),
-                    strong(t.queued.to_string()),
-                    dim(" queued"),
-                ]));
-                if t.total_bytes > 0 {
-                    // Include in-flight bytes: `done_bytes` only moves on GroupDone
-                    // (a whole file), so the overall bar used to sit still for the
-                    // entire duration of one file and jump when it landed.
-                    let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
-                    let shown = (t.done_bytes + in_flight).min(t.total_bytes);
-                    v.push(Line::styled(
-                        bar_line("overall", shown, t.total_bytes, 34),
-                        Style::default().fg(Color::Cyan),
-                    ));
-                }
-                for f in t.files.iter().take(8) {
-                    let name = shorten(&f.name, 42);
-                    v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
-                }
-            }
-            if let Some(f) = &t.finished {
-                let (text, color) = match f {
-                    TaskEnd::Done(m) => (format!("✔ {m}"), Color::Green),
-                    TaskEnd::Failed(e) => (format!("✘ {}", friendly_error(e)), Color::Red),
-                    TaskEnd::Stopped => (
-                        "■ stopped — partial files are kept for the next run".to_string(),
-                        Color::Yellow,
-                    ),
-                };
-                v.push(Line::styled(
-                    text,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ));
-            }
-            if state.busy && state.task_handle.is_some() {
-                v.push(Line::styled(
-                    "Ctrl+C stops this task",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            v
+fn task_lines(task: Option<&TaskUi>, stoppable: bool) -> Vec<Line<'_>> {
+    let Some(t) = task else {
+        return vec![Line::raw("idle")];
+    };
+    let stopped = matches!(t.finished, Some(TaskEnd::Stopped));
+    let mut v = vec![Line::from(vec![dim("task: "), accent(t.kind.clone())])];
+    if let Some(target) = &t.target {
+        v.push(Line::from(vec![dim("at:   "), Span::raw(target.clone())]));
+    }
+    // A stopped task has no progress to show; its bar and in-flight
+    // rows are stale and would read as a paused 0%.
+    if !stopped {
+        v.push(Line::from(vec![
+            dim("files: "),
+            strong(t.done.to_string()),
+            dim(" done · "),
+            strong(t.queued.to_string()),
+            dim(" queued"),
+        ]));
+        if t.total_bytes > 0 {
+            // Include in-flight bytes: `done_bytes` only moves on GroupDone
+            // (a whole file), so the overall bar used to sit still for the
+            // entire duration of one file and jump when it landed.
+            let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
+            let shown = (t.done_bytes + in_flight).min(t.total_bytes);
+            v.push(Line::styled(
+                bar_line("overall", shown, t.total_bytes, 34),
+                Style::default().fg(Color::Cyan),
+            ));
         }
+        for f in t.files.iter().take(8) {
+            let name = shorten(&f.name, 42);
+            v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
+        }
+    }
+    if let Some(f) = &t.finished {
+        let (text, color) = match f {
+            TaskEnd::Done(m) => (format!("✔ {m}"), Color::Green),
+            TaskEnd::Failed(e) => (format!("✘ {}", friendly_error(e)), Color::Red),
+            TaskEnd::Stopped => (
+                "■ stopped — partial files are kept for the next run".to_string(),
+                Color::Yellow,
+            ),
+        };
+        v.push(Line::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if stoppable && t.finished.is_none() {
+        v.push(Line::styled(
+            "Ctrl+C stops this task",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    v
+}
+
+fn task_percent(t: &TaskUi) -> String {
+    if t.total_bytes > 0 {
+        let inflight: u64 = t.files.iter().map(|f| f.done).sum();
+        let shown = (t.done_bytes + inflight).min(t.total_bytes);
+        format!("{:.0}%", shown as f64 * 100.0 / t.total_bytes as f64)
+    } else if t.done + t.queued > 0 {
+        format!("{:.0}%", t.done as f64 * 100.0 / (t.done + t.queued) as f64)
+    } else {
+        "…".into()
     }
 }
 
-fn render_task(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect, focused: bool) {
+fn render_task(f: &mut Frame, task: Option<&TaskUi>, stoppable: bool, area: ratatui::layout::Rect, focused: bool) {
     f.render_widget(
-        Paragraph::new(task_lines(state)).wrap(Wrap { trim: true }).block(
-            panel("activity").border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray })),
-        ),
+        Paragraph::new(task_lines(task, stoppable))
+            .wrap(Wrap { trim: true })
+            .block(panel("activity").border_style(Style::default().fg(if focused {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }))),
         area,
     );
 }
@@ -2521,12 +2582,12 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
         ));
         spans.push(Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray)));
     }
-    if state.busy {
+    if running(state, state.active) {
         spans.push(Span::styled(
             "   [busy]",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
-        if state.task_handle.is_some() {
+        if game_task(state, state.active).is_some_and(|t| t.handle.is_some()) {
             spans.push(Span::styled(
                 "  Ctrl+C stop",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -2547,7 +2608,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             Line::raw("       s sync · Q quality · c switch server · k force-kill"),
             Line::raw("       Tab: status / activity"),
             Line::raw("Clean  Q -> x removes the highlighted tier"),
-            Line::raw("Stop   Ctrl+C stops a running download · Esc backs out"),
+            Line::raw("Stop   Ctrl+C stops this game's task · Esc backs out"),
             Line::raw("Install i · ↑↓ select · ←→ server/pack · Enter folder/install"),
             Line::raw("Shell  kuro update FOLDER --check|--download|--apply"),
             Line::raw("       kuro pack FOLDER hd --remove"),
@@ -3027,11 +3088,13 @@ mod tests {
     #[test]
     fn a_running_task_shows_the_activity_panel() {
         let mut state = two_games();
-        state.task = Some(super::TaskUi {
-            kind: "predownload".into(),
-            ..Default::default()
-        });
-        state.busy = true;
+        state.tasks = vec![
+            Some(super::TaskUi {
+                kind: "predownload".into(),
+                ..Default::default()
+            }),
+            None,
+        ];
         let out = render_to_string(&state, 100, 30);
         assert!(out.contains("activity"), "activity panel missing:\n{out}");
         assert!(out.contains("task: predownload"), "task line missing:\n{out}");
@@ -3040,11 +3103,14 @@ mod tests {
     #[test]
     fn a_stopped_task_is_not_shown_as_a_failure() {
         let mut state = two_games();
-        state.task = Some(super::TaskUi {
-            kind: "sync".into(),
-            finished: Some(super::TaskEnd::Stopped),
-            ..Default::default()
-        });
+        state.tasks = vec![
+            Some(super::TaskUi {
+                kind: "sync".into(),
+                finished: Some(super::TaskEnd::Stopped),
+                ..Default::default()
+            }),
+            None,
+        ];
         let out = render_to_string(&state, 100, 30);
         assert!(out.contains("stopped"), "stopped state missing:\n{out}");
         assert!(!out.contains('✘'), "stopped task rendered as failed:\n{out}");
@@ -3057,7 +3123,7 @@ mod tests {
         state.show_help = true;
         let out = render_to_string(&state, 100, 40);
         assert!(
-            out.contains("Ctrl+C stops a running download"),
+            out.contains("Ctrl+C stops this game's task"),
             "help missing stop key:\n{out}"
         );
         assert!(!out.contains("Esc / Ctrl+C"), "help still maps Esc to stop:\n{out}");
@@ -3088,12 +3154,14 @@ mod tests {
         let mut state = UiState {
             paths: vec!["/a".into()],
             statuses: vec![None],
+            tasks: vec![None],
             quality_sel: vec![None],
             ..Default::default()
         };
         assert_eq!(remember_install_path(&mut state, "/b"), 1);
         assert_eq!(state.paths, vec!["/a".to_string(), "/b".to_string()]);
         assert_eq!(state.statuses.len(), 2);
+        assert_eq!(state.tasks.len(), 2);
         assert_eq!(state.quality_sel.len(), 2);
         assert_eq!(
             remember_install_path(&mut state, "/b"),

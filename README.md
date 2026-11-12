@@ -195,10 +195,12 @@ never compared side by side. There is no log panel.
 | `Tab` | cycle focus: status → activity |
 | `q` | quit |
 
-While a download, install, sync, or pack task runs, `Ctrl+C` stops it and
-`Esc` backs out while the task keeps running. Stop waits for the task and
-every chunk download to be gone before the panel says `stopped`; partial
-files stay on disk and the next run continues from them.
+Each game has its own task, so WuWa and PGR can install at the same time;
+the games list shows each row's progress and the activity panel follows the
+selected row. `Ctrl+C` stops the selected game's task, `q` quits all of them,
+and `Esc` backs out while they keep running. Stop waits for the task and every
+chunk download to be gone before the panel says `stopped`; partial files stay
+on disk and the next run continues from them.
 
 ### Cleaning packs
 

@@ -90,10 +90,11 @@ edits.
   `predownload` block is used only when the formal packs are current. A
   missing source-version delta is a refusal, never a full-body or other-tier
   fallback.
-- **Only cancellable tasks get a task handle.** The TUI stores the
-  `JoinHandle` for predownload, sync, install, pack install, and tier removal,
-  aborts it, and *awaits it* before reporting `stopped`. Apply and checkout do
-  not get one, because interrupting a swap leaves a half-applied tree.
+- **Tasks are per game.** `UiState.tasks` has one slot per game, so WuWa and
+  PGR install/download at the same time. A task owns its `JoinHandle` only
+  when it is safe to stop (predownload, sync, install, pack, remove); apply
+  and checkout have none. `Ctrl+C` stops the active game's task and `q` quits
+  all of them.
   `remove_pack` deletes the tier directory and both launcher records, and
   leaves the versioned `Client/Saved/Resources` payloads alone.
 - **A cancelled download must abort its chunk tasks.** `download_chunked` owns
