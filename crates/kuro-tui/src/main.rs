@@ -1482,15 +1482,29 @@ async fn run(
                         }
                     }
                     KeyCode::Char('c') if !state.busy => {
-                        state.busy = true;
-                        state.task = Some(TaskUi {
-                            kind: "checkout (in place)".into(),
-                            target: Some(path.clone()),
-                            ..Default::default()
-                        });
-                        state.focus = Focus::Task;
-                        state.task_handle = None;
-                        spawn_simple(&tx, &path, TaskKind::Checkout);
+                        let game = active_game(&state);
+                        let server = state
+                            .statuses
+                            .get(state.active)
+                            .and_then(|s| s.as_ref())
+                            .and_then(|r| r.as_ref().ok())
+                            .map(|s| s.server);
+                        if !checkout_possible(game, server) {
+                            notify(
+                                &mut state,
+                                "no server to switch to — checkout is Wuthering Waves CN ↔ Bilibili only",
+                            );
+                        } else {
+                            state.busy = true;
+                            state.task = Some(TaskUi {
+                                kind: "checkout (in place)".into(),
+                                target: Some(path.clone()),
+                                ..Default::default()
+                            });
+                            state.focus = Focus::Task;
+                            state.task_handle = None;
+                            spawn_simple(&tx, &path, TaskKind::Checkout);
+                        }
                     }
                     _ => {}
                 }
@@ -1652,6 +1666,12 @@ fn active_game(state: &UiState) -> Game {
         .map(|gs| gs.game)
         .or_else(|| detect_game(std::path::Path::new(&state.paths[state.active])))
         .unwrap_or(Game::WuWa)
+}
+
+/// Fast checkout is only the WuWa CN ↔ Bilibili pair. PGR is a different
+/// package and WuWa Global cannot be swapped with CN.
+fn checkout_possible(game: Game, server: Option<Server>) -> bool {
+    game == Game::WuWa && !matches!(server, Some(Server::Global))
 }
 
 /// Read the install's packs and saved choice for the modal.
@@ -2651,8 +2671,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, cli_bar, debug_log, default_folder, init_debug, install_target_for, parse_quality_arg,
-        remember_install_path, split_play_args, ui, CliProgress, InstallDraft, QualityDraft, Screen, UiState,
+        body_choice, checkout_possible, cli_bar, debug_log, default_folder, init_debug, install_target_for,
+        parse_quality_arg, remember_install_path, split_play_args, ui, CliProgress, InstallDraft, QualityDraft, Screen,
+        UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, ProgressEvent, Quality, Server};
 
@@ -2970,6 +2991,15 @@ mod tests {
             "reinstalling into the same folder must not add a duplicate row"
         );
         assert_eq!(state.paths.len(), 2);
+    }
+
+    #[test]
+    fn checkout_is_only_for_wuwa_cn_and_bilibili() {
+        assert!(checkout_possible(Game::WuWa, Some(Server::Cn)));
+        assert!(checkout_possible(Game::WuWa, Some(Server::Bilibili)));
+        assert!(!checkout_possible(Game::WuWa, Some(Server::Global)));
+        assert!(!checkout_possible(Game::Pgr, Some(Server::Cn)));
+        assert!(!checkout_possible(Game::Pgr, None));
     }
 
     /// The CLI bar is one running total, not a per-file row. Verify fills it
