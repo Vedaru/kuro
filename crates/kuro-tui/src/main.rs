@@ -5,7 +5,10 @@
 //! `r` refresh · `p` play · `d` update · `a` apply · `s` sync · `c` checkout
 //! CN<->bilibili · `Q` quality preset · `q` quit.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -19,6 +22,44 @@ use kuro_core::{
     default_game_dir, detect_game, detect_steam, launch, quality, BodyChoice, Game, GameManager, GameStatus,
     ProgressEvent, Quality, QualityInfo, Server, SteamInfo,
 };
+
+/// Debug logging is opt-in: `--debug` or `KURO_DEBUG=1`. Logs go to
+/// `$XDG_STATE_HOME/kuro/kuro.log` (usually `~/.local/state/kuro/kuro.log`),
+/// or `KURO_DEBUG_LOG` when set. Without it, nothing is buffered or written.
+static DEBUG_LOG: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn init_debug(enabled: bool) {
+    if !enabled {
+        let _ = DEBUG_LOG.set(None);
+        return;
+    }
+    let path = std::env::var_os("KURO_DEBUG_LOG").map(PathBuf::from).or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(home).join(".local/state"));
+        Some(state.join("kuro/kuro.log"))
+    });
+    if let Some(path) = &path {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+    let _ = DEBUG_LOG.set(path);
+}
+
+fn debug_log(msg: impl AsRef<str>) {
+    let Some(Some(path)) = DEBUG_LOG.get() else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{secs}] {}", msg.as_ref());
+    }
+}
 
 /// Where WuWa lives when no folder is given on the command line: the first
 /// Steam library's `common/` if Steam is installed (which is where a Proton
@@ -69,14 +110,12 @@ struct FileState {
     total: u64,
 }
 
-/// Which section the Tab-focus is on; highlighted border + section-scoped keys
-/// (PgUp/PgDn scroll the log only when it is focused).
+/// Which section the Tab-focus is on. The focused panel gets the accent border.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     #[default]
     Status,
     Task,
-    Log,
 }
 
 /// The drill-down stack: the games list is the root, a game detail is one
@@ -92,16 +131,15 @@ enum Screen {
 #[derive(Default)]
 struct UiState {
     screen: Screen,
-    logs: Vec<String>,
+    /// Last user-facing message, shown in the task panel when it is idle.
+    notice: Option<String>,
     task: Option<TaskUi>,
     busy: bool,
     /// Game folders in the manager; ←/→ switches between them.
     paths: Vec<String>,
     active: usize,
-    /// Focused section (Tab cycles; PgUp/PgDn only scroll the log when focused).
+    /// Focused section (Tab cycles).
     focus: Focus,
-    /// Log panel scroll offset (lines from the newest).
-    log_scroll: usize,
     /// Open install modal (game + server selection).
     install: Option<InstallDraft>,
     /// Help overlay open.
@@ -176,15 +214,13 @@ fn body_label(body: BodyChoice) -> String {
     }
 }
 
-fn push_log(state: &mut UiState, msg: impl Into<String>) {
+fn notify(state: &mut UiState, msg: impl Into<String>) {
     let msg = msg.into();
-    state.logs.push(msg);
-    if state.logs.len() > 200 {
-        state.logs.drain(0..state.logs.len() - 200);
-    }
+    debug_log(&msg);
+    state.notice = Some(msg);
 }
 
-/// Human-friendly game name for logs.
+/// Human-friendly game name for messages.
 fn pretty_game(game: Game) -> &'static str {
     match game {
         Game::WuWa => "Wuthering Waves",
@@ -227,7 +263,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let debug =
+        args.iter().any(|a| a == "--debug") || std::env::var("KURO_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0");
+    args.retain(|a| a != "--debug");
+    init_debug(debug);
+    debug_log("kuro starting");
 
     // one-shot CLI subcommands
     match args.first().map(|s| s.as_str()) {
@@ -313,6 +354,7 @@ usage: kuro [game-folder ...]            launch the TUI (default: auto-detect)
        kuro update [folder] [--check|--download|--apply]   common + tier deltas
        kuro play <folder> [--quality <sd|hd|uhd>]
        kuro kill <folder>
+       kuro --debug [command...]                 write debug logs to a file
        kuro help | --help | -h
        kuro --version | -V",
         ver = env!("CARGO_PKG_VERSION")
@@ -974,13 +1016,13 @@ async fn run(
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
-                            push_log(
+                            notify(
                                 &mut state,
                                 format!("installing {} paks — the game must be closed", tier.as_arg()),
                             );
                             spawn_simple(&tx, &path, TaskKind::Pack(tier));
                         } else {
-                            push_log(&mut state, "busy — wait for the current task to finish");
+                            notify(&mut state, "busy — wait for the current task to finish");
                         }
                     }
                     if !close {
@@ -1047,7 +1089,7 @@ async fn run(
                             kind: "install".into(),
                             ..Default::default()
                         });
-                        push_log(
+                        notify(
                             &mut state,
                             match body {
                                 BodyChoice::All => {
@@ -1076,12 +1118,8 @@ async fn run(
                         KeyCode::Enter => {
                             if let Some(path) = state.paths.get(state.active).cloned() {
                                 state.screen = Screen::Detail;
-                                // The detail is a fresh page: the shared
-                                // startup log would otherwise name the other
-                                // game on a page that is supposed to show one.
                                 let opened = pretty_game(active_game(&state));
-                                state.logs.clear();
-                                push_log(&mut state, format!("opened {opened}"));
+                                notify(&mut state, format!("opened {opened}"));
                                 if state.statuses.get(state.active).and_then(|s| s.as_ref()).is_none() {
                                     spawn_status(&tx, &path, state.active);
                                 }
@@ -1097,7 +1135,7 @@ async fn run(
                                 for i in 0..state.paths.len() {
                                     spawn_status(&tx, &state.paths[i], i);
                                 }
-                                push_log(&mut state, "refreshing all games…");
+                                notify(&mut state, "refreshing all games…");
                             }
                         }
                         KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
@@ -1123,7 +1161,7 @@ async fn run(
                             if game.uses_quality_tiers() {
                                 state.quality_modal = Some(open_quality_draft(&path, &state));
                             } else {
-                                push_log(
+                                notify(
                                     &mut state,
                                     format!("{} has no quality tiers — it launches as-is", pretty_game(game)),
                                 );
@@ -1133,8 +1171,7 @@ async fn run(
                     KeyCode::Tab => {
                         state.focus = match state.focus {
                             Focus::Status => Focus::Task,
-                            Focus::Task => Focus::Log,
-                            Focus::Log => Focus::Status,
+                            Focus::Task => Focus::Status,
                         };
                     }
                     KeyCode::Char('r') => {
@@ -1175,26 +1212,14 @@ async fn run(
                             spawn_simple(&tx, &path, TaskKind::Sync);
                         }
                     }
-                    KeyCode::Char('c') => {
-                        if !state.busy {
-                            state.busy = true;
-                            state.task = Some(TaskUi {
-                                kind: "checkout".into(),
-                                ..Default::default()
-                            });
-                            state.focus = Focus::Task;
-                            spawn_simple(&tx, &path, TaskKind::Checkout);
-                        }
-                    }
-                    // Scrolling belongs to the log pane; the guard keeps the
-                    // other panes from silently swallowing these keys.
-                    KeyCode::Up if state.focus == Focus::Log => state.log_scroll += 1,
-                    KeyCode::Down if state.focus == Focus::Log => {
-                        state.log_scroll = state.log_scroll.saturating_sub(1);
-                    }
-                    KeyCode::PageUp if state.focus == Focus::Log => state.log_scroll += 10,
-                    KeyCode::PageDown if state.focus == Focus::Log => {
-                        state.log_scroll = state.log_scroll.saturating_sub(10);
+                    KeyCode::Char('c') if !state.busy => {
+                        state.busy = true;
+                        state.task = Some(TaskUi {
+                            kind: "checkout".into(),
+                            ..Default::default()
+                        });
+                        state.focus = Focus::Task;
+                        spawn_simple(&tx, &path, TaskKind::Checkout);
                     }
                     _ => {}
                 }
@@ -1221,13 +1246,17 @@ async fn run(
                         }
                         Err(e) => format!("status error: {}", friendly_error(e)),
                     };
-                    push_log(&mut state, line);
+                    if s.is_err() {
+                        notify(&mut state, line);
+                    } else {
+                        debug_log(&line);
+                    }
                     if idx < state.statuses.len() {
                         state.statuses[idx] = Some(s);
                     }
                 }
                 UiEvent::Progress(p) => match p {
-                    ProgressEvent::Log(m) => push_log(&mut state, m),
+                    ProgressEvent::Log(m) => debug_log(m),
                     ProgressEvent::SetTotal { bytes } => {
                         if let Some(t) = state.task.as_mut() {
                             t.total_bytes = bytes;
@@ -1277,8 +1306,8 @@ async fn run(
                 },
                 UiEvent::TaskDone(r) => {
                     match &r {
-                        Ok(msg) => push_log(&mut state, msg.clone()),
-                        Err(e) => push_log(&mut state, format!("failed: {}", friendly_error(e))),
+                        Ok(msg) => notify(&mut state, msg.clone()),
+                        Err(e) => notify(&mut state, format!("failed: {}", friendly_error(e))),
                     }
                     if let Some(t) = state.task.as_mut() {
                         t.finished = Some(r);
@@ -1329,7 +1358,7 @@ fn open_quality_draft(folder: &str, state: &UiState) -> QualityDraft {
 /// afresh on every kuro launch, so nothing else needs updating).
 fn apply_quality(state: &mut UiState, folder: &str, choice: Quality) {
     match quality::set_selected(std::path::Path::new(folder), choice) {
-        Ok(()) => push_log(
+        Ok(()) => notify(
             state,
             format!(
                 "quality: set {} ({}) — press 'p' to play",
@@ -1337,7 +1366,7 @@ fn apply_quality(state: &mut UiState, folder: &str, choice: Quality) {
                 choice.label()
             ),
         ),
-        Err(e) => push_log(state, format!("quality save failed: {e}")),
+        Err(e) => notify(state, format!("quality save failed: {e}")),
     }
     if let Some(slot) = state.quality_sel.get_mut(state.active) {
         *slot = Some(choice);
@@ -1360,7 +1389,7 @@ fn play(state: &mut UiState, folder: &str) {
         .or(info.selected)
         .unwrap_or_else(|| info.default_choice());
     if game.uses_quality_tiers() && !info.is_installed(quality) {
-        push_log(
+        notify(
             state,
             format!("cannot play: {} paks are not installed", quality.as_arg()),
         );
@@ -1368,10 +1397,10 @@ fn play(state: &mut UiState, folder: &str) {
     }
     match launch::plan(p, game, quality) {
         Ok(plan) => match launch::spawn(&plan) {
-            Ok(pid) => push_log(state, format!("launching {} — pid {pid}", plan.brief())),
-            Err(e) => push_log(state, format!("launch failed: {e}")),
+            Ok(pid) => notify(state, format!("launching {} — pid {pid}", plan.brief())),
+            Err(e) => notify(state, format!("launch failed: {e}")),
         },
-        Err(e) => push_log(state, format!("cannot launch: {e}")),
+        Err(e) => notify(state, format!("cannot launch: {e}")),
     }
 }
 
@@ -1379,9 +1408,9 @@ fn play(state: &mut UiState, folder: &str) {
 /// process group, for a client that hangs on shutdown.
 fn kill_game(state: &mut UiState, folder: &str) {
     match launch::kill(std::path::Path::new(folder)) {
-        Ok(r) if r.was_running => push_log(state, format!("force-killed game (group {})", r.pid)),
-        Ok(r) => push_log(state, format!("no running game (group {} already exited)", r.pid)),
-        Err(e) => push_log(state, format!("kill: {e}")),
+        Ok(r) if r.was_running => notify(state, format!("force-killed game (group {})", r.pid)),
+        Ok(r) => notify(state, format!("no running game (group {} already exited)", r.pid)),
+        Err(e) => notify(state, format!("kill: {e}")),
     }
 }
 
@@ -1684,7 +1713,6 @@ fn ui_games(f: &mut Frame, state: &UiState) {
         .constraints([
             Constraint::Min(5), // games table
             Constraint::Length(if state.task.is_some() || state.busy { 6 } else { 3 }),
-            Constraint::Min(3),    // recent log
             Constraint::Length(1), // footer
         ])
         .split(f.area());
@@ -1820,8 +1848,7 @@ fn ui_games(f: &mut Frame, state: &UiState) {
     f.render_stateful_widget(table, chunks[0], &mut ts);
 
     render_task(f, state, chunks[1], false);
-    render_log(f, state, chunks[2], false);
-    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[3]);
+    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[2]);
 }
 
 fn folder_name(path: &str) -> String {
@@ -1852,8 +1879,7 @@ fn ui_detail(f: &mut Frame, state: &UiState) {
         .constraints([
             Constraint::Length(1), // breadcrumb: kuro › games › <game> › <server>
             Constraint::Length(9), // status: the open game only
-            Constraint::Length(if state.task.is_some() || state.busy { 9 } else { 4 }),
-            Constraint::Min(4),    // log
+            Constraint::Min(3),    // activity: task progress or the last message
             Constraint::Length(1), // footer
         ])
         .split(f.area());
@@ -1887,13 +1913,15 @@ fn ui_detail(f: &mut Frame, state: &UiState) {
     );
 
     render_task(f, state, chunks[2], state.focus == Focus::Task);
-    render_log(f, state, chunks[3], state.focus == Focus::Log);
-    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[4]);
+    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[3]);
 }
 
 fn task_lines(state: &UiState) -> Vec<Line<'_>> {
     match &state.task {
-        None => vec![Line::raw("idle")],
+        None => match &state.notice {
+            Some(msg) => vec![Line::raw(msg.as_str())],
+            None => vec![Line::raw("idle")],
+        },
         Some(t) => {
             let mut v = vec![
                 Line::raw(format!("task: {}", t.kind)),
@@ -1931,36 +1959,7 @@ fn task_lines(state: &UiState) -> Vec<Line<'_>> {
 fn render_task(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect, focused: bool) {
     f.render_widget(
         Paragraph::new(task_lines(state)).wrap(Wrap { trim: true }).block(
-            panel("task").border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray })),
-        ),
-        area,
-    );
-}
-
-fn log_lines(state: &UiState) -> Vec<Line<'_>> {
-    // Build only the 60 rows on screen. Materialising the whole 200-line window
-    // and cloning it every frame was work the Paragraph never sees.
-    let max_scroll = state.logs.len().min(200).saturating_sub(1);
-    let scroll = state.log_scroll.min(max_scroll);
-    state
-        .logs
-        .iter()
-        .rev()
-        .take(200)
-        .skip(scroll)
-        .take(60)
-        .map(|l| Line::raw(l.as_str()))
-        .collect()
-}
-
-fn render_log(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect, focused: bool) {
-    f.render_widget(
-        Paragraph::new(log_lines(state)).wrap(Wrap { trim: true }).block(
-            panel("log (↑/↓ PgUp/PgDn)").border_style(Style::default().fg(if focused {
-                Color::Cyan
-            } else {
-                Color::DarkGray
-            })),
+            panel("activity").border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray })),
         ),
         area,
     );
@@ -2023,22 +2022,13 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
     if state.show_help {
         let help_lines: Vec<Line> = vec![
             Line::raw("kuro — Kuro Games launcher"),
-            Line::raw(""),
-            Line::raw("  Games  ↑↓ select · Enter open · i install · r refresh · q quit"),
-            Line::raw("  Game   Esc back · p play · d predownload · a apply · s sync"),
-            Line::raw("         Q quality · c switch server · k force-kill · r refresh"),
-            Line::raw("         Tab focus panels · ↑↓ / PgUp / PgDn scroll the log"),
-            Line::raw(""),
-            Line::raw("Install dialog"),
-            Line::raw("  w/p game · c/b/g server · f pack · t path · s Steam · Enter go"),
-            Line::raw(""),
-            Line::raw("From a shell"),
-            Line::raw("  kuro update FOLDER --check"),
-            Line::raw("  kuro update FOLDER --download"),
-            Line::raw("  kuro update FOLDER --apply"),
-            Line::raw("  kuro sync FOLDER"),
-            Line::raw("  kuro pack FOLDER hd"),
-            Line::raw(""),
+            Line::raw("Games  ↑↓ select · Enter open · i install · r refresh · q quit"),
+            Line::raw("Game   Esc back · p play · d predownload · a apply"),
+            Line::raw("       s sync · Q quality · c switch server · k force-kill"),
+            Line::raw("       Tab: status / activity"),
+            Line::raw("Install i from Games · w/p game · c/b/g server · f pack · t path"),
+            Line::raw("Shell  kuro update FOLDER --check|--download|--apply"),
+            Line::raw("Debug  kuro --debug -> ~/.local/state/kuro/kuro.log"),
             Line::raw("h / ? / Esc to close"),
         ];
         let area = centered_rect(70, 60, f.area());
@@ -2252,8 +2242,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, default_folder, parse_quality_arg, split_play_args, ui, InstallDraft, QualityDraft, Screen,
-        UiState,
+        body_choice, debug_log, default_folder, init_debug, parse_quality_arg, split_play_args, ui, InstallDraft,
+        QualityDraft, Screen, UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, Quality, Server};
 
@@ -2298,7 +2288,7 @@ mod tests {
         let info = quality::info(dir.path());
         let mut state = UiState {
             paths: vec![dir.path().display().to_string()],
-            logs: vec!["status: Wuthering Waves (cn) — up to date".into()],
+            notice: Some("status: Wuthering Waves (cn) — up to date".into()),
             statuses: vec![None],
             quality_modal: Some(QualityDraft {
                 game: Game::WuWa,
@@ -2453,6 +2443,7 @@ mod tests {
         );
         assert!(!out.contains("game:"), "the list leaked a detail status box:\n{out}");
         assert!(!out.contains("server:"), "the list leaked a detail status box:\n{out}");
+        assert!(!out.contains("log ("), "the log panel is still rendered:\n{out}");
     }
 
     /// The detail screen renders exactly one game. The other game must not be
@@ -2469,6 +2460,19 @@ mod tests {
             "another game is on the detail page:\n{out}"
         );
         assert!(out.contains("Esc back"), "detail page lost the back hint:\n{out}");
+        assert!(!out.contains("log ("), "the log panel is still rendered:\n{out}");
+    }
+
+    #[test]
+    fn debug_log_writes_to_the_selected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kuro.log");
+        std::env::set_var("KURO_DEBUG_LOG", &path);
+        init_debug(true);
+        debug_log("hello debug");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("hello debug"), "{text}");
+        std::env::remove_var("KURO_DEBUG_LOG");
     }
 
     #[test]

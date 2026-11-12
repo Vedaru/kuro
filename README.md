@@ -118,6 +118,7 @@ kuro update <folder> [--check | --download | --apply]   # CLI: common + tier del
 kuro install <wuwa|pgr> <cn|bilibili|global> <folder> [--quality <sd|hd|uhd>]
 kuro quality <folder> [sd|hd|uhd]                       # CLI: which pack the client mounts
 kuro pack [folder] <sd|hd|uhd> [--check]                # CLI: install one tier + register it
+kuro --debug [command...]                               # write debug logs to a file
 ```
 
 For WuWa CN/Bilibili the pack document is the single update path. `kuro sync`
@@ -144,8 +145,8 @@ pack-document version update.
 ### TUI
 
 The TUI is a drill-down: a **games list**, then one game per page. `Esc` backs
-out. Only the open game's status, task and log are on screen, so PGR and WuWa
-are never compared side by side.
+out. Only the open game's status and activity are on screen, so PGR and WuWa are
+never compared side by side. There is no log panel.
 
 **Games list**
 
@@ -171,9 +172,15 @@ are never compared side by side.
 | `k` | force-kill a hung client |
 | `Q` | quality preset (`s`/`h`/`u` pick · `i` install that tier's paks · Enter pick + install · saved for `p`) |
 | `r` | refresh this game's status |
-| `Tab` | cycle focus: status → task → log |
-| `↑` / `↓`, `PgUp` / `PgDn` | scroll the log (when focused) |
+| `Tab` | cycle focus: status → activity |
 | `q` | quit |
+
+### Debug log
+
+The TUI has no log section. `--debug` or `KURO_DEBUG=1` appends events to
+`$XDG_STATE_HOME/kuro/kuro.log` (usually `~/.local/state/kuro/kuro.log`), one
+line per event. `KURO_DEBUG_LOG` overrides the path. Without debug mode,
+nothing is buffered and no log file is opened.
 
 ### Running the game
 
