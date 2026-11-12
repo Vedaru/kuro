@@ -1351,7 +1351,7 @@ async fn run(
                             }
                         }
                         KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
-                        KeyCode::Esc if state.busy => stop_task(&mut state).await,
+                        KeyCode::Esc if state.busy => {}
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         _ => {}
                     }
@@ -1359,7 +1359,6 @@ async fn run(
                 }
 
                 match key.code {
-                    KeyCode::Esc if state.busy => stop_task(&mut state).await,
                     KeyCode::Esc => state.screen = Screen::Games,
                     KeyCode::Char('q') => break,
                     KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
@@ -2223,7 +2222,7 @@ fn task_lines(state: &UiState) -> Vec<Line<'_>> {
             }
             if state.busy && state.task_handle.is_some() {
                 v.push(Line::styled(
-                    "Esc / Ctrl+C stops this task",
+                    "Ctrl+C stops this task",
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -2283,7 +2282,6 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
         ],
     };
     for (i, (key, label)) in keys.iter().enumerate() {
-        let label = if *key == "Esc" && state.busy { "stop" } else { label };
         if i > 0 {
             spans.push(Span::raw("  "));
         }
@@ -2298,9 +2296,9 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
             "   [busy]",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
-        if state.screen == Screen::Games && state.task_handle.is_some() {
+        if state.task_handle.is_some() {
             spans.push(Span::styled(
-                "  Esc stop",
+                "  Ctrl+C stop",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ));
         }
@@ -2319,7 +2317,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             Line::raw("       s sync · Q quality · c switch server · k force-kill"),
             Line::raw("       Tab: status / activity"),
             Line::raw("Clean  Q -> x removes the highlighted tier"),
-            Line::raw("Stop   Esc / Ctrl+C stops a running download"),
+            Line::raw("Stop   Ctrl+C stops a running download · Esc backs out"),
             Line::raw("Install i from Games · w/p game · c/b/g server · f pack · t path"),
             Line::raw("Shell  kuro update FOLDER --check|--download|--apply"),
             Line::raw("       kuro pack FOLDER hd --remove"),
@@ -2812,6 +2810,19 @@ mod tests {
         let out = render_to_string(&state, 100, 30);
         assert!(out.contains("stopped"), "stopped state missing:\n{out}");
         assert!(!out.contains('✘'), "stopped task rendered as failed:\n{out}");
+    }
+
+    /// Esc is navigation. The help overlay must not advertise it as a stop.
+    #[test]
+    fn help_does_not_promote_esc_as_stop() {
+        let mut state = two_games();
+        state.show_help = true;
+        let out = render_to_string(&state, 100, 40);
+        assert!(
+            out.contains("Ctrl+C stops a running download"),
+            "help missing stop key:\n{out}"
+        );
+        assert!(!out.contains("Esc / Ctrl+C"), "help still maps Esc to stop:\n{out}");
     }
 
     /// The CLI bar is one running total, not a per-file row. Verify fills it

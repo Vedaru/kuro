@@ -167,7 +167,7 @@ never compared side by side. There is no log panel.
 
 | Key | Action |
 |-----|--------|
-| `Esc` | back to the games list (stops a running task first) |
+| `Esc` | back to the games list (a running task keeps going) |
 | `p` | play |
 | `d` | predownload (pack document for WuWa CN/Bilibili, base index otherwise) |
 | `a` | apply the downloaded pack predownload, or the base predownload on PGR / WuWa Global |
@@ -179,10 +179,10 @@ never compared side by side. There is no log panel.
 | `Tab` | cycle focus: status → activity |
 | `q` | quit |
 
-While a download, install, sync, or pack task runs, `Esc` or `Ctrl+C` stops
-it. Stop waits for the task and every chunk download to be gone before the
-panel says `stopped`; partial files stay on disk and the next run continues
-from them.
+While a download, install, sync, or pack task runs, `Ctrl+C` stops it and
+`Esc` backs out while the task keeps running. Stop waits for the task and
+every chunk download to be gone before the panel says `stopped`; partial
+files stay on disk and the next run continues from them.
 
 ### Cleaning packs
 

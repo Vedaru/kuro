@@ -100,6 +100,9 @@ edits.
   byte-range tasks and its progress ticker in `JoinSet`s; dropping the future
   aborts them. Detached `tokio::spawn` tasks here survive the parent and keep
   streaming after the UI says the task stopped.
+- **`Esc` is navigation, never a stop.** It pops the detail screen and leaves
+  the task running. `Ctrl+C` is the only stop key; while a task runs it stops
+  it, and at idle it quits.
 - **The tier body is matched as spelled, not case-folded.** The game reads
   `Client/Content/HD`; on a case-sensitive host a manifest spelling
   `client/content/hd` would write files the game never reads. Leading slashes
