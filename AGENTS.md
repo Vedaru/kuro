@@ -103,6 +103,11 @@ edits.
 - **`Esc` is navigation, never a stop.** It pops the detail screen and leaves
   the task running. `Ctrl+C` is the only stop key; while a task runs it stops
   it, and at idle it quits.
+- **Checkout is the manifest delta, not a hardcoded file list.** CN ⇄ Bilibili
+  fetches both channels' full manifests at the installed version, downloads
+  every target-only or changed file, deletes source-only files, then writes the
+  target appId. A version skew is refused, not silently downgraded. The old
+  `diff_files` list outlived the files it named and made every switch fail.
 - **The tier body is matched as spelled, not case-folded.** The game reads
   `Client/Content/HD`; on a case-sensitive host a manifest spelling
   `client/content/hd` would write files the game never reads. Leading slashes

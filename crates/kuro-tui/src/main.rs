@@ -264,10 +264,7 @@ fn pretty_game(game: Game) -> &'static str {
 
 /// Turn known raw errors into friendly, human-readable messages.
 fn friendly_error(raw: &str) -> String {
-    if raw.contains("no channel files could be swapped") || raw.contains("checkout:") {
-        "checkout isn't possible for this server — its channel files aren't in the manifest; your install is unchanged"
-            .to_string()
-    } else if raw.contains("patchConfig entry") {
+    if raw.contains("patchConfig entry") {
         "already on the latest version — nothing to do".to_string()
     } else if raw.contains("run predownload first") || raw.contains("incremental_download") {
         "no downloaded update found — press 'd' first to download it".to_string()
@@ -1530,6 +1527,7 @@ async fn run(
                     }
                 },
                 UiEvent::TaskDone(r) => {
+                    let switched = r.is_ok() && state.task.as_ref().is_some_and(|t| t.kind == "checkout");
                     match &r {
                         Ok(msg) => notify(&mut state, msg.clone()),
                         Err(e) => notify(&mut state, format!("failed: {}", friendly_error(e))),
@@ -1544,6 +1542,11 @@ async fn run(
                     state.task_handle = None;
                     if let Some(path) = state.paths.get(state.active).cloned() {
                         state.quality_sel[state.active] = quality::selected(std::path::Path::new(&path));
+                        // Checkout changes the appId, so the cached "server:"
+                        // line is stale until a fresh status read.
+                        if switched {
+                            spawn_status(&tx, &path, state.active);
+                        }
                     }
                 }
             }
@@ -1913,8 +1916,12 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
                     };
                     let report = mgr.checkout(target).await.map_err(|e| e.to_string())?;
                     Ok(format!(
-                        "checkout complete — {} → {}, {} files swapped, now v{}",
-                        report.from_server, report.to_server, report.swapped_files, report.new_version
+                        "checkout complete — {} → {}, {} file(s) swapped, {} removed, now v{}",
+                        report.from_server,
+                        report.to_server,
+                        report.swapped_files,
+                        report.removed_files,
+                        report.new_version
                     ))
                 }
             }

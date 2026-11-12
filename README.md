@@ -146,6 +146,11 @@ version older than the installed one is refused rather than rolled back.
 `kuro pack` for a tier the channel does not serve, and `kuro update` for a
 pack-document version update.
 
+Switching CN ⇄ Bilibili (`c` on the game page) compares the two channels'
+manifests at the installed version, downloads the files that differ, and
+deletes files only the old channel has. A version skew is refused with a
+"sync first" message rather than downgrading the install.
+
 ### TUI
 
 The TUI is a drill-down: a **games list**, then one game per page. `Esc` backs

@@ -951,55 +951,108 @@ impl GameManager {
     /// updating the appId (CN <-> Bilibili). Global is a different package —
     /// not supported for fast-switch (mirrors ww-manager).
     pub async fn checkout(&self, target: Server) -> Result<CheckoutReport> {
-        if matches!(target, Server::Global) {
+        self.checkout_inner(target, None, None).await
+    }
+
+    /// Checkout core, testable with the two channel APIs pointed at local
+    /// servers.
+    ///
+    /// The channel delta is derived from the two full manifests, not a
+    /// hardcoded file list (the old list stopped existing and made every
+    /// switch fail). A fast switch is same-version only: on a version skew the
+    /// user is told to sync instead of silently downgrading the install.
+    pub async fn checkout_inner(
+        &self,
+        target: Server,
+        target_api: Option<&str>,
+        source_api: Option<&str>,
+    ) -> Result<CheckoutReport> {
+        if matches!(target, Server::Global) || matches!(self.server, Server::Global) {
             return Err(Error::Unsupported(
                 "global fast-switch is not supported (package differences) — full sync instead",
             ));
         }
-        self.checkout_inner(target, None).await
-    }
-
-    /// Checkout core, testable with `api_url` pointed at a local server.
-    pub async fn checkout_inner(&self, target: Server, api_url: Option<&str>) -> Result<CheckoutReport> {
-        let entry = server_entry(self.game, target).expect("registry covers all known servers");
-        let api_url = match api_url {
+        if self.game != Game::WuWa {
+            return Err(Error::Unsupported(
+                "fast server switch is only for Wuthering Waves CN <-> Bilibili — install or sync the other package instead",
+            ));
+        }
+        let local = self
+            .local_version()?
+            .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
+        let target_url = match target_api {
             Some(u) => u.to_string(),
             None => index_url(self.game, target)?,
         };
+        let source_url = match source_api {
+            Some(u) => u.to_string(),
+            None => index_url(self.game, self.server)?,
+        };
 
-        let index = self.api.fetch_index(&api_url).await?;
-        let nodes = cdn_nodes(&self.api, &index)?;
-        let cfg = &index.default.config;
-        let to_version = cfg.version.clone();
-        let base = cfg.base_url.clone();
+        let target_index = self.api.fetch_index(&target_url).await?;
+        let target_cfg = &target_index.default.config;
+        if target_cfg.version != local {
+            return Err(Error::Patch(format!(
+                "{target} is on {}, your install is {local} — a fast switch needs the same version",
+                target_cfg.version
+            )));
+        }
+        let source_index = self.api.fetch_index(&source_url).await?;
+        let source_cfg = &source_index.default.config;
+        if source_cfg.version != local {
+            return Err(Error::Patch(format!(
+                "{} is on {} but your install is {local} — sync this channel first",
+                self.server, source_cfg.version
+            )));
+        }
 
-        // full index → md5s for the diff files
-        let full_index = self.api.fetch_manifest(&nodes, &cfg.index_file).await?;
-        let md5_by_dest: HashMap<String, String> = full_index
+        let target_nodes = cdn_nodes(&self.api, &target_index)?;
+        let source_nodes = cdn_nodes(&self.api, &source_index)?;
+        let target_manifest = self.api.fetch_manifest(&target_nodes, &target_cfg.index_file).await?;
+        let source_manifest = self.api.fetch_manifest(&source_nodes, &source_cfg.index_file).await?;
+        if target_manifest.resource.is_empty() {
+            return Err(Error::Patch(format!(
+                "the {target} manifest is empty — refusing to switch"
+            )));
+        }
+
+        let source_by_dest: HashMap<&str, &ResourceItem> =
+            source_manifest.resource.iter().map(|r| (r.dest.as_str(), r)).collect();
+        let target_dests: HashSet<&str> = target_manifest.resource.iter().map(|r| r.dest.as_str()).collect();
+        let to_fetch: Vec<&ResourceItem> = target_manifest
             .resource
             .iter()
-            .map(|r| (r.dest.clone(), r.md5.clone()))
+            .filter(|r| match source_by_dest.get(r.dest.as_str()) {
+                None => true,
+                Some(s) => s.md5 != r.md5 || s.size != r.size,
+            })
+            .collect();
+        // Files only this channel has (the CN KRSDK.dll, the Bilibili SDK
+        // tree) must not survive the switch.
+        let to_remove: Vec<&ResourceItem> = source_manifest
+            .resource
+            .iter()
+            .filter(|r| !target_dests.contains(r.dest.as_str()))
             .collect();
 
+        let base = target_cfg.base_url.clone();
         let mut swapped = 0;
         let sem = Arc::new(tokio::sync::Semaphore::new(FILE_CONCURRENCY));
         let mut handles = tokio::task::JoinSet::new();
-        for f in entry.diff_files {
-            let Some(expected_md5) = md5_by_dest.get(*f) else {
-                continue;
-            };
-            let urls = node_urls(&nodes, |n| ApiClient::resource_url(n, &base, f));
-            let game_path = self.game_folder.join(f.trim_start_matches('/'));
+        for item in to_fetch {
+            let dest = item.dest.clone();
+            let size = item.size;
+            let md5 = item.md5.clone();
+            let urls = node_urls(&target_nodes, |n| ApiClient::resource_url(n, &base, &dest));
+            let game_path = self.game_folder.join(normalise(&dest));
             std::fs::create_dir_all(game_path.parent().unwrap())?;
             let tmp = tmp_sibling(&game_path, "checkout");
-            let name = f.to_string();
-            let md5 = expected_md5.clone();
             let http = self.http.clone();
             let budget = self.budget.clone();
             let sem = sem.clone();
             handles.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                download_single(&http, &urls, &tmp, None, Some(md5.as_str()), &name, None, &budget).await?;
+                download_single(&http, &urls, &tmp, Some(size), Some(md5.as_str()), &dest, None, &budget).await?;
                 safe_replace(&tmp, &game_path)?;
                 Ok::<_, Error>(())
             });
@@ -1009,13 +1062,18 @@ impl GameManager {
             swapped += 1;
         }
 
-        if swapped == 0 {
-            return Err(Error::Patch(
-                "checkout: no channel files could be swapped (missing from target manifest) — config left unchanged"
-                    .into(),
-            ));
+        let mut removed = 0;
+        for item in to_remove {
+            let path = self.game_folder.join(normalise(&item.dest));
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
 
+        let entry = server_entry(self.game, target).expect("registry covers all known servers");
+        let to_version = target_cfg.version.clone();
         let cfg = self
             .local_config()?
             .unwrap_or_else(|| LocalConfig::new(to_version.clone(), entry.app_id))
@@ -1026,6 +1084,7 @@ impl GameManager {
             from_server: self.server,
             to_server: target,
             swapped_files: swapped,
+            removed_files: removed,
             new_version: to_version,
         })
     }
@@ -1425,6 +1484,7 @@ pub struct CheckoutReport {
     pub from_server: Server,
     pub to_server: Server,
     pub swapped_files: usize,
+    pub removed_files: usize,
     pub new_version: String,
 }
 

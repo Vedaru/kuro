@@ -68,8 +68,6 @@ impl fmt::Display for Server {
 pub struct ServerEntry {
     pub api_url: &'static str,
     pub app_id: &'static str,
-    /// Files that are channel-specific and must be swapped when switching.
-    pub diff_files: &'static [&'static str],
     /// Where the 3.0+ launcher publishes the channel's optional quality packs
     /// ([`PackConfig`](crate::PackConfig)), if the channel has any. More than
     /// one URL is a failover list for the same document.
@@ -102,11 +100,6 @@ pub const WUWA_PACK_CONFIG_URLS: &[&str] = &[
     "https://prod-tencentcdn-gamestarter.kurogame.com/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
 ];
 
-pub const WUWA_DIFF_FILES: &[&str] = &[
-    "Client/Binaries/Win64/kuro_login.dll",
-    "Client/Content/Paks/pakchunk1-Kuro-Win64-Shipping.pak",
-];
-
 pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
     match game {
         Game::WuWa => &[
@@ -115,7 +108,6 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                 ServerEntry {
                     api_url: "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/index.json",
                     app_id: "10003",
-                    diff_files: WUWA_DIFF_FILES,
                     pack_config_urls: WUWA_PACK_CONFIG_URLS,
                 },
             ),
@@ -124,10 +116,6 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                 ServerEntry {
                     api_url: "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10004_j5GWFuUFlb8N31Wi2uS3ZAVHcb7ZGN7y/index.json",
                     app_id: "10004",
-                    diff_files: &[
-                        "Client/Binaries/Win64/bilibili_sdk.dll",
-                        "Client/Content/Paks/pakchunk1-Bilibili-Win64-Shipping.pak",
-                    ],
                     pack_config_urls: WUWA_PACK_CONFIG_URLS,
                 },
             ),
@@ -136,7 +124,6 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                 ServerEntry {
                     api_url: "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/G153/50004_obOHXFrFanqsaIEOmuKroCcbZkQRBC7c/index.json",
                     app_id: "50004",
-                    diff_files: WUWA_DIFF_FILES,
                     pack_config_urls: &[],
                 },
             ),
@@ -148,7 +135,6 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                     // Token is runtime-only (env / tokens file) — see index_url().
                     api_url: "",
                     app_id: "50015",
-                    diff_files: &[],
                     pack_config_urls: &[],
                 },
             ),
@@ -158,7 +144,6 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
                     // Token is runtime-only (env / tokens file) — see index_url().
                     api_url: "",
                     app_id: "10012",
-                    diff_files: &[],
                     pack_config_urls: &[],
                 },
             ),
