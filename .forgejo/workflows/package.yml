@@ -145,10 +145,19 @@ jobs:
         run: |
           set -euo pipefail
           helper='!f() { echo "username=x"; printf "password=%s\n" "$FORGEJO_TOKEN"; }; f'
-          rm -rf "$RUNNER_TEMP/chezmoi-src"
-          git -c credential.helper= -c "credential.helper=$helper" \
-              clone --quiet --depth 1 \
-              http://127.0.0.1:3000/Vedaru/chezmoi.git "$RUNNER_TEMP/chezmoi-src"
+          cloned=0
+          for attempt in 1 2 3 4 5; do
+              rm -rf "$RUNNER_TEMP/chezmoi-src"
+              if git -c credential.helper= -c "credential.helper=$helper" \
+                  clone --quiet --depth 1 \
+                  http://127.0.0.1:3000/Vedaru/chezmoi.git "$RUNNER_TEMP/chezmoi-src"; then
+                  cloned=1
+                  break
+              fi
+              echo "chezmoi clone failed, retry $attempt/5" >&2
+              sleep 3
+          done
+          [ "$cloned" = 1 ] || { echo "clone of chezmoi.git failed" >&2; exit 1; }
 
       - name: Build kuro from source and stage it
         env:
