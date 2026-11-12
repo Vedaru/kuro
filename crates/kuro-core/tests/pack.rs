@@ -5,10 +5,9 @@ mod common;
 
 use common::md5_bytes;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use kuro_api::{LocalConfig, PackBundle, PackCdnNode, PackConfig, PackEntry};
+use kuro_api::{LocalConfig, PackBundle, PackCdnNode, PackConfig, PackEntry, PackPatch};
 use kuro_core::{pack, GameManager, Quality};
 
 fn setup_game(base: &Path, app_id: &str) -> PathBuf {
@@ -102,14 +101,9 @@ async fn installs_a_tier_and_registers_it_with_the_launcher() {
 
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
-    let mut channel = HashMap::new();
-    channel.insert(
-        "client/binaries/win64/client-win64-shipping.exe".to_string(),
-        (common.len() as u64, md5_bytes(&common)),
-    );
 
     let report = mgr
-        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), &channel, true, None)
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
 
@@ -119,9 +113,11 @@ async fn installs_a_tier_and_registers_it_with_the_launcher() {
         std::fs::read(game.join("Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak")).unwrap(),
         hd
     );
-    assert_eq!(
-        std::fs::read(game.join("Client/Binaries/Win64/Client-Win64-Shipping.exe")).unwrap(),
-        common
+    // `pack` installs the tier, not `common`: the base client is the
+    // game-version path's job, exactly as in the official launcher.
+    assert!(
+        !game.join("Client/Binaries/Win64/Client-Win64-Shipping.exe").exists(),
+        "a tier install wrote a common file"
     );
 
     // Both launcher records, or the launcher offers "repair game".
@@ -144,9 +140,8 @@ async fn installs_a_tier_and_registers_it_with_the_launcher() {
 }
 
 /// Since 3.8.0 a tier ships optional map/event packs under
-/// `Client/Saved/Resources/<version>/`. They live outside the body, are absent
-/// from the channel manifest, and must still be fetched by the tier that owns
-/// them: the common copy by `common`, the `_HD` copy by `hd`.
+/// `Client/Saved/Resources/<version>/`. They live outside the body and must be
+/// fetched by the tier install, with the version directory as the only rule.
 #[tokio::test]
 async fn optional_pack_resources_are_installed_outside_the_body() {
     let base = tempfile::Builder::new()
@@ -155,22 +150,11 @@ async fn optional_pack_resources_are_installed_outside_the_body() {
         .unwrap();
     let game = setup_game(base.path(), "10003");
 
-    let common_bin = b"CLIENT-BINARY".to_vec();
-    let common_pack = b"COMMON-OPTION-PACK".to_vec();
     let hd = b"HD-PAK".to_vec();
     let hd_pack = b"HD-OPTION-PACK".to_vec();
-
-    let common_dest = "Client/Saved/Resources/3.8.0/Option_Pack_Map/Base/pakchunk50.pak";
     let hd_dest = "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/pakchunk50-HD.pak";
 
     let server = common::spawn_http_server(vec![
-        (
-            "/common/indexFile.json".into(),
-            manifest_json(&[
-                ("Client/Binaries/Win64/Client-Win64-Shipping.exe", &common_bin),
-                (common_dest, &common_pack),
-            ]),
-        ),
         (
             "/hd/indexFile.json".into(),
             manifest_json(&[
@@ -178,11 +162,6 @@ async fn optional_pack_resources_are_installed_outside_the_body() {
                 (hd_dest, &hd_pack),
             ]),
         ),
-        (
-            "/zip/Client/Binaries/Win64/Client-Win64-Shipping.exe".into(),
-            common_bin.clone(),
-        ),
-        (format!("/zip/{common_dest}"), common_pack.clone()),
         (
             "/zip/Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak".into(),
             hd.clone(),
@@ -193,24 +172,13 @@ async fn optional_pack_resources_are_installed_outside_the_body() {
 
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.8.0");
-    let mut channel = HashMap::new();
-    channel.insert(
-        "client/binaries/win64/client-win64-shipping.exe".to_string(),
-        (common_bin.len() as u64, md5_bytes(&common_bin)),
-    );
-
     let report = mgr
-        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), &channel, true, None)
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
 
     assert!(report.broken.is_empty(), "unexpected failures: {:?}", report.broken);
     assert!(report.registered);
-    assert_eq!(
-        report.parts[0].skipped, 0,
-        "the common optional pack was skipped as a channel difference"
-    );
-    assert_eq!(std::fs::read(game.join(common_dest)).unwrap(), common_pack);
     assert_eq!(std::fs::read(game.join(hd_dest)).unwrap(), hd_pack);
 }
 
@@ -234,14 +202,7 @@ async fn failed_download_does_not_register_the_tier() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
     let report = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
 
@@ -251,84 +212,6 @@ async fn failed_download_does_not_register_the_tier() {
     assert!(
         !game.join("launcherDownloadConfig/hd.json").exists(),
         "marker written for an uninstalled tier"
-    );
-}
-
-/// `common` describes the base client, which the channel also serves. Where the
-/// two disagree the channel wins — otherwise installing a tier would replace
-/// channel-specific SDK binaries with the other channel's.
-#[tokio::test]
-async fn common_defers_to_the_channel_where_they_disagree() {
-    let base = tempfile::Builder::new().prefix("kuro-pack-common-").tempdir().unwrap();
-    let game = setup_game(base.path(), "10004");
-
-    let sdk_pack_doc = b"BILIBILI-SDK-FROM-PACK-DOC".to_vec();
-    let channel_sdk = b"THE-CHANNEL-VERSION-OF-IT".to_vec();
-    let agreed = b"AGREED-FILE".to_vec();
-    let cn_only = b"CN-ONLY-SDK".to_vec();
-    let hd_pak = b"HD-PAK".to_vec();
-    std::fs::create_dir_all(game.join("Client/Binaries/Win64")).unwrap();
-    std::fs::write(game.join("Client/Binaries/Win64/bilibili_sdk.dll"), &channel_sdk).unwrap();
-
-    let server = common::spawn_http_server(vec![
-        (
-            "/common/indexFile.json".into(),
-            manifest_json(&[
-                ("Client/Binaries/Win64/bilibili_sdk.dll", &sdk_pack_doc),
-                ("Client/Binaries/Win64/shared.dll", &agreed),
-                ("Client/Binaries/Win64/thirdparty/krpcsdk_mainland/krsdk.dll", &cn_only),
-            ]),
-        ),
-        (
-            "/hd/indexFile.json".into(),
-            manifest_json(&[("Client/Content/HD/pakchunk0.pak", &hd_pak)]),
-        ),
-        (
-            "/zip/Client/Binaries/Win64/bilibili_sdk.dll".into(),
-            sdk_pack_doc.clone(),
-        ),
-        ("/zip/Client/Binaries/Win64/shared.dll".into(), agreed.clone()),
-        ("/zip/Client/Content/HD/pakchunk0.pak".into(), hd_pak.clone()),
-    ])
-    .await;
-
-    let mgr = GameManager::open(game.clone()).await.unwrap();
-    let cfg = config(&server, "3.7.1");
-    let mut channel = HashMap::new();
-    channel.insert(
-        "client/binaries/win64/bilibili_sdk.dll".to_string(),
-        (channel_sdk.len() as u64, md5_bytes(&channel_sdk)),
-    );
-    channel.insert(
-        "client/binaries/win64/shared.dll".to_string(),
-        (agreed.len() as u64, md5_bytes(&agreed)),
-    );
-
-    let report = mgr
-        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), &channel, true, None)
-        .await
-        .unwrap();
-
-    assert!(report.broken.is_empty(), "{:?}", report.broken);
-    assert_eq!(
-        std::fs::read(game.join("Client/Binaries/Win64/bilibili_sdk.dll")).unwrap(),
-        channel_sdk,
-        "the pack document's copy replaced the channel's SDK binary"
-    );
-    assert_eq!(
-        std::fs::read(game.join("Client/Binaries/Win64/shared.dll")).unwrap(),
-        agreed,
-        "a file both sides agree on should still be installed"
-    );
-    assert_eq!(
-        report.parts[0].skipped, 2,
-        "the differing binary and the entry this channel does not list are both the channel's"
-    );
-    assert!(
-        !game
-            .join("Client/Binaries/Win64/thirdparty/krpcsdk_mainland/krsdk.dll")
-            .exists(),
-        "a CN-only SDK dll was written into a Bilibili install"
     );
 }
 
@@ -355,14 +238,7 @@ async fn check_reports_without_touching_anything() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
     let report = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            false,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), false, None)
         .await
         .unwrap();
 
@@ -399,14 +275,7 @@ async fn check_does_not_create_marker_files() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
     let report = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            false,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), false, None)
         .await
         .unwrap();
 
@@ -438,30 +307,16 @@ async fn rerun_is_idempotent() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
     let first = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
-    assert_eq!(first.parts[1].downloaded, 1);
+    assert_eq!(first.parts[0].downloaded, 1);
 
     let second = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
-    assert_eq!(second.parts[1].downloaded, 0, "a verified tier was re-downloaded");
+    assert_eq!(second.parts[0].downloaded, 0, "a verified tier was re-downloaded");
     assert!(second.registered);
 }
 
@@ -490,14 +345,7 @@ async fn a_tier_pack_cannot_write_outside_its_body() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
     let err = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap_err();
 
@@ -531,14 +379,7 @@ async fn a_failed_install_withdraws_the_records_it_cannot_vouch_for() {
     // The file URL is not registered, so the download fails after the records
     // have already been withdrawn.
     let first = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
     assert!(!first.registered);
@@ -572,16 +413,9 @@ async fn a_noop_rerun_does_not_disturb_a_healthy_registration() {
 
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
-    mgr.sync_pack_inner(
-        Quality::Hd,
-        &cfg,
-        std::slice::from_ref(&server),
-        &HashMap::new(),
-        true,
-        None,
-    )
-    .await
-    .unwrap();
+    mgr.sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
+        .await
+        .unwrap();
 
     // The launcher rewrote the marker while the game ran; kuro must leave it be.
     let marker = game.join("launcherDownloadConfig/hd.json");
@@ -590,17 +424,10 @@ async fn a_noop_rerun_does_not_disturb_a_healthy_registration() {
     let stamp = std::fs::metadata(&marker).unwrap().modified().unwrap();
 
     let second = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
-    assert_eq!(second.parts[1].downloaded, 0);
+    assert_eq!(second.parts[0].downloaded, 0);
     assert!(second.registered, "a complete tier must report as registered");
     assert_eq!(
         std::fs::metadata(&marker).unwrap().modified().unwrap(),
@@ -640,14 +467,7 @@ async fn a_shrinking_tier_removes_its_own_stale_files_only() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&first_server, "3.7.1");
     let first = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&first_server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&first_server), true, None)
         .await
         .unwrap();
     assert!(first.registered);
@@ -668,14 +488,7 @@ async fn a_shrinking_tier_removes_its_own_stale_files_only() {
     .await;
     let cfg = config(&second_server, "3.7.2");
     let second = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&second_server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&second_server), true, None)
         .await
         .unwrap();
     assert_eq!(second.pruned, 1, "the dropped pak was not removed");
@@ -711,14 +524,7 @@ async fn an_empty_tier_manifest_does_not_wipe_the_installed_tier() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&good, "3.7.1");
     let installed = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&good),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&good), true, None)
         .await
         .unwrap();
     assert!(installed.registered);
@@ -733,14 +539,7 @@ async fn an_empty_tier_manifest_does_not_wipe_the_installed_tier() {
     .await;
     let cfg = config(&empty, "3.7.2");
     let err = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&empty),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&empty), true, None)
         .await
         .expect_err("an empty tier manifest was accepted");
     assert!(err.to_string().contains("lists no files"), "unexpected error: {err}");
@@ -797,14 +596,7 @@ async fn a_launcher_side_update_is_not_downgraded() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
     let err = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .expect_err("a launcher-side 3.8.0 install was downgraded to 3.7.1");
     assert!(
@@ -840,14 +632,7 @@ async fn a_manifest_that_fails_its_published_digest_is_refused() {
     cfg.resource_packs.get_mut("hd").unwrap().index_file_md5 = "0".repeat(32);
 
     let err = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap_err();
     assert!(
@@ -883,14 +668,7 @@ async fn a_large_pak_is_fetched_as_ranges() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
     let report = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
 
@@ -899,17 +677,10 @@ async fn a_large_pak_is_fetched_as_ranges() {
     assert_eq!(std::fs::read(&pak).unwrap(), big, "ranged download reassembled wrong");
     // A rerun trusts the recorded hash instead of re-reading 5 MiB.
     let again = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .unwrap();
-    assert_eq!(again.parts[1].downloaded, 0);
+    assert_eq!(again.parts[0].downloaded, 0);
 }
 
 /// An entry with a size but no digest cannot be verified, so it must not be
@@ -948,14 +719,7 @@ async fn an_entry_without_a_digest_refuses_the_tier() {
     let mgr = GameManager::open(game.clone()).await.unwrap();
     let cfg = config(&server, "3.7.1");
     let err = mgr
-        .sync_pack_inner(
-            Quality::Hd,
-            &cfg,
-            std::slice::from_ref(&server),
-            &HashMap::new(),
-            true,
-            None,
-        )
+        .sync_pack_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), true, None)
         .await
         .expect_err("a manifest with an unverifiable entry was installed");
     assert!(
@@ -972,4 +736,114 @@ async fn an_entry_without_a_digest_refuses_the_tier() {
         !game.join("launcherDownloadConfig/hd.json").exists(),
         "the refused run registered the tier"
     );
+}
+
+fn patch_config(server: &str) -> PackConfig {
+    let mut cfg = PackConfig::default();
+    cfg.cdn_list.push(PackCdnNode {
+        p: 1,
+        url: server.to_string(),
+        k1: Some(1),
+        k2: Some(1),
+    });
+    for name in ["common", "hd"] {
+        cfg.resource_packs.insert(
+            name.to_string(),
+            PackEntry {
+                version: "3.8.0".to_string(),
+                patch_config: vec![PackPatch {
+                    version: "3.7.1".to_string(),
+                    index_file: format!("{name}/patch.json"),
+                    base_url: "zip".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+    }
+    cfg.bundles.insert(
+        "HD".to_string(),
+        PackBundle {
+            resource_packs: vec!["common".into(), "hd".into()],
+        },
+    );
+    cfg
+}
+
+/// The official update path: `common` and the active tier each apply their own
+/// 3.7.1 → 3.8.0 delta, and only then is the new version recorded. The full
+/// 3.8.0 body is never fetched.
+#[tokio::test]
+async fn pack_update_applies_common_and_tier_deltas_together() {
+    let base = tempfile::Builder::new().prefix("kuro-pack-update-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
+
+    let common_bin = b"NEW-COMMON-BIN".to_vec();
+    let common_pack = b"NEW-COMMON-OPTION-PACK".to_vec();
+    let hd_pak = b"NEW-HD-PAK".to_vec();
+    let hd_pack = b"NEW-HD-OPTION-PACK".to_vec();
+
+    let common_dest = "Client/Binaries/Win64/Client-Win64-Shipping.exe";
+    let common_pack_dest = "Client/Saved/Resources/3.8.0/Option_Pack_Map/Base/pakchunk50.pak";
+    let hd_dest = "Client/Content/HD/pakchunk0-HD-WindowsNoEditor.pak";
+    let hd_pack_dest = "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/pakchunk50-HD.pak";
+
+    let server = common::spawn_http_server(vec![
+        (
+            "/common/patch.json".into(),
+            manifest_json(&[(common_dest, &common_bin), (common_pack_dest, &common_pack)]),
+        ),
+        (
+            "/hd/patch.json".into(),
+            manifest_json(&[(hd_dest, &hd_pak), (hd_pack_dest, &hd_pack)]),
+        ),
+        (format!("/zip/{common_dest}"), common_bin.clone()),
+        (format!("/zip/{common_pack_dest}"), common_pack.clone()),
+        (format!("/zip/{hd_dest}"), hd_pak.clone()),
+        (format!("/zip/{hd_pack_dest}"), hd_pack.clone()),
+    ])
+    .await;
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let cfg = patch_config(&server);
+    let report = mgr
+        .pack_update_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), None)
+        .await
+        .unwrap();
+
+    assert_eq!(report.version, "3.8.0");
+    assert_eq!(report.parts.len(), 2);
+    assert_eq!(report.parts[0].name, "common", "common must apply first");
+    assert_eq!(report.parts[1].name, "hd");
+    assert_eq!(std::fs::read(game.join(common_dest)).unwrap(), common_bin);
+    assert_eq!(std::fs::read(game.join(common_pack_dest)).unwrap(), common_pack);
+    assert_eq!(std::fs::read(game.join(hd_dest)).unwrap(), hd_pak);
+    assert_eq!(std::fs::read(game.join(hd_pack_dest)).unwrap(), hd_pack);
+
+    let root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(game.join("launcherDownloadConfig.json")).unwrap()).unwrap();
+    assert_eq!(root["version"], "3.8.0");
+    assert_eq!(root["bundles"]["HD"]["version"], "3.8.0");
+    let marker: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(game.join("launcherDownloadConfig/hd.json")).unwrap()).unwrap();
+    assert_eq!(marker["packName"], "hd");
+    assert_eq!(marker["version"], "3.8.0");
+}
+
+/// No matching source-version delta is a refusal, not a full-body fallback.
+#[tokio::test]
+async fn pack_update_refuses_without_a_matching_patch() {
+    let base = tempfile::Builder::new().prefix("kuro-pack-nopatch-").tempdir().unwrap();
+    let game = setup_game(base.path(), "10003");
+
+    let server = common::spawn_http_server(vec![]).await;
+    let mut cfg = patch_config(&server);
+    cfg.resource_packs.get_mut("hd").unwrap().patch_config.clear();
+
+    let mgr = GameManager::open(game.clone()).await.unwrap();
+    let err = mgr
+        .pack_update_inner(Quality::Hd, &cfg, std::slice::from_ref(&server), None)
+        .await
+        .expect_err("a missing patchConfig entry was accepted");
+    assert!(err.to_string().contains("no 3.7.1"), "unexpected error: {err}");
 }

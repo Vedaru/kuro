@@ -16,5 +16,5 @@ pub use config::{
 pub use error::{Error, Result};
 pub use types::{
     CdnNode, ChunkInfo, DefaultSection, FileRef, GroupInfo, LauncherConfig, LauncherIndex, LocalConfig, PackBundle,
-    PackCdnNode, PackConfig, PackEntry, PatchConfig, PatchIndex, ResourceItem,
+    PackCdnNode, PackConfig, PackEntry, PackPatch, PatchConfig, PatchIndex, ResourceItem,
 };

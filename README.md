@@ -48,15 +48,15 @@ the wine dependency is removed by applying patches via
   (size, mtime) like `make`/`git`, so re-verify costs one stat per file. Pure
   I/O savings — delete `.kuro_cache/` any time to force a full re-hash
 - **install** — from-zero client download for any supported game
-- **quality packs (SD / HD / UHD)** — WuWa's channel manifest carries the base
-  paks plus one `Client/Content/HD` body and nothing else, so SD and UHD cannot
-  come from `sync`. `kuro pack <folder> <sd|hd|uhd>` installs the tier from the
-  launcher's own pack document (`common` + `sd`/`hd`/`uhd`, each with its own
-  version, manifest and CDN) and then writes the two records the official
-  launcher reads, so the tier counts as installed instead of as "repair game".
-  `--check` verifies without downloading. `--quality` on `install` / `sync`
-  stays the narrower thing: it picks which body those fetch from the channel.
-  PGR (Unity) has no quality packs, so this is WuWa-only
+- **quality packs and the official pack update (SD / HD / UHD)** — WuWa
+  CN/Bilibili publish the game version and the tiers through the launcher's
+  pack document. `kuro update` applies `common` + the active tier through their
+  `patchConfig` deltas, which is the official 3.7.1 → 3.8.0 path: ~12 GiB of
+  patches instead of a 54 GiB full body. `kuro sync` uses the same path for
+  those channels. `kuro pack <folder> <sd|hd|uhd>` installs one tier from its
+  full `resourcePacks[<tier>]` manifest and writes the two launcher records.
+  `--check` writes nothing. Channels without a pack document (Global, PGR) stay
+  on the base index. PGR (Unity) has no quality packs at all
 - **checkout** — CN ⇄ Bilibili channel switch for WuWa (diff-file swap + appId)
 - **built-in launcher** — `kuro play` starts the game itself. Since WuWa 3.7
   the client refuses to boot without `-krqlv=<SD|HD|UHD>` on its command line,
@@ -112,33 +112,30 @@ cp target/release/kuro ~/.local/bin/
 kuro                    # TUI — auto-detects installed games in Steam libraries
 kuro <folder>...        # or point at game folders explicitly
 kuro status <folder>    # CLI: print local/remote versions
-kuro sync <folder> [--quality <sd|hd|uhd>]              # CLI: verify + repair
+kuro sync <folder> [--quality <sd|hd|uhd>]              # CLI: pack update + verify
+kuro update <folder> [--check]                          # CLI: common + tier patchConfig update
 kuro install <wuwa|pgr> <cn|bilibili|global> <folder> [--quality <sd|hd|uhd>]
 kuro quality <folder> [sd|hd|uhd]                       # CLI: which pack the client mounts
-kuro pack [folder] <sd|hd|uhd> [--check]                # CLI: install the paks + register them
+kuro pack [folder] <sd|hd|uhd> [--check]                # CLI: install one tier + register it
 ```
 
-`--quality` on `install` / `sync` is the **download** side of that choice: only
-the named `Client/Content/<TIER>` body is fetched, together with the base paks
-and binaries every install needs. It defaults to everything the channel serves,
-and a body the channel does not serve is an error naming what it does serve —
-so "sd" on an HD-only channel tells you instead of quietly installing 42 GiB of
-HD. The saved preset (`kuro quality <folder> hd`) is what a plain `sync` follows
-afterwards, best-effort: if the channel currently serves no such body, the run
-falls back to the full manifest rather than failing. PGR has no quality packs at
-all, so there `--quality` is refused rather than ignored.
+For WuWa CN/Bilibili the pack document is the single update path. `kuro sync`
+applies `common` + the active tier's `patchConfig` deltas and reports the
+result. `kuro update` is the same operation as an explicit command, with
+`--check` to see the download first. `common` is the base client, so a tier
+install (`kuro pack`) never touches it.
 
-Getting a tier the channel does not serve is `kuro pack`'s job. It is
-idempotent — a rerun verifies by MD5 and downloads only what is missing — and it
-writes the launcher records only after every file of the tier verifies, because
-a record for a pack the disk does not have is exactly what makes the launcher
-answer "repair game". The records are withdrawn before the first byte of a
-reinstall for the same reason: an interrupted run must read as "not installed",
-not as a broken install. `common` is reconciled against the channel: where the
-two disagree about a file (the 69 channel-SDK binaries, CN vs Bilibili), the
-channel wins and the pack's copy is left alone. The manifest is also checked
-against the `indexFileMd5` the pack document publishes, and an offered version
-older than the installed one is refused rather than rolled back.
+A pack manifest has exactly one path rule: a tier owns
+`Client/Content/<TIER>/`, and any pack may write the target version's
+`Client/Saved/Resources/<version>/`. That is the official rule, and the version
+directory is the only discriminator. A missing `patchConfig` entry for the
+installed version is a refusal, not a fallback to a full body or another tier.
+Every launcher record is written only after every file verifies, and an offered
+version older than the installed one is refused rather than rolled back.
+
+`--quality` on `install` still selects a body the channel manifest serves. Use
+`kuro pack` for a tier the channel does not serve, and `kuro update` for a
+pack-document version update.
 
 ### TUI keys
 
@@ -148,7 +145,7 @@ older than the installed one is refused rather than rolled back.
 | `←` / `→` | switch game |
 | `↑` / `↓`, `PgUp` / `PgDn` | scroll the log (when focused) |
 | `r` | refresh status |
-| `d` | predownload update |
+| `d` | update / predownload (pack document for WuWa CN/Bilibili) |
 | `a` | apply predownloaded update |
 | `s` | sync / repair files |
 | `c` | checkout server (CN ⇄ Bilibili) |
@@ -238,10 +235,10 @@ workspace member, and its two dead-code warnings are not ours to fix.
   is derived from the shared launcher platform, not yet confirmed against a
   live session
 - ACE anti-cheat doesn't run under Proton (see above)
-- `--quality` on `install` / `sync` only covers the bodies a channel serves:
-  `predownload` / `apply` still stage the whole patch set for a version,
-  because a partially-applied patch would record a version the install does not
-  actually hold. Tiers the channel does not serve come from `kuro pack`
+- The pack update path needs a `patchConfig` entry matching the installed
+  version. If the channel has not published one, kuro refuses rather than
+  downloading a full body or switching tiers. The nested `predownload` block
+  (the launcher's preinstall channel) is not consumed yet.
 - `kuro pack` installs one tier at a time; nothing switches between installed
   tiers on disk. Each tier is a disjoint ~20–62 GiB body, so keeping more than
   one installed is a disk-space decision, and the `-krqlv=` argument is what
@@ -254,9 +251,9 @@ workspace member, and its two dead-code warnings are not ours to fix.
   Video/Lang/Resource packs — not the `Client/Content/Paks` base paks) is
   fetched by the client itself and is invisible to Kuro. The one exception is
   the launcher's *pack* document: since 3.8.0 a tier's manifest also lists its
-  optional map/event packs under `Client/Saved/Resources/<version>/`, and
-  `kuro pack` installs those with the tier. The client's own
-  Resource/Lang/Video channel is still fetched by the game.
+  optional map/event packs under `Client/Saved/Resources/<version>/`, and the
+  pack install/update writes those. The client's own Resource/Lang/Video
+  channel is still fetched by the game.
 - WuWa CN hotfixes (e.g. 3.6.0 → 3.6.1) have no `krpdiff` groups and no
   `fromFolder`: `predownload` stages the changed files as full files, and
   `apply` refuses to record the new version unless every target file is already

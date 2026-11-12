@@ -27,14 +27,18 @@
 //! Tier bodies are disjoint from each other and `common ∩ full` is identical
 //! (`hd` happens to duplicate the channel's HD body byte for byte).
 //!
-//! Since 3.8.0 a tier manifest also carries its optional map/event packs,
-//! which live outside the body under
-//! `Client/Saved/Resources/<version>/Option_Pack_<tag>[_<TIER>]/Base/`.
-//! `common` owns the unsuffixed form and each tier owns its `_SD`/`_HD`/`_UHD`
-//! form, so the tier installs them in the same run. They are the only subtree
-//! outside `Client/Content/<TIER>` a pack may write: the rest of
-//! `Client/Saved` (Config, LocalStorage, the client's Resource/Lang/Video
-//! directories) is live game state and stays off limits.
+//! Since 3.8.0 a pack manifest also carries optional map/event packs under
+//! `Client/Saved/Resources/<pack version>/`. The official rule is exactly one
+//! rule: a tier writes its body or any path under the target version's resource
+//! directory, and `common` writes anything outside a tier body. The version
+//! directory is the only discriminator. The rest of `Client/Saved` (Config,
+//! LocalStorage, the client's own Resource/Lang/Video directories) is live game
+//! state and stays off limits.
+//!
+//! `common` is the base client, not a second source for a tier. A tier install
+//! (`kuro pack`) never touches it. The game/pack update applies `common` and
+//! the active tier together through their own `patchConfig` deltas, then writes
+//! the new version once both have landed.
 //!
 //! # Why the launcher must be told
 //!
@@ -59,12 +63,10 @@
 //!   temp-sibling + [`safe_replace`] path `sync` uses, and a rerun resumes by
 //!   MD5 — an interrupted tier is harmless, because the client only mounts a
 //!   body directory when launched with that tier.
-//! * `common` is reconciled against the *channel* manifest rather than
-//!   validated against a separately downloaded target index: the channel is the
-//!   authority for its own files, so an entry the channel serves differently is
-//!   left to `sync` instead of aborting the tier. That is what keeps the shared
-//!   CN pack document usable from Bilibili (747/816 `common` entries agree;
-//!   the 69 that differ are channel SDK binaries).
+//! * A tier install is just `resourcePacks[<tier>]`. `common` is the base
+//!   client, so a tier install never rewrites it. This is the official
+//!   `resource` operation, and it is why a tier install cannot clobber a
+//!   channel-specific base file.
 //! * Verification runs *before* anything is written, as one scan phase over
 //!   every pack, so `--check` and a repair agree on what is missing and a
 //!   repair with nothing to do does not rewrite records the launcher may have
@@ -76,20 +78,15 @@
 //!   document publishes, and an offered version older than the installed one is
 //!   refused rather than silently rolled back.
 //!
-//! # The one thing `ww-manager` has that this does not
+//! # The update path
 //!
-//! `ww-manager` drives pack *updates* through the incremental engine: it reads
-//! `resourcePacks.<name>.patchConfig`, applies the krpdiff groups for
-//! `from -> to`, and writes a resumable plan so `--apply` can continue after an
-//! interruption. kuro's pack path installs a *tier* from its full manifest, and
-//! treats a newer channel version as "verify and fetch what differs". For the
-//! packs published today that is the same work: none of the four manifests
-//! carries `groupInfos`, and every `patchConfig` entry we probed resolves to a
-//! full-file list (the 3.6.0/3.6.1 `common` patches are the only ones with
-//! groups, and they are for older palettes). Adding the merge engine here before
-//! a pack actually ships groups would be code no run exercises.
+//! [`GameManager::pack_update`] is the official launcher's incremental path:
+//! read `resourcePacks.<name>.patchConfig` for `common` and the active tier,
+//! download the krpdiff groups and full-file fallbacks, apply `common` first
+//! then the tier, and only then write `launcherDownloadConfig.version =
+//! resourcePacks.common.version`. A missing source-version delta is a refusal,
+//! never a full-body fallback or a switch to another tier.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -98,6 +95,7 @@ use kuro_api::{ApiClient, Error, PackConfig, PackEntry, PatchIndex, Result, Serv
 
 use crate::atomic::safe_replace;
 use crate::download::{download_file, FILE_CONCURRENCY};
+use crate::game::is_krpdiff;
 use crate::md5_cache::Md5Cache;
 use crate::path::{key as path_key, normalise, tmp_sibling};
 use crate::quality::Quality;
@@ -137,6 +135,129 @@ impl PackReport {
     pub fn bytes(&self) -> u64 {
         self.parts.iter().map(|p| p.bytes).sum()
     }
+}
+
+/// One pack's share of an official `patchConfig` update.
+#[derive(Debug, Clone)]
+pub struct PackUpdatePart {
+    pub name: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub report: crate::ApplyReport,
+}
+
+/// Summary of a `common` + tier pack update.
+#[derive(Debug, Clone, Default)]
+pub struct PackUpdateReport {
+    /// The game version recorded after the update, i.e. `common`'s target.
+    pub version: String,
+    pub parts: Vec<PackUpdatePart>,
+}
+
+/// What a pack update would download, without writing anything.
+#[derive(Debug, Clone, Default)]
+pub struct PackUpdatePlan {
+    pub version: String,
+    pub parts: Vec<PackUpdatePlanPart>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackUpdatePlanPart {
+    pub name: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// One pack's delta the official update path would apply.
+#[derive(Debug, Clone)]
+struct PackUpdateStep {
+    name: String,
+    from: String,
+    to: String,
+    patch: kuro_api::PackPatch,
+}
+
+/// Build the `common` + tier delta list. A missing `patchConfig` entry is a
+/// refusal, never a full-body fallback.
+fn pack_update_steps(
+    tier: Quality,
+    config: &PackConfig,
+    local: &str,
+    current_tier: &str,
+) -> Result<Vec<PackUpdateStep>> {
+    let tier_key = tier.pack_key();
+    let common_entry = config
+        .resource_packs
+        .get("common")
+        .ok_or_else(|| Error::Patch("the pack document has no `common` pack".to_string()))?;
+    let tier_entry = config.resource_packs.get(&tier_key).ok_or_else(|| {
+        Error::Patch(format!(
+            "the pack document for this channel has no `{tier_key}` pack (has: {})",
+            config.resource_packs.keys().cloned().collect::<Vec<_>>().join(", ")
+        ))
+    })?;
+    let mut work = Vec::new();
+    for (name, from, entry) in [
+        ("common".to_string(), local.to_string(), common_entry.clone()),
+        (tier_key, current_tier.to_string(), tier_entry.clone()),
+    ] {
+        let to = entry.version.clone();
+        if from == to {
+            continue;
+        }
+        if is_downgrade(&from, &to) {
+            return Err(Error::Patch(format!(
+                "the channel offers {name} {to}, older than the installed {from} — \
+                 refusing to downgrade; the pack document is probably stale"
+            )));
+        }
+        let patch = entry
+            .patch_config
+            .iter()
+            .find(|p| p.version == from)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Patch(format!(
+                    "`{name}` has no {from} → {to} patchConfig entry — the official launcher \
+                     does not install a full body here; wait for the channel to publish it"
+                ))
+            })?;
+        if patch.index_file.is_empty() {
+            return Err(Error::MissingField("patchConfig.indexFile"));
+        }
+        if patch.base_url.is_empty() {
+            return Err(Error::MissingField("patchConfig.baseUrl"));
+        }
+        work.push(PackUpdateStep { name, from, to, patch });
+    }
+    // `common` first, then the tier. The version record is written only after
+    // both, exactly like the official launcher.
+    work.sort_by_key(|p| usize::from(p.name != "common"));
+    Ok(work)
+}
+
+/// The installed version of a tier, or an error if it was never installed.
+///
+/// Old installs predate the launcher's tier records and use HD by default, so
+/// HD falls back to the game version. SD/UHD must have a record.
+fn installed_tier_version(game_folder: &Path, tier: Quality, local: &str) -> Result<String> {
+    let tier_key = tier.pack_key();
+    let state = state_of(game_folder, tier);
+    state
+        .marker
+        .as_ref()
+        .map(|m| m.version.clone())
+        .or_else(|| read_record(game_folder).installed.get(&tier_key).cloned())
+        .or_else(|| (tier == Quality::Hd).then(|| local.to_string()))
+        .ok_or_else(|| {
+            Error::Patch(format!(
+                "no installed {} pack — run `kuro pack <folder> {}` first",
+                tier.as_arg(),
+                tier.as_arg().to_ascii_lowercase()
+            ))
+        })
 }
 
 /// A tier as recorded on disk, for `kuro pack` and the TUI.
@@ -435,16 +556,21 @@ fn is_md5(md5: &str) -> bool {
 ///
 /// A healthy registration is left alone: the launcher may have rewritten it
 /// while the game ran, and replacing a working record with ours buys nothing.
-fn reconcile_records(game_folder: &Path, tier: Quality, plan: &[PlannedPack], version: &str) -> Result<usize> {
+fn reconcile_records(
+    game_folder: &Path,
+    tier: Quality,
+    plan: &[PlannedPack],
+    version: &str,
+    bundle: &[String],
+) -> Result<usize> {
     let (pruned, files) = prune_and_record(game_folder, tier, plan);
     let state = state_of(game_folder, tier);
     let current = state.marker.as_ref().is_some_and(|m| m.version == version);
     if !state.registered() || !current {
-        let packs = plan.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
         // An empty list would overwrite the only description of what is on
         // disk with "nothing", stranding those files beyond any future prune.
         let files = (!files.is_empty()).then_some(files.as_slice());
-        register(game_folder, tier, version, Some(&packs), files)?;
+        register(game_folder, tier, version, Some(bundle), files)?;
     }
     Ok(pruned)
 }
@@ -502,8 +628,7 @@ impl crate::GameManager {
             .iter()
             .map(|n| n.url.clone())
             .collect();
-        let channel = self.channel_manifest().await?;
-        self.sync_pack_inner(tier, &config, &bases, &channel, repair, tx).await
+        self.sync_pack_inner(tier, &config, &bases, repair, tx).await
     }
 
     /// [`GameManager::sync_pack`] with the network discovery already done, so
@@ -513,7 +638,6 @@ impl crate::GameManager {
         tier: Quality,
         config: &PackConfig,
         bases: &[String],
-        channel: &HashMap<String, (u64, String)>,
         repair: bool,
         tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
     ) -> Result<PackReport> {
@@ -522,6 +646,7 @@ impl crate::GameManager {
         }
         let plan = self.plan_pack_tier(tier, config, bases, tx.as_ref()).await?;
         let version = planned_version(&plan, tier, config);
+        let bundle = bundle_packs(config, tier);
         for installed in installed_versions(&self.game_folder, tier) {
             if is_downgrade(&installed, &version) {
                 return Err(Error::Patch(format!(
@@ -542,15 +667,8 @@ impl crate::GameManager {
         let mut scans = Vec::with_capacity(plan.len());
         for planned in &plan {
             scans.push(
-                self.scan_pack_part(
-                    &planned.name,
-                    &planned.entry,
-                    &planned.manifest,
-                    channel,
-                    &cache,
-                    tx.as_ref(),
-                )
-                .await?,
+                self.scan_pack_part(&planned.name, &planned.entry, &planned.manifest, &cache, tx.as_ref())
+                    .await?,
             );
         }
 
@@ -578,7 +696,7 @@ impl crate::GameManager {
 
         if scans.iter().all(|s| s.todo.is_empty()) {
             let _ = cache.save();
-            report.pruned = reconcile_records(&self.game_folder, tier, &plan, &version)?;
+            report.pruned = reconcile_records(&self.game_folder, tier, &plan, &version, &bundle)?;
             report.registered = true;
             return Ok(report);
         }
@@ -603,17 +721,200 @@ impl crate::GameManager {
         }
 
         if report.broken.is_empty() {
-            report.pruned = reconcile_records(&self.game_folder, tier, &plan, &version)?;
+            report.pruned = reconcile_records(&self.game_folder, tier, &plan, &version, &bundle)?;
             report.registered = true;
         }
         Ok(report)
     }
 
-    /// Resolve and validate every pack of a tier, without writing anything.
+    /// The official launcher's pack update: `common` **and** the active tier,
+    /// each through its own `patchConfig` delta, applied together.
     ///
-    /// `common` downloads first, so a tier pack whose manifest turns out to be
-    /// unusable must be refused now: the alternative is writing tens of GiB of
-    /// `common` and only then rejecting the tier.
+    /// This is the path that moves a CN/Bilibili install from, say, 3.7.1 to
+    /// 3.8.0 without downloading a full 42 GiB body. It deliberately refuses
+    /// when a matching delta is missing rather than falling back to a full
+    /// tier or another tier.
+    pub async fn pack_update(
+        &self,
+        tier: Quality,
+        tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
+    ) -> Result<PackUpdateReport> {
+        if !self.game.uses_quality_tiers() {
+            return Err(Error::Unsupported(
+                "this game has no quality packs — only Wuthering Waves has Client/Content/<TIER>",
+            ));
+        }
+        let config = self.pack_config().await?;
+        let bases: Vec<String> = ApiClient::pack_cdn_candidates(&config)?
+            .iter()
+            .map(|n| n.url.clone())
+            .collect();
+        self.pack_update_inner(tier, &config, &bases, tx).await
+    }
+
+    /// [`GameManager::pack_update`] with the pack document and CDN already
+    /// resolved, so the orchestration is testable against a local server.
+    pub async fn pack_update_inner(
+        &self,
+        tier: Quality,
+        config: &PackConfig,
+        bases: &[String],
+        tx: Option<tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
+    ) -> Result<PackUpdateReport> {
+        if !self.game.uses_quality_tiers() {
+            return Err(Error::Unsupported(
+                "this game has no quality packs — only Wuthering Waves has Client/Content/<TIER>",
+            ));
+        }
+        if bases.is_empty() {
+            return Err(Error::NoCdnNode);
+        }
+        let local = self
+            .local_version()?
+            .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
+
+        let tier_key = tier.pack_key();
+        let current_tier = installed_tier_version(&self.game_folder, tier, &local)?;
+
+        let work = pack_update_steps(tier, config, &local, &current_tier)?;
+
+        if work.is_empty() {
+            return Ok(PackUpdateReport {
+                version: local,
+                ..Default::default()
+            });
+        }
+
+        let mut report = PackUpdateReport {
+            version: local.clone(),
+            parts: Vec::new(),
+        };
+        for part in &work {
+            if let Some(tx) = &tx {
+                let _ = tx
+                    .send(crate::ProgressEvent::Log(format!(
+                        "pack update {}: {} → {}",
+                        part.name, part.from, part.to
+                    )))
+                    .await;
+            }
+            let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
+            let index = self
+                .api_client()
+                .fetch_manifest_verified(&base_refs, &part.patch.index_file, &part.patch.index_file_md5)
+                .await?;
+            validate_pack_update_index(&part.name, &part.to, &index)?;
+            let patch_cfg = kuro_api::PatchConfig {
+                version: part.from.clone(),
+                index_file: part.patch.index_file.clone(),
+                base_url: part.patch.base_url.clone(),
+            };
+            let plan = self.plan_from_patch_index(&index, &part.from, &part.to);
+            let download_tx = match &tx {
+                Some(tx) => tx.clone(),
+                None => {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+                    tx
+                }
+            };
+            self.predownload_index(&plan, &index, &patch_cfg, bases, download_tx)
+                .await?;
+            let applied = self
+                .apply_pack_index(&index, &base_refs, &patch_cfg, &part.to, tx.clone())
+                .await?;
+            report.parts.push(PackUpdatePart {
+                name: part.name.clone(),
+                from_version: part.from.clone(),
+                to_version: part.to.clone(),
+                report: applied,
+            });
+        }
+
+        let common_target = work
+            .iter()
+            .find(|p| p.name == "common")
+            .map(|p| p.to.clone())
+            .unwrap_or_else(|| local.clone());
+        let tier_target = work
+            .iter()
+            .find(|p| p.name == tier_key)
+            .map(|p| p.to.clone())
+            .unwrap_or_else(|| current_tier.clone());
+
+        let cfg = state::read_local_config(&self.game_folder)?
+            .unwrap_or_else(|| kuro_api::LocalConfig::new(common_target.clone(), self.server_entry().app_id))
+            .retargeted(common_target.clone(), self.server_entry().app_id);
+        state::write_local_config(&self.game_folder, &cfg)?;
+        let bundle = bundle_packs(config, tier);
+        register(&self.game_folder, tier, &tier_target, Some(&bundle), None)?;
+        report.version = common_target;
+        Ok(report)
+    }
+
+    /// Plan a pack update without downloading or writing anything.
+    pub async fn pack_update_plan(&self, tier: Quality) -> Result<PackUpdatePlan> {
+        if !self.game.uses_quality_tiers() {
+            return Err(Error::Unsupported(
+                "this game has no quality packs — only Wuthering Waves has Client/Content/<TIER>",
+            ));
+        }
+        let config = self.pack_config().await?;
+        let bases: Vec<String> = ApiClient::pack_cdn_candidates(&config)?
+            .iter()
+            .map(|n| n.url.clone())
+            .collect();
+        self.pack_update_plan_inner(tier, &config, &bases).await
+    }
+
+    /// [`GameManager::pack_update_plan`] with an injected document and CDN.
+    pub async fn pack_update_plan_inner(
+        &self,
+        tier: Quality,
+        config: &PackConfig,
+        bases: &[String],
+    ) -> Result<PackUpdatePlan> {
+        if bases.is_empty() {
+            return Err(Error::NoCdnNode);
+        }
+        let local = self
+            .local_version()?
+            .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
+        let current_tier = installed_tier_version(&self.game_folder, tier, &local)?;
+        let work = pack_update_steps(tier, config, &local, &current_tier)?;
+        let common_target = work
+            .iter()
+            .find(|p| p.name == "common")
+            .map(|p| p.to.clone())
+            .unwrap_or_else(|| local.clone());
+        let mut parts = Vec::new();
+        for part in &work {
+            let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
+            let index = self
+                .api_client()
+                .fetch_manifest_verified(&base_refs, &part.patch.index_file, &part.patch.index_file_md5)
+                .await?;
+            validate_pack_update_index(&part.name, &part.to, &index)?;
+            let plan = self.plan_from_patch_index(&index, &part.from, &part.to);
+            parts.push(PackUpdatePlanPart {
+                name: part.name.clone(),
+                from_version: part.from.clone(),
+                to_version: part.to.clone(),
+                files: plan.patch_groups.len() + plan.full_files.len(),
+                bytes: plan.total_bytes,
+            });
+        }
+        Ok(PackUpdatePlan {
+            version: common_target,
+            parts,
+        })
+    }
+
+    /// Resolve and validate the tier's own pack, without writing anything.
+    ///
+    /// `common` is the base client and belongs to the game-version path, not to
+    /// a tier install. The official launcher's `resource` operation installs
+    /// only `resourcePacks[<tier>]`; the `bundles` list is just the record it
+    /// writes afterwards.
     async fn plan_pack_tier(
         &self,
         tier: Quality,
@@ -621,10 +922,7 @@ impl crate::GameManager {
         bases: &[String],
         tx: Option<&tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
     ) -> Result<Vec<PlannedPack>> {
-        let mut packs = bundle_packs(config, tier);
-        if packs.is_empty() {
-            packs = vec!["common".to_string(), tier.pack_key()];
-        }
+        let packs = vec![tier.pack_key()];
         if let Some(tx) = tx {
             let _ = tx
                 .send(crate::ProgressEvent::Log(format!(
@@ -661,25 +959,6 @@ impl crate::GameManager {
         Ok(plan)
     }
 
-    /// The channel's full manifest, keyed by normalised (lowercase) dest.
-    async fn channel_manifest(&self) -> Result<HashMap<String, (u64, String)>> {
-        let index = self
-            .api_client()
-            .fetch_index(&kuro_api::index_url(self.game, self.server)?)
-            .await?;
-        let nodes = self.api_client().cdn_candidates(&index)?;
-        let bases: Vec<&str> = nodes.iter().map(|n| n.url.as_str()).collect();
-        let manifest = self
-            .api_client()
-            .fetch_manifest(&bases, &index.default.config.index_file)
-            .await?;
-        Ok(manifest
-            .resource
-            .into_iter()
-            .map(|r| (path_key(&r.dest), (r.size, r.md5)))
-            .collect())
-    }
-
     /// Fetch one pack's manifest and check it may be installed.
     async fn fetch_pack_manifest(&self, name: &str, entry: &PackEntry, bases: &[String]) -> Result<PatchIndex> {
         if entry.index_file.is_empty() {
@@ -693,7 +972,7 @@ impl crate::GameManager {
             .api_client()
             .fetch_manifest_verified(&base_refs, &entry.index_file, &entry.index_file_md5)
             .await?;
-        validate_pack_manifest(name, &manifest)?;
+        validate_pack_manifest_for(name, &entry.version, &manifest)?;
         Ok(manifest)
     }
 
@@ -708,13 +987,11 @@ impl crate::GameManager {
         name: &str,
         entry: &PackEntry,
         manifest: &PatchIndex,
-        channel: &HashMap<String, (u64, String)>,
         cache: &Md5Cache,
         tx: Option<&tokio::sync::mpsc::Sender<crate::ProgressEvent>>,
     ) -> Result<PackScan> {
-        let is_common = name.eq_ignore_ascii_case("common");
         let mut todo = Vec::new();
-        let mut skipped = 0usize;
+        let skipped = 0usize;
         let mut total = 0u64;
         let mut pending = Vec::new();
         for item in &manifest.resource {
@@ -735,19 +1012,6 @@ impl crate::GameManager {
                 continue;
             }
             let key = path_key(&item.dest);
-            if is_common {
-                // `common` is reconciled against the channel because the pack
-                // document is shared across CN/Bilibili/Global. Optional packs
-                // are the exception: the channel manifest describes the base
-                // client and does not list `Client/Saved/Resources` at all, so
-                // "absent from the channel" there is normal, not a channel
-                // difference. If the channel does describe one, it still wins.
-                let optional = optional_pack_tier(&item.dest).is_some();
-                if !channel_agrees(channel, &key, item) && (channel.contains_key(&key) || !optional) {
-                    skipped += 1;
-                    continue;
-                }
-            }
             total += item.size;
             // `key` is the case-folded comparison form; the file itself keeps
             // the manifest's spelling. Writing to the folded path would create
@@ -932,20 +1196,6 @@ fn pack_urls(bases: &[String], base_url: &str, dest: &str) -> Vec<String> {
         .collect()
 }
 
-/// Does the channel serve this exact file?
-///
-/// `common` describes the CN base client, which every channel also serves, and
-/// the channel is the authority for its own files. An entry the channel does
-/// not describe, or describes differently, is left to it: the pack document is
-/// shared across channels, so its copy of a channel-specific binary is the
-/// wrong channel's. (CN agrees on all 816; Bilibili agrees on 747 and differs
-/// on the 69 `krsdk_*`/anti-cheat binaries, plus one CN-only SDK dll.)
-fn channel_agrees(channel: &HashMap<String, (u64, String)>, key: &str, item: &kuro_api::ResourceItem) -> bool {
-    channel
-        .get(key)
-        .is_some_and(|(size, md5)| *size == item.size && md5 == &item.md5)
-}
-
 /// A zero-length entry is a marker, not a download: create it if absent.
 ///
 /// Written through a temp sibling and [`safe_replace`] rather than `fs::write`:
@@ -987,65 +1237,8 @@ struct PartOutcome {
 /// touch the launcher's records or kuro's cache — a manifest that asked to
 /// would otherwise be able to rewrite the install's identity or delete the
 /// version record it is about to write.
-fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
-    let tier = Quality::ALL.into_iter().find(|q| q.as_arg().eq_ignore_ascii_case(name));
-    let spelled = tier.map(|t| format!("Client/Content/{}/", t.dir_name()));
-    // A named tier owns exactly its own body directory. `common` owns everything
-    // *else*, so its rule is the mirror image: it must never write into a body
-    // directory, because those are what the user's tier choice selects between
-    // and a `common` install would clobber the tier the launcher believes is
-    // active. (Upstream enforces the same split.)
-    let body_prefixes: Vec<String> = Quality::ALL
-        .iter()
-        .map(|t| format!("client/content/{}/", t.pack_key()))
-        .collect();
-    let is_common = name.eq_ignore_ascii_case("common");
-    let check = |dest: &str| -> Result<()> {
-        let key = path_key(dest);
-        let first = key.split('/').next().unwrap_or("");
-        if first == ".kuro_cache" || first == ".incremental_download" || key.starts_with("launcherdownloadconfig") {
-            return Err(Error::UnsafePath(dest.to_string()));
-        }
-        if let Some(spelled) = &spelled {
-            // Compared as spelled, not folded: the body directory is
-            // `Client/Content/HD/` and on a case-sensitive host
-            // `client/content/hd/` is a different directory the game never
-            // reads. A manifest that spells it that way would register the
-            // tier as complete with its files somewhere else.
-            if !crate::path::normalise(dest).starts_with(spelled.as_str()) {
-                // Since 3.8.0 a tier manifest also carries its optional map /
-                // event packs under `Client/Saved/Resources/<version>/`. They
-                // are shipped content, not save state, and the launcher
-                // installs them with the tier — so they are the one subtree a
-                // tier may write outside its own body.
-                let belongs = matches!(optional_pack_tier(dest), Some(Some(q)) if Some(q) == tier);
-                if !belongs {
-                    return Err(Error::Patch(format!(
-                        "`{name}` manifest entry outside Client/Content/{}: {dest}",
-                        tier.map(|t| t.dir_name()).unwrap_or_default()
-                    )));
-                }
-            }
-        }
-        if is_common {
-            if body_prefixes.iter().any(|p| key.starts_with(p.as_str())) {
-                return Err(Error::Patch(format!(
-                    "`common` manifest entry inside a quality-tier body: {dest} — \
-                     those files belong to the sd/hd/uhd pack"
-                )));
-            }
-            // `common` owns the unsuffixed optional packs. A `_SD`/`_HD`/`_UHD`
-            // body belongs to that tier's manifest, and letting `common` write
-            // it would put a different quality's pak under the active tier.
-            if let Some(Some(q)) = optional_pack_tier(dest) {
-                return Err(Error::Patch(format!(
-                    "`common` manifest entry inside the {} optional-pack set: {dest}",
-                    q.as_arg()
-                )));
-            }
-        }
-        Ok(())
-    };
+fn validate_pack_manifest_for(name: &str, version: &str, manifest: &PatchIndex) -> Result<()> {
+    let check = |dest: &str| -> Result<()> { pack_path_ok(name, version, dest) };
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in &manifest.resource {
         check(&item.dest)?;
@@ -1100,67 +1293,100 @@ fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
     Ok(())
 }
 
-/// Which optional-pack tier a `Client/Saved/Resources/...` entry belongs to.
+/// The one path rule the official launcher applies to a pack.
 ///
-/// Since WuWa 3.8.0 the launcher's tier manifests carry optional map / event
-/// packs next to the body, in the shape
-///
-/// ```text
-/// Client/Saved/Resources/<version>/Option_Pack_<tag>[_<TIER>]/Base/<file>
-/// ```
-///
-/// The unsuffixed form is installed by `common`, the `_SD`/`_HD`/`_UHD` forms
-/// by that tier. The shape is checked literally rather than by a broad
-/// `Client/Saved/Resources/` prefix: the game reads
-/// `Client/Saved/Resources/<version>`, and everything beside it (Config,
-/// LocalStorage, the client's own Resource/Lang/Video directories) is live
-/// game state a pack must never write. `normalise` only rewrites separators,
-/// so a `.`/`..` segment has to be rejected here before it reaches a join.
-fn optional_pack_tier(dest: &str) -> Option<Option<Quality>> {
+/// A tier owns `Client/Content/<TIER>/` plus the target version's resource
+/// directory, `Client/Saved/Resources/<version>/`. `common` owns everything
+/// outside a tier body, including that resource directory. There is no
+/// per-optional-pack shape: since 3.7/3.8 the launcher ships any such file
+/// under the version directory, and the version is the only discriminator.
+/// Management records stay off limits for every pack.
+fn pack_path_ok(name: &str, version: &str, dest: &str) -> Result<()> {
+    let key = path_key(dest);
+    let first = key.split('/').next().unwrap_or("");
+    if first == ".kuro_cache" || first == ".incremental_download" || key.starts_with("launcherdownloadconfig") {
+        return Err(Error::UnsafePath(dest.to_string()));
+    }
     let normalised = normalise(dest);
-    let rest = normalised.strip_prefix("Client/Saved/Resources/")?;
-    let mut parts = rest.split('/');
-    let version = parts.next()?;
-    let dir = parts.next()?;
-    let base = parts.next()?;
-    let file = parts.next()?;
-    // Exactly the four published segments. A deeper path is not the shape the
-    // launcher ships, and accepting it would let a manifest walk into any
-    // directory under the resource version.
-    if parts.next().is_some() || file.is_empty() || base != "Base" {
-        return None;
+    if normalised.split('/').any(|p| p == "." || p == "..") {
+        return Err(Error::UnsafePath(dest.to_string()));
     }
-    if [version, dir, base, file].iter().any(|s| *s == "." || *s == "..") {
-        return None;
-    }
-    if !is_dotted_version(version) {
-        return None;
-    }
-    let tag = dir.strip_prefix("Option_Pack_")?;
-    if tag.is_empty() || tag.starts_with('_') || tag.ends_with('_') {
-        return None;
-    }
-    for q in Quality::ALL {
-        if let Some(stem) = tag.strip_suffix(&format!("_{}", q.dir_name())) {
-            if !stem.is_empty() {
-                return Some(Some(q));
-            }
+    if let Some(rest) = normalised.strip_prefix("Client/Saved/Resources/") {
+        let mut parts = rest.split('/');
+        let found = parts.next().unwrap_or("");
+        let file = parts.next().unwrap_or("");
+        if found == version && !file.is_empty() {
+            return Ok(());
         }
+        return Err(Error::Patch(format!(
+            "`{name}` resource entry outside the {version} resource directory: {dest}"
+        )));
     }
-    Some(None)
+    if name.eq_ignore_ascii_case("common") {
+        if Quality::ALL
+            .iter()
+            .any(|q| key.starts_with(&format!("client/content/{}/", q.pack_key())))
+        {
+            return Err(Error::Patch(format!(
+                "`common` manifest entry inside a quality-tier body: {dest}"
+            )));
+        }
+        return Ok(());
+    }
+    let Some(tier) = Quality::ALL.into_iter().find(|q| q.as_arg().eq_ignore_ascii_case(name)) else {
+        return Err(Error::Patch(format!("unknown pack `{name}`")));
+    };
+    if !normalised.starts_with(&format!("Client/Content/{}/", tier.dir_name())) {
+        return Err(Error::Patch(format!(
+            "`{name}` manifest entry outside Client/Content/{}: {dest}",
+            tier.dir_name()
+        )));
+    }
+    Ok(())
 }
 
-/// A dotted-numeric version (`3.8.0`, `3.8`), which is how the resource
-/// directory is named. Everything else is a name the game does not read.
-fn is_dotted_version(v: &str) -> bool {
-    let mut parts = 0;
-    for part in v.split('.') {
-        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return false;
+/// Validate a pack *update* index (`patchConfig`).
+///
+/// The `resource` array also carries the `.krpdiff` payloads themselves, whose
+/// `dest` is a staging filename rather than an install path, so only the group
+/// sources/targets and the full-file fallbacks go through the path rule.
+fn validate_pack_update_index(name: &str, version: &str, index: &PatchIndex) -> Result<()> {
+    let mut writes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut write = |dest: &str| -> Result<()> {
+        pack_path_ok(name, version, dest)?;
+        if !writes.insert(path_key(dest)) {
+            return Err(Error::Patch(format!("`{name}` update lists {dest} more than once")));
         }
-        parts += 1;
+        Ok(())
+    };
+    for item in &index.resource {
+        if item.size > 0 && !is_md5(&item.md5) {
+            return Err(Error::Patch(format!(
+                "`{name}` update entry without a valid md5: {} (size {})",
+                item.dest, item.size
+            )));
+        }
+        if !is_krpdiff(&item.dest) {
+            write(&item.dest)?;
+        }
     }
-    parts >= 2
+    for group in &index.group_infos {
+        for f in &group.src_files {
+            pack_path_ok(name, version, &f.dest)?;
+        }
+        for f in &group.dst_files {
+            write(&f.dest)?;
+        }
+    }
+    for dest in &index.delete_files {
+        pack_path_ok(name, version, dest)?;
+        if writes.contains(&path_key(dest)) {
+            return Err(Error::Patch(format!(
+                "`{name}` update writes and deletes the same path: {dest}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1301,76 +1527,64 @@ mod tests {
         .is_ok());
     }
 
-    /// 3.8.0's tier manifests carry optional map/event packs outside the body.
-    /// They are installed by the tier and must not be mistaken for a stray
-    /// path, but another tier's copy is still refused.
+    /// The official rule: a tier may write its body or *any* path under the
+    /// target version's resource directory. No option-pack name or tier suffix
+    /// participates.
     #[test]
-    fn a_tier_may_ship_its_own_optional_pack_resources() {
-        for (tier, tag) in [
-            ("sd", "Option_Pack_Map_SD"),
-            ("hd", "Option_Pack_Map_HD"),
-            ("uhd", "Option_Pack_Map_UHD"),
-        ] {
-            let dest = format!("Client/Saved/Resources/3.8.0/{tag}/Base/pakchunk50.pak");
-            assert!(
-                validate_pack_manifest(tier, &manifest(&[&dest])).is_ok(),
-                "{tier} rejected its own optional pack: {dest}"
-            );
+    fn a_tier_may_ship_any_path_under_the_target_resource_version() {
+        for tier in ["sd", "hd", "uhd"] {
+            for dest in [
+                "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/pakchunk50.pak",
+                "Client/Saved/Resources/3.8.0/Option_Pack_Map/Base/x.pak",
+                "Client/Saved/Resources/3.8.0/anything/at/all.pak",
+            ] {
+                assert!(
+                    validate_pack_manifest(tier, &manifest(&[dest])).is_ok(),
+                    "{tier} rejected {dest}"
+                );
+            }
         }
-        for dest in [
-            // Another tier's body.
-            "Client/Saved/Resources/3.8.0/Option_Pack_Map_SD/Base/pakchunk50.pak",
-            // The common (unsuffixed) copy belongs to `common`, not a tier.
-            "Client/Saved/Resources/3.8.0/Option_Pack_Map/Base/pakchunk50.pak",
-        ] {
-            assert!(
-                validate_pack_manifest("hd", &manifest(&[dest])).is_err(),
-                "an HD pack was allowed to write {dest}"
-            );
-        }
+        assert!(validate_pack_manifest("hd", &manifest(&["Client/Content/UHD/x.pak"])).is_err());
+        assert!(validate_pack_manifest("hd", &manifest(&["Client/Binaries/Win64/x.dll"])).is_err());
     }
 
     #[test]
-    fn common_may_ship_the_unsuffixed_optional_packs_only() {
+    fn common_may_ship_the_target_resource_version_too() {
         assert!(validate_pack_manifest(
             "common",
-            &manifest(&["Client/Saved/Resources/3.8.0/Option_Pack_Map/Base/pakchunk50.pak"])
+            &manifest(&[
+                "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/x.pak",
+                "Client/Binaries/Win64/Client-Win64-Shipping.exe",
+            ])
         )
         .is_ok());
-        for tier in ["SD", "HD", "UHD"] {
-            let dest = format!("Client/Saved/Resources/3.8.0/Option_Pack_Map_{tier}/Base/pakchunk50.pak");
-            assert!(
-                validate_pack_manifest("common", &manifest(&[&dest])).is_err(),
-                "`common` was allowed to write the {tier} pack: {dest}"
-            );
-        }
+        assert!(validate_pack_manifest("common", &manifest(&["Client/Saved/Resources/3.7.1/x.pak"])).is_err());
+        assert!(validate_pack_manifest("common", &manifest(&["Client/Content/HD/x.pak"])).is_err());
     }
 
-    /// The optional-pack permission is a path *shape*, not a prefix: the rest
-    /// of `Client/Saved` is live game state and stays off limits.
     #[test]
-    fn an_optional_pack_path_must_have_the_published_shape() {
+    fn the_resource_version_is_the_only_discriminator() {
         for bad in [
             "Client/Saved/Config/GameUserSettings.ini",
             "Client/Saved/LocalStorage/x.txt",
-            "Client/Saved/Resources/3.8.0/Resource/pakchunk50.pak",
-            "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Data/pakchunk50.pak",
-            "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/sub/pakchunk50.pak",
-            "Client/Saved/Resources/latest/Option_Pack_Map_HD/Base/pakchunk50.pak",
-            "Client/Saved/Resources/3.8.0/Option_Pack__HD/Base/pakchunk50.pak",
-            "Client/Saved/Resources/3.8.0/Option_Pack_Map_HD/Base/../../x.pak",
+            "Client/Saved/Resources/3.7.1/Option_Pack_Map_HD/Base/x.pak",
+            "Client/Saved/Resources/latest/Option_Pack_Map_HD/Base/x.pak",
+            "Client/Saved/Resources/3.8.0/../../x.pak",
+            "Client/Saved/Resources/3.8.0",
         ] {
             assert!(
                 validate_pack_manifest("hd", &manifest(&[bad])).is_err(),
-                "{bad} was accepted as an optional pack"
+                "{bad} was accepted"
             );
         }
         // A leading slash and backslashes are the CDN's spelling of the same
         // relative path, exactly as for the body.
-        assert!(validate_pack_manifest(
-            "hd",
-            &manifest(&["/Client\\Saved\\Resources\\3.8.0\\Option_Pack_Map_HD\\Base\\pakchunk50.pak"])
-        )
-        .is_ok());
+        assert!(validate_pack_manifest("hd", &manifest(&["/Client\\Saved\\Resources\\3.8.0\\x.pak"])).is_ok());
+    }
+
+    /// The tests above exercise the live 3.8.0 document. Production passes the
+    /// entry's own version.
+    fn validate_pack_manifest(name: &str, manifest: &PatchIndex) -> Result<()> {
+        validate_pack_manifest_for(name, "3.8.0", manifest)
     }
 }

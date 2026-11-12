@@ -68,14 +68,25 @@ edits.
   ships into *and* with an extension that directory uses, minus `is_protected`
   (`Client/Saved/**`, runtime logs/dumps/DBs, SDK and crash-reporter payloads).
   Widening this deletes game state that cannot be re-downloaded.
-- **A pack manifest is untrusted ground truth, so `validate_pack_manifest` in
-  `pack.rs` accepts it whole or refuses it whole.** No partial installs: an
+- **A pack manifest is untrusted ground truth, so `validate_pack_manifest_for`
+  in `pack.rs` accepts it whole or refuses it whole.** No partial installs: an
   empty tier document, a `common` entry inside a tier body, an entry with no
-  MD5, a dest listed twice, and any `deleteFiles` entry are all refusals
-  *before* the first byte and before `unregister`. A skipped entry would
-  otherwise let the tier register as healthy while a file is missing, which the
-  launcher then reports as nothing to repair. (`deleteFiles` and `groupInfos`
-  are `Error::Unsupported`: the packs never ship them, so refusing is honest.)
+  MD5, and a dest listed twice are all refusals *before* the first byte and
+  before `unregister`. A skipped entry would otherwise let the tier register as
+  healthy while a file is missing, which the launcher then reports as nothing to
+  repair. A *full* manifest still refuses `deleteFiles`/`groupInfos`; the
+  `patchConfig` update index is the one that carries them and has its own
+  validator (`validate_pack_update_index`).
+- **One path rule for packs, the official one.** A tier writes
+  `Client/Content/<TIER>/`, and any pack writes
+  `Client/Saved/Resources/<pack version>/`. The version directory is the only
+  discriminator; there is no per-option-pack tag or tier-suffix check. The rest
+  of `Client/Saved` is game state. `common` is the base client, so a tier
+  install (`kuro pack`) never touches it.
+- **Pack updates go through `patchConfig`, not a full body.** `pack_update`
+  applies `common` first, then the active tier, and writes
+  `launcherDownloadConfig.version` only after both land. A missing source
+  version delta is a refusal, never a full-body or other-tier fallback.
 - **The tier body is matched as spelled, not case-folded.** The game reads
   `Client/Content/HD`; on a case-sensitive host a manifest spelling
   `client/content/hd` would write files the game never reads. Leading slashes

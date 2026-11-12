@@ -246,6 +246,9 @@ async fn main() -> std::io::Result<()> {
         Some("pack") => {
             return cli_pack(&args).await;
         }
+        Some("update") => {
+            return cli_update(&args).await;
+        }
         Some("play") => {
             return cli_play(&args);
         }
@@ -295,6 +298,7 @@ usage: kuro [game-folder ...]            launch the TUI (default: auto-detect)
        kuro sync [folder] [--quality sd|hd|uhd]
        kuro quality <folder> [sd|hd|uhd]
        kuro pack [folder] <sd|hd|uhd> [--check]   install a quality pack
+       kuro update [folder] [--check]            apply common + tier patchConfig deltas
        kuro play <folder> [--quality <sd|hd|uhd>]
        kuro kill <folder>
        kuro help | --help | -h
@@ -495,6 +499,93 @@ fn cli_quality(args: &[String]) -> std::io::Result<()> {
             preset.as_arg().to_ascii_lowercase()
         ),
         Err(e) => println!("could not save preset: {e}"),
+    }
+    Ok(())
+}
+
+/// `kuro update [folder] [--check]` — the official pack-document update.
+///
+/// `common` and the active tier each apply their own `patchConfig` delta, then
+/// the game version is recorded. This is the path that moves 3.7.1 to 3.8.0
+/// without downloading a full 42 GiB body. `--check` reports the download
+/// without writing anything.
+async fn cli_update(args: &[String]) -> std::io::Result<()> {
+    let (folder, rest) = split_play_args(args);
+    let check_only = rest.iter().any(|a| a == "--check");
+    let rest: Vec<String> = rest.into_iter().filter(|a| a != "--check").collect();
+    if !rest.is_empty() {
+        println!("usage: kuro update [folder] [--check]");
+        return Ok(());
+    }
+    let mgr = match GameManager::open(PathBuf::from(&folder)).await {
+        Ok(m) => m,
+        Err(e) => {
+            println!("open error: {e}");
+            return Ok(());
+        }
+    };
+    if !mgr.game.uses_quality_tiers() {
+        println!("{} has no quality packs", pretty_game(mgr.game));
+        return Ok(());
+    }
+    let tier = quality::selected(std::path::Path::new(&folder))
+        .or_else(|| {
+            quality::info(std::path::Path::new(&folder))
+                .installed()
+                .first()
+                .copied()
+        })
+        .unwrap_or(Quality::Hd);
+
+    if check_only {
+        match mgr.pack_update_plan(tier).await {
+            Ok(plan) => {
+                if plan.parts.is_empty() {
+                    println!("up to date at {}", plan.version);
+                } else {
+                    for part in &plan.parts {
+                        println!(
+                            "  {:<6} {} -> {}  {} file(s), {}",
+                            part.name,
+                            part.from_version,
+                            part.to_version,
+                            part.files,
+                            fmt_bytes(part.bytes)
+                        );
+                    }
+                    println!(
+                        "update -> {}: {} file(s), {}",
+                        plan.version,
+                        plan.parts.iter().map(|p| p.files).sum::<usize>(),
+                        fmt_bytes(plan.parts.iter().map(|p| p.bytes).sum())
+                    );
+                }
+            }
+            Err(e) => println!("update check error: {e}"),
+        }
+        return Ok(());
+    }
+
+    match mgr.pack_update(tier, None).await {
+        Ok(report) => {
+            if report.parts.is_empty() {
+                println!("up to date at {}", report.version);
+            } else {
+                for part in &report.parts {
+                    println!(
+                        "  {:<6} {} -> {}  merged {}, skipped {}, swapped {}",
+                        part.name,
+                        part.from_version,
+                        part.to_version,
+                        part.report.merged,
+                        part.report.skipped,
+                        part.report.swapped
+                    );
+                }
+                println!("updated to {}", report.version);
+            }
+        }
+        Err(e) => println!("update error: {e}"),
     }
     Ok(())
 }
@@ -1225,9 +1316,28 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) {
     let path = path.to_string();
     tokio::spawn(async move {
         let result = async {
-            let mgr = GameManager::open(PathBuf::from(path))
+            let mgr = GameManager::open(PathBuf::from(&path))
                 .await
                 .map_err(|e| e.to_string())?;
+            if mgr.game.uses_quality_tiers() && !mgr.server_entry().pack_config_urls.is_empty() {
+                let folder = PathBuf::from(&path);
+                let tier = quality::selected(&folder)
+                    .or_else(|| quality::info(&folder).installed().first().copied())
+                    .unwrap_or(Quality::Hd);
+                let (ptx, mut prx) = tokio::sync::mpsc::channel(256);
+                let tx2 = tx.clone();
+                tokio::spawn(async move {
+                    while let Some(ev) = prx.recv().await {
+                        let _ = tx2.send(UiEvent::Progress(ev)).await;
+                    }
+                });
+                let report = mgr.pack_update(tier, Some(ptx)).await.map_err(|e| e.to_string())?;
+                return Ok::<_, String>(if report.parts.is_empty() {
+                    format!("up to date at {}", report.version)
+                } else {
+                    format!("pack update applied → {}", report.version)
+                });
+            }
             let plan = mgr.plan_predownload().await.map_err(|e| e.to_string())?;
             let (ptx, mut prx) = tokio::sync::mpsc::channel(256);
             let tx2 = tx.clone();
@@ -1550,7 +1660,7 @@ fn ui(f: &mut Frame, state: &UiState) {
             Line::raw(""),
             Line::raw("  p play         k force-kill      Q quality"),
             Line::raw("  i install      r refresh         a apply update"),
-            Line::raw("  d predownload  s sync / repair   c switch server"),
+            Line::raw("  d update / predownload   s sync / repair   c switch server"),
             Line::raw("  Tab focus   <-/-> game   Up/Down scroll log   q quit"),
             Line::raw(""),
             Line::raw("Install dialog"),

@@ -27,6 +27,9 @@ pub use game::{
 };
 pub use kuro_api::{Error, Game, Result, Server};
 pub use launch::{KillReport, LaunchPlan};
-pub use pack::{PackMarker, PackPartReport, PackRecord, PackReport, PackState};
+pub use pack::{
+    PackMarker, PackPartReport, PackRecord, PackReport, PackState, PackUpdatePart, PackUpdatePlan, PackUpdatePlanPart,
+    PackUpdateReport,
+};
 pub use quality::{PackInfo, Quality, QualityInfo};
 pub use steam::{default_game_dir, detect_steam, SteamInfo};

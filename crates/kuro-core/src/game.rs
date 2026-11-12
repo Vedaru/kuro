@@ -194,7 +194,20 @@ impl GameManager {
     /// Remote (current) version + whether an update is available.
     pub async fn status(&self) -> Result<GameStatus> {
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
-        let remote = index.default.version.clone();
+        let mut remote = index.default.version.clone();
+        // For a game with a pack document, `resourcePacks.common.version` is
+        // the launcher's authoritative game version. The channel index can lag
+        // it during the update window, which is exactly when a plain
+        // index-only status says "up to date" and misses the pack update.
+        if self.game.uses_quality_tiers() && !self.server_entry().pack_config_urls.is_empty() {
+            if let Ok(config) = self.pack_config().await {
+                if let Some(common) = config.resource_packs.get("common") {
+                    if version_ge(&common.version, &remote) {
+                        remote = common.version.clone();
+                    }
+                }
+            }
+        }
         let local = self.local_version()?;
         Ok(GameStatus {
             game: self.game,
@@ -241,7 +254,12 @@ impl GameManager {
 
     /// Build a plan from an already-fetched patch manifest (no network, so it
     /// is directly testable).
-    fn plan_from_patch_index(&self, patch_index: &PatchIndex, from_version: &str, to_version: &str) -> PredownloadPlan {
+    pub(crate) fn plan_from_patch_index(
+        &self,
+        patch_index: &PatchIndex,
+        from_version: &str,
+        to_version: &str,
+    ) -> PredownloadPlan {
         let mut patch_groups = Vec::new();
         let mut full_files = Vec::new();
         let mut total = 0u64;
@@ -314,8 +332,33 @@ impl GameManager {
             )))
             .await;
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
-        let nodes = cdn_nodes(&self.api, &index)?;
+        let nodes: Vec<String> = cdn_nodes(&self.api, &index)?.iter().map(|s| s.to_string()).collect();
 
+        let patch_cfg = index
+            .default
+            .config
+            .patch_config
+            .iter()
+            .find(|p| p.version == plan.from_version)
+            .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
+        let base_refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
+        let patch_index = self.api.fetch_manifest(&base_refs, &patch_cfg.index_file).await?;
+        self.predownload_index(plan, &patch_index, patch_cfg, &nodes, tx).await
+    }
+
+    /// Download a plan against an already-resolved patch index.
+    ///
+    /// Shared by the game-version path and the pack update path: the pack
+    /// document publishes the same `PatchIndex` shape, just from its own
+    /// `resourcePacks.<name>.patchConfig`.
+    pub(crate) async fn predownload_index(
+        &self,
+        plan: &PredownloadPlan,
+        patch_index: &PatchIndex,
+        patch_cfg: &PatchConfig,
+        nodes: &[String],
+        tx: tokio::sync::mpsc::Sender<ProgressEvent>,
+    ) -> Result<()> {
         let dir = incremental_dir(&self.game_folder);
         std::fs::create_dir_all(&dir)?;
 
@@ -326,14 +369,6 @@ impl GameManager {
             return Ok(());
         }
 
-        let patch_cfg = index
-            .default
-            .config
-            .patch_config
-            .iter()
-            .find(|p| p.version == plan.from_version)
-            .ok_or_else(|| Error::MissingField("patchConfig entry for local version"))?;
-        let patch_index = self.api.fetch_manifest(&nodes, &patch_cfg.index_file).await?;
         let res_by_dest: std::collections::HashMap<&str, &ResourceItem> =
             patch_index.resource.iter().map(|r| (r.dest.as_str(), r)).collect();
 
@@ -348,7 +383,7 @@ impl GameManager {
             if group.local_ready {
                 continue;
             }
-            let urls = node_urls(&nodes, |base| ApiClient::krpdiff_url(base, patch_cfg, &group.name));
+            let urls = node_urls(nodes, |base| ApiClient::krpdiff_url(base, patch_cfg, &group.name));
             let staged = state::staged_patch_path(&self.game_folder, &group.name);
             let tmp = tmp_sibling(&staged, "krpdiff");
             let name = group.name.clone();
@@ -382,7 +417,7 @@ impl GameManager {
                 .get(item.name.as_str())
                 .ok_or_else(|| Error::MissingField("resource entry"))?;
             let from = resource_base(res, patch_cfg);
-            let urls = node_urls(&nodes, |base| ApiClient::resource_url(base, &from, &res.dest));
+            let urls = node_urls(nodes, |base| ApiClient::resource_url(base, &from, &res.dest));
             let staged = state::staged_resource_path(&self.game_folder, &res.dest);
             std::fs::create_dir_all(staged.parent().unwrap())?;
             let tmp = tmp_sibling(&staged, "dl");
@@ -431,6 +466,18 @@ impl GameManager {
         &self,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
     ) -> Result<ApplyReport> {
+        // WuWa CN/Bilibili apply the pack document in one step (`pack_update`);
+        // there is no separate staged plan to apply here.
+        if self.game.uses_quality_tiers() && !self.server_entry().pack_config_urls.is_empty() {
+            if let Some(tx) = &tx {
+                let _ = tx
+                    .send(ProgressEvent::Log(
+                        "pack updates apply in one step — use d / `kuro update`".into(),
+                    ))
+                    .await;
+            }
+            return Ok(ApplyReport::default());
+        }
         let from_version = self
             .local_version()?
             .ok_or_else(|| Error::NoLocalConfig(self.game_folder.clone()))?;
@@ -483,6 +530,37 @@ impl GameManager {
         patch_cfg: &PatchConfig,
         to_version: &str,
         tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<ApplyReport> {
+        self.apply_inner_mode(patch_index, cdn_nodes, patch_cfg, to_version, tx, true)
+            .await
+    }
+
+    /// Apply one pack's `patchConfig` index without recording a game version.
+    ///
+    /// The official launcher writes `launcherDownloadConfig.version` only
+    /// after `common` **and** the active tier have both applied, so the pack
+    /// path owns the record and calls this for each part.
+    pub(crate) async fn apply_pack_index(
+        &self,
+        patch_index: &PatchIndex,
+        cdn_nodes: &[&str],
+        patch_cfg: &PatchConfig,
+        to_version: &str,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<ApplyReport> {
+        self.apply_inner_mode(patch_index, cdn_nodes, patch_cfg, to_version, tx, false)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_inner_mode(
+        &self,
+        patch_index: &PatchIndex,
+        cdn_nodes: &[&str],
+        patch_cfg: &PatchConfig,
+        to_version: &str,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+        record_version: bool,
     ) -> Result<ApplyReport> {
         let inc = incremental_dir(&self.game_folder);
         if !inc.exists() {
@@ -745,13 +823,15 @@ impl GameManager {
         }
 
         // ---- finish: bump version, clean staging ----
-        // Read-modify-write, not a fresh struct: `launcherDownloadConfig.json`
-        // also carries the launcher's `bundles` records, and an apply that
-        // dropped them would un-register an installed quality pack.
-        let cfg = state::read_local_config(&self.game_folder)?
-            .unwrap_or_else(|| LocalConfig::new(to_version, self.server_entry().app_id))
-            .retargeted(to_version, self.server_entry().app_id);
-        state::write_local_config(&self.game_folder, &cfg)?;
+        if record_version {
+            // Read-modify-write, not a fresh struct: `launcherDownloadConfig.json`
+            // also carries the launcher's `bundles` records, and an apply that
+            // dropped them would un-register an installed quality pack.
+            let cfg = state::read_local_config(&self.game_folder)?
+                .unwrap_or_else(|| LocalConfig::new(to_version, self.server_entry().app_id))
+                .retargeted(to_version, self.server_entry().app_id);
+            state::write_local_config(&self.game_folder, &cfg)?;
+        }
         // Best-effort: the version is already recorded, so failing the whole
         // apply because staging was busy/locked would report failure for a
         // successful update. The next predownload reuses or clears the dir.
@@ -808,7 +888,7 @@ impl GameManager {
 
         let mut mgr = Self::open(game_folder.clone()).await?;
         mgr.set_body(body);
-        let sync = match mgr.sync_with_progress(tx).await {
+        let sync = match mgr.sync_base_with_progress(tx).await {
             Ok(report) => report,
             Err(e) => {
                 match prev_cfg {
@@ -934,6 +1014,50 @@ impl GameManager {
 
     /// Sync with optional progress events (used by install and the TUI).
     pub async fn sync_with_progress(&self, tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>) -> Result<SyncReport> {
+        // WuWa CN/Bilibili publish the game version and tiers through the pack
+        // document. That document is the single update path: `common` + the
+        // active tier through `patchConfig`, exactly like the official launcher.
+        // Channels without a pack document (Global, PGR) keep the base index.
+        if self.game.uses_quality_tiers() && !self.server_entry().pack_config_urls.is_empty() {
+            return self.sync_pack_document(tx).await;
+        }
+        self.sync_base_with_progress(tx).await
+    }
+
+    /// The pack-document sync: apply `common` + the active tier's deltas, then
+    /// report the files that were written.
+    async fn sync_pack_document(&self, tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>) -> Result<SyncReport> {
+        let tier = match self.body {
+            BodyChoice::Only(q) | BodyChoice::Prefer(q) => q,
+            BodyChoice::All => quality::selected(&self.game_folder)
+                .or_else(|| quality::info(&self.game_folder).installed().first().copied())
+                .unwrap_or(Quality::Hd),
+        };
+        let update = self.pack_update(tier, tx.clone()).await?;
+        let mut report = SyncReport::default();
+        for part in &update.parts {
+            let applied = &part.report;
+            report.checked += applied.merged + applied.skipped + applied.swapped;
+            report.repaired += applied.swapped;
+            report.ok += applied.skipped;
+        }
+        if let Some(tx) = &tx {
+            let msg = if update.parts.is_empty() {
+                format!("up to date at {}", update.version)
+            } else {
+                format!("pack update applied → {}", update.version)
+            };
+            let _ = tx.send(ProgressEvent::Log(msg)).await;
+            let _ = tx.send(ProgressEvent::Done).await;
+        }
+        Ok(report)
+    }
+
+    /// The base-client sync: verify/repair against the channel's full manifest.
+    pub async fn sync_base_with_progress(
+        &self,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<SyncReport> {
         let index = self.api.fetch_index(&index_url(self.game, self.server)?).await?;
         let nodes = cdn_nodes(&self.api, &index)?;
         let cfg = &index.default.config;
@@ -1309,13 +1433,34 @@ pub fn detect_game(folder: &Path) -> Option<Game> {
     game_server_by_app_id(&cfg.app_id).map(|(game, _)| game)
 }
 
-fn is_krpdiff(dest: &str) -> bool {
+pub(crate) fn is_krpdiff(dest: &str) -> bool {
     // Suffix compare on bytes instead of lowercasing the whole path: this runs
     // once per manifest entry, and a fresh `String` per entry (the manifest
     // lists every file) is pure garbage. Working on bytes also avoids a slice
     // that could panic mid-UTF-8.
     let b = dest.as_bytes();
     b.len() >= 8 && b[b.len() - 8..].eq_ignore_ascii_case(b".krpdiff")
+}
+
+/// Is `a` the same as or newer than `b`? Only dotted-numeric versions are
+/// comparable; anything else answers `false` so an odd string never overrides
+/// the channel index.
+fn version_ge(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Option<Vec<u64>> {
+        if v.is_empty() {
+            return None;
+        }
+        v.split('.').map(|p| p.parse::<u64>().ok()).collect()
+    }
+    let (Some(a), Some(b)) = (parse(a), parse(b)) else {
+        return false;
+    };
+    let len = a.len().max(b.len());
+    let pad = |mut v: Vec<u64>| {
+        v.resize(len, 0);
+        v
+    };
+    pad(a) >= pad(b)
 }
 
 /// CDN folder a full-file entry is fetched from. Entries without `fromFolder`

@@ -156,6 +156,11 @@ pub struct PackConfig {
     /// made of. `HD` -> `[common, hd]`, and so on.
     #[serde(default)]
     pub bundles: std::collections::BTreeMap<String, PackBundle>,
+    /// The next version's pack set, when the launcher has published a
+    /// preinstall. Isomorphic to the top-level keys; the outer `cdnList` is
+    /// reused. `None` means only the formal packs are open.
+    #[serde(default)]
+    pub predownload: Option<Box<PackConfig>>,
 }
 
 /// One CDN edge from a [`PackConfig`].
@@ -200,6 +205,28 @@ pub struct PackEntry {
     /// carry the per-file hashes that are actually enforced).
     #[serde(default)]
     pub index_file_md5: String,
+    /// `from version -> this version` patch entries. The official launcher
+    /// updates `common` and the active tier by applying these deltas, not by
+    /// downloading a full body again.
+    #[serde(default)]
+    pub patch_config: Vec<PackPatch>,
+}
+
+/// One `patchConfig` entry of a pack: the delta from `version` to the pack's
+/// own version.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackPatch {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub index_file: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub index_file_md5: String,
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// A tier's composition, e.g. `HD -> {resourcePacks: [common, hd]}`.
