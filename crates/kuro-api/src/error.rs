@@ -19,7 +19,7 @@ pub enum Error {
     #[error("missing required field `{0}`")]
     MissingField(&'static str),
 
-    #[error("local launcher config not found at {0}; run with --path or set up the game first")]
+    #[error("{0} is not a game folder yet: launcherDownloadConfig.json is missing")]
     NoLocalConfig(PathBuf),
 
     #[error("unknown appId `{0}` — cannot map to a known game/server")]

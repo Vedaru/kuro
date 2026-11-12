@@ -351,6 +351,12 @@ fn is_blank_install(state: &UiState, idx: usize) -> bool {
         .is_some_and(|p| !std::path::Path::new(p).join("launcherDownloadConfig.json").is_file())
 }
 
+/// A folder with files but no launcher config is a stopped install, not a
+/// virgin slot.
+fn partial_install(path: &str) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 /// A blank PGR slot should open the install dialog on PGR (Global, as the
 /// previous install used), not silently offer WuWa.
 fn draft_for_active(state: &UiState) -> InstallDraft {
@@ -371,7 +377,9 @@ fn draft_for_active(state: &UiState) -> InstallDraft {
 
 /// `open` fails with this when the folder has no launcher config yet.
 fn is_not_installed(err: &str) -> bool {
-    err.contains("launcher config not found") || err.contains("NoLocalConfig")
+    err.contains("is not a game folder yet")
+        || err.contains("launcher config not found")
+        || err.contains("NoLocalConfig")
 }
 
 /// Add an install to the games list, returning its index. Reinstalling into
@@ -405,8 +413,8 @@ fn friendly_error(raw: &str) -> String {
         "already on the latest version — nothing to do".to_string()
     } else if raw.contains("run predownload first") || raw.contains("incremental_download") {
         "no downloaded update found — press 'd' first to download it".to_string()
-    } else if raw.contains("NoLocalConfig") || raw.contains("launcher config not found") {
-        "no game found in this folder (launcherDownloadConfig.json missing)".to_string()
+    } else if is_not_installed(raw) {
+        "not a game folder yet — press i to install here".to_string()
     } else if raw.contains("global fast-switch") {
         "the global server can't be fast-switched — use 's' to sync instead".to_string()
     } else if raw.contains("already up to date") {
@@ -2180,6 +2188,13 @@ fn form_row(active: bool, label: &'static str, value: impl Into<String>) -> Line
     ])
 }
 
+fn help_line(label: &'static str, text: &'static str) -> Line<'static> {
+    Line::from(vec![
+        accent(format!("{label:<8}")),
+        Span::styled(text, Style::default().fg(Color::Gray)),
+    ])
+}
+
 /// The root screen: one row per installed game, one game per row. The detail
 /// view is a separate screen, so two games are never compared side by side.
 fn ui_games(f: &mut Frame, state: &UiState) {
@@ -2262,13 +2277,16 @@ fn ui_games(f: &mut Frame, state: &UiState) {
                         Style::default().fg(Color::Green)
                     },
                 ),
-                Some(Err(e)) if is_not_installed(e) => (
-                    "—".into(),
-                    "—".into(),
-                    "—".into(),
-                    "not installed",
-                    Style::default().fg(Color::Yellow),
-                ),
+                Some(Err(e)) if is_not_installed(e) => {
+                    let incomplete = partial_install(path);
+                    (
+                        "—".into(),
+                        "—".into(),
+                        "—".into(),
+                        if incomplete { "not completed" } else { "not installed" },
+                        Style::default().fg(Color::Yellow),
+                    )
+                }
                 Some(Err(_)) => (
                     "?".into(),
                     "?".into(),
@@ -2602,20 +2620,17 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
 fn render_overlays(f: &mut Frame, state: &UiState) {
     if state.show_help {
         let help_lines: Vec<Line> = vec![
-            Line::raw("kuro — Kuro Games launcher"),
-            Line::raw("Games  ↑↓ select · Enter open · i install · r refresh · q quit"),
-            Line::raw("Game   Esc back · p play · d predownload · a apply"),
-            Line::raw("       s sync · Q quality · c switch server · k force-kill"),
-            Line::raw("       Tab: status / activity"),
-            Line::raw("Clean  Q -> x removes the highlighted tier"),
-            Line::raw("Stop   Ctrl+C stops this game's task · Esc backs out"),
-            Line::raw("Install i · ↑↓ select · ←→ server/pack · Enter folder/install"),
-            Line::raw("Shell  kuro update FOLDER --check|--download|--apply"),
-            Line::raw("       kuro pack FOLDER hd --remove"),
-            Line::raw("Debug  kuro --debug -> ~/.local/state/kuro/kuro.log"),
-            Line::raw("h / ? / Esc to close"),
+            Line::from(vec![accent("kuro"), dim(" — Kuro Games launcher")]),
+            help_line("Games", "↑↓ select · Enter open · i install"),
+            help_line("Game", "p play · d download · a apply · s sync"),
+            help_line("Other", "Q quality · c server · k kill · Tab focus"),
+            help_line("Install", "↑↓ select · ←→ change · Enter"),
+            help_line("Stop", "Ctrl+C task · Esc back"),
+            help_line("Shell", "update · pack · sync · --debug"),
+            Line::styled("h / ? / Esc to close", Style::default().fg(Color::DarkGray)),
         ];
-        let area = centered_rect(70, 60, f.area());
+        let help_width = if f.area().width < 80 { 90 } else { 70 };
+        let area = centered_rect(help_width, 60, f.area());
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(help_lines).block(Block::default().borders(Borders::ALL).title("help")),
@@ -2770,7 +2785,7 @@ fn status_box_lines(s: Option<&Result<GameStatus, String>>, busy: bool, quality:
             lines
         }
         Some(Err(e)) => vec![Line::styled(
-            format!("error: {e}"),
+            format!("error: {}", friendly_error(e)),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )],
         None => vec![Line::styled("loading…", Style::default().fg(Color::DarkGray))],
@@ -3122,10 +3137,7 @@ mod tests {
         let mut state = two_games();
         state.show_help = true;
         let out = render_to_string(&state, 100, 40);
-        assert!(
-            out.contains("Ctrl+C stops this game's task"),
-            "help missing stop key:\n{out}"
-        );
+        assert!(out.contains("Ctrl+C task"), "help missing stop key:\n{out}");
         assert!(!out.contains("Esc / Ctrl+C"), "help still maps Esc to stop:\n{out}");
     }
 
@@ -3182,7 +3194,7 @@ mod tests {
 
     #[test]
     fn blank_rows_render_as_not_installed() {
-        let err = "local launcher config not found at /tmp/x; run with --path or set up the game first";
+        let err = "/tmp/x is not a game folder yet: launcherDownloadConfig.json is missing";
         let state = UiState {
             paths: vec!["/tmp/blank-wuwa".into(), "/tmp/blank-pgr".into()],
             statuses: vec![Some(Err(err.into())), Some(Err(err.into()))],
@@ -3192,6 +3204,23 @@ mod tests {
         let out = render_to_string(&state, 100, 30);
         assert_eq!(out.matches("not installed").count(), 2, "{out}");
         assert!(!out.contains("status error"), "{out}");
+    }
+
+    #[test]
+    fn a_partial_folder_is_not_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("partial.bin"), b"x").unwrap();
+        let err = "/tmp/x is not a game folder yet: launcherDownloadConfig.json is missing";
+        let state = UiState {
+            paths: vec![dir.path().to_string_lossy().into_owned()],
+            statuses: vec![Some(Err(err.into()))],
+            tasks: vec![None],
+            quality_sel: vec![None],
+            ..Default::default()
+        };
+        let out = render_to_string(&state, 100, 30);
+        assert!(out.contains("not completed"), "{out}");
+        assert!(!out.contains("not installed"), "{out}");
     }
 
     #[test]

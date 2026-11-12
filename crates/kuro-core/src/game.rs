@@ -922,8 +922,6 @@ impl GameManager {
     ) -> Result<InstallReport> {
         std::fs::create_dir_all(&game_folder)?;
         let mut mgr = Self::manage(game, server, game_folder.clone())?;
-        let index = mgr.api.fetch_index(&index_url(game, server)?).await?;
-        let version = index.default.version.clone();
         mgr.set_body(body);
         let sync = mgr.sync_base_with_progress(tx).await?;
         if !sync.failed.is_empty() {
@@ -932,6 +930,11 @@ impl GameManager {
                 sync.failed.len()
             )));
         }
+        // The successful sync just wrote the channel version; no second
+        // index fetch is needed to name the tier records.
+        let version = mgr
+            .local_version()?
+            .ok_or_else(|| Error::NoLocalConfig(game_folder.clone()))?;
         // The channel manifest carries the HD body for WuWa 3.7.x. A from-zero
         // install is not finished until the launcher records name the tier
         // (ww-manager does the same after `download`); without them the
