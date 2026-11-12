@@ -130,6 +130,10 @@ never touches it. The pack document's nested `predownload` block is consumed
 only once the formal packs are current, and the resulting preinstall plan is
 applied only on an explicit `a` / `--apply`.
 
+`kuro sync` draws one overall progress bar on stderr: the verify count while
+hashing, then bytes for the whole download (`common` + tier together). Piped
+output gets no bar, only the final summary.
+
 A pack manifest has exactly one path rule: a tier owns
 `Client/Content/<TIER>/`, and any pack may write the target version's
 `Client/Saved/Resources/<version>/`. That is the official rule, and the version
@@ -176,7 +180,9 @@ never compared side by side. There is no log panel.
 | `q` | quit |
 
 While a download, install, sync, or pack task runs, `Esc` or `Ctrl+C` stops
-it. Partial files stay on disk and the next run resumes.
+it. Stop waits for the task and every chunk download to be gone before the
+panel says `stopped`; partial files stay on disk and the next run continues
+from them.
 
 ### Cleaning packs
 

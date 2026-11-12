@@ -967,6 +967,10 @@ impl crate::GameManager {
             predownload: is_predownload,
             parts: Vec::new(),
         };
+        // Build every part's plan before downloading so the UI gets one total
+        // for `common` + the active tier, instead of a bar that resets when
+        // the second pack starts.
+        let mut planned = Vec::with_capacity(plan_file.parts.len());
         for part in &plan_file.parts {
             let stage = pack_staging_dir(&self.game_folder, &part.name);
             let patch_cfg = kuro_api::PatchConfig {
@@ -987,6 +991,13 @@ impl crate::GameManager {
                     )))
                     .await;
             }
+            planned.push((part, patch_cfg, stage, part_plan));
+        }
+        if let Some(tx) = &tx {
+            let total: u64 = planned.iter().map(|(_, _, _, p)| p.total_bytes).sum();
+            let _ = tx.send(crate::ProgressEvent::SetTotal { bytes: total }).await;
+        }
+        for (part, patch_cfg, stage, part_plan) in planned {
             let download_tx = match &tx {
                 Some(tx) => tx.clone(),
                 None => {

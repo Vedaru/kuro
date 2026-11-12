@@ -6,7 +6,7 @@
 //! CN<->bilibili · `Q` quality preset · `q` quit.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -96,11 +96,19 @@ struct TaskUi {
     done: usize,
     /// Items announced but not yet finished (GroupStart - GroupDone).
     queued: usize,
-    finished: Option<Result<String, String>>,
+    finished: Option<TaskEnd>,
     total_bytes: u64,
     done_bytes: u64,
     /// In-flight files (parallel downloads), each with its own bar.
     files: Vec<FileState>,
+}
+
+/// How a task ended. Stopped is deliberately not an error: the user aborted
+/// it, and the partial files are kept for the next run.
+enum TaskEnd {
+    Done(String),
+    Failed(String),
+    Stopped,
 }
 
 #[derive(Clone, Default)]
@@ -134,8 +142,9 @@ struct UiState {
     /// Last user-facing message, shown in the task panel when it is idle.
     notice: Option<String>,
     task: Option<TaskUi>,
-    /// Abort handle for the running task, when it is safe to stop it.
-    task_abort: Option<tokio::task::AbortHandle>,
+    /// Handle for the running task, when it is safe to stop it. The handle is
+    /// awaited on stop so `stopped` means the task is gone, not merely asked.
+    task_handle: Option<tokio::task::JoinHandle<()>>,
     busy: bool,
     /// Game folders in the manager; ←/→ switches between them.
     paths: Vec<String>,
@@ -224,17 +233,25 @@ fn notify(state: &mut UiState, msg: impl Into<String>) {
     state.notice = Some(msg);
 }
 
-fn cancel_task(state: &mut UiState) {
-    let Some(handle) = state.task_abort.take() else {
+async fn stop_task(state: &mut UiState) {
+    let Some(handle) = state.task_handle.take() else {
         notify(state, "this task cannot be stopped");
         return;
     };
     handle.abort();
+    // Abort is a request. Wait for the task to actually be gone so a stopped
+    // download cannot keep streaming into the staging tree while the user
+    // starts the next one, and so "stopped" is not a guess.
+    let _ = handle.await;
     if let Some(task) = state.task.as_mut() {
-        task.finished = Some(Err("cancelled".into()));
+        task.finished = Some(TaskEnd::Stopped);
+        task.files.clear();
     }
     state.busy = false;
-    notify(state, "cancelled — partial downloads are resumable");
+    notify(
+        state,
+        "stopped — partial files are kept; the next run continues from them",
+    );
 }
 
 /// Human-friendly game name for messages.
@@ -459,6 +476,120 @@ async fn cli_status(folder: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A single live line on stderr for long CLI commands: one bar for the whole
+/// operation, not one per file. Piped output gets no bar; only the summary.
+struct CliProgress {
+    tty: bool,
+    verify_done: u64,
+    verify_total: u64,
+    total_bytes: u64,
+    done_bytes: u64,
+    in_flight: std::collections::HashMap<String, u64>,
+    last: std::time::Instant,
+}
+
+impl CliProgress {
+    fn new() -> Self {
+        Self {
+            tty: std::io::stderr().is_terminal(),
+            verify_done: 0,
+            verify_total: 0,
+            total_bytes: 0,
+            done_bytes: 0,
+            in_flight: std::collections::HashMap::new(),
+            last: std::time::Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+    fn apply(&mut self, ev: ProgressEvent) {
+        match ev {
+            ProgressEvent::SetTotal { bytes } => {
+                self.total_bytes = bytes;
+                self.in_flight.clear();
+            }
+            ProgressEvent::FileProgress { name, bytes, total } => {
+                if name == "verify" {
+                    self.verify_total = total;
+                    self.verify_done = bytes;
+                } else {
+                    self.in_flight.insert(name, bytes);
+                }
+            }
+            ProgressEvent::GroupDone { name, bytes } => {
+                self.in_flight.remove(&name);
+                self.done_bytes += bytes;
+            }
+            _ => {}
+        }
+        self.draw();
+    }
+
+    fn draw(&mut self) {
+        if !self.tty || self.last.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        let line = if self.total_bytes > 0 {
+            // In-flight bytes are what makes the bar move during one big file;
+            // done_bytes only advances when a whole file lands.
+            let in_flight: u64 = self.in_flight.values().sum();
+            let shown = (self.done_bytes + in_flight).min(self.total_bytes);
+            format!(
+                "  {}  {}/{}",
+                cli_bar(shown, self.total_bytes, 30),
+                fmt_bytes(shown),
+                fmt_bytes(self.total_bytes)
+            )
+        } else if self.verify_total > 0 {
+            format!(
+                "  {}  verifying {}/{} files",
+                cli_bar(self.verify_done, self.verify_total, 30),
+                self.verify_done,
+                self.verify_total
+            )
+        } else {
+            "  preparing…".to_string()
+        };
+        eprint!("\r\x1b[K{line}");
+        let _ = std::io::stderr().flush();
+    }
+
+    fn finish(&mut self) {
+        if self.tty {
+            eprint!("\r\x1b[K");
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
+fn cli_bar(done: u64, total: u64, width: usize) -> String {
+    if total == 0 {
+        return "?".to_string();
+    }
+    let ratio = (done as f64 / total as f64).clamp(0.0, 1.0);
+    let filled = (width as f64 * ratio).round() as usize;
+    format!(
+        "[{}{}] {:5.1}%",
+        "█".repeat(filled),
+        "░".repeat(width - filled),
+        ratio * 100.0
+    )
+}
+
+/// Drain progress on a task so the CLI can await the summary only after the
+/// live line has been cleared.
+fn cli_progress() -> (tokio::sync::mpsc::Sender<ProgressEvent>, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let handle = tokio::spawn(async move {
+        let mut p = CliProgress::new();
+        while let Some(ev) = rx.recv().await {
+            p.apply(ev);
+        }
+        p.finish();
+    });
+    (tx, handle)
+}
+
 /// `kuro sync [folder] [--quality <sd|hd|uhd>]` — verify + repair, optionally
 /// against a body other than the saved preset's.
 ///
@@ -489,7 +620,10 @@ async fn cli_sync(args: &[String]) -> std::io::Result<()> {
             if body != BodyChoice::All {
                 m.set_body(body);
             }
-            match m.sync().await {
+            let (tx, progress) = cli_progress();
+            let result = m.sync_with_progress(Some(tx)).await;
+            let _ = progress.await;
+            match result {
                 Ok(r) => println!(
                     "checked={} ok={} repaired={} stale_removed={} failed={}",
                     r.checked,
@@ -1008,7 +1142,7 @@ async fn run(
 
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     if state.busy {
-                        cancel_task(&mut state);
+                        stop_task(&mut state).await;
                     } else {
                         break;
                     }
@@ -1080,7 +1214,7 @@ async fn run(
                                 &mut state,
                                 format!("installing {} paks — the game must be closed", tier.as_arg()),
                             );
-                            state.task_abort = Some(spawn_simple(&tx, &path, TaskKind::Pack(tier)));
+                            state.task_handle = Some(spawn_simple(&tx, &path, TaskKind::Pack(tier)));
                         } else {
                             notify(&mut state, "busy — wait for the current task to finish");
                         }
@@ -1100,7 +1234,7 @@ async fn run(
                                     tier.as_arg()
                                 ),
                             );
-                            state.task_abort = Some(spawn_simple(&tx, &path, TaskKind::RemovePack(tier)));
+                            state.task_handle = Some(spawn_simple(&tx, &path, TaskKind::RemovePack(tier)));
                         } else {
                             notify(&mut state, "busy — wait for the current task to finish");
                         }
@@ -1183,7 +1317,7 @@ async fn run(
                                 ),
                             },
                         );
-                        state.task_abort = Some(spawn_install(&tx, &target, game, server, body));
+                        state.task_handle = Some(spawn_install(&tx, &target, game, server, body));
                     }
                 }
 
@@ -1217,7 +1351,7 @@ async fn run(
                             }
                         }
                         KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
-                        KeyCode::Esc if state.busy => cancel_task(&mut state),
+                        KeyCode::Esc if state.busy => stop_task(&mut state).await,
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         _ => {}
                     }
@@ -1225,7 +1359,7 @@ async fn run(
                 }
 
                 match key.code {
-                    KeyCode::Esc if state.busy => cancel_task(&mut state),
+                    KeyCode::Esc if state.busy => stop_task(&mut state).await,
                     KeyCode::Esc => state.screen = Screen::Games,
                     KeyCode::Char('q') => break,
                     KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
@@ -1267,7 +1401,7 @@ async fn run(
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
-                            state.task_abort = Some(spawn_predownload(&tx, &path));
+                            state.task_handle = Some(spawn_predownload(&tx, &path));
                         }
                     }
                     KeyCode::Char('a') => {
@@ -1278,7 +1412,7 @@ async fn run(
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
-                            state.task_abort = None;
+                            state.task_handle = None;
                             spawn_simple(&tx, &path, TaskKind::Apply);
                         }
                     }
@@ -1290,7 +1424,7 @@ async fn run(
                                 ..Default::default()
                             });
                             state.focus = Focus::Task;
-                            state.task_abort = Some(spawn_simple(&tx, &path, TaskKind::Sync));
+                            state.task_handle = Some(spawn_simple(&tx, &path, TaskKind::Sync));
                         }
                     }
                     KeyCode::Char('c') if !state.busy => {
@@ -1300,7 +1434,7 @@ async fn run(
                             ..Default::default()
                         });
                         state.focus = Focus::Task;
-                        state.task_abort = None;
+                        state.task_handle = None;
                         spawn_simple(&tx, &path, TaskKind::Checkout);
                     }
                     _ => {}
@@ -1309,6 +1443,16 @@ async fn run(
         }
 
         while let Ok(ev) = rx.try_recv() {
+            // A stopped task may still have progress (and even a Done) queued
+            // from before the abort landed. Do not let those revive it.
+            if matches!(ev, UiEvent::Progress(_) | UiEvent::TaskDone(_))
+                && matches!(
+                    state.task.as_ref().and_then(|t| t.finished.as_ref()),
+                    Some(TaskEnd::Stopped)
+                )
+            {
+                continue;
+            }
             match ev {
                 UiEvent::Status(idx, s) => {
                     let line = match &s {
@@ -1381,7 +1525,7 @@ async fn run(
                     }
                     ProgressEvent::Done => {
                         if let Some(t) = state.task.as_mut() {
-                            t.finished = Some(Ok("download complete — press 'a' to apply".into()));
+                            t.finished = Some(TaskEnd::Done("download complete — press 'a' to apply".into()));
                         }
                         state.busy = false;
                     }
@@ -1392,10 +1536,13 @@ async fn run(
                         Err(e) => notify(&mut state, format!("failed: {}", friendly_error(e))),
                     }
                     if let Some(t) = state.task.as_mut() {
-                        t.finished = Some(r);
+                        t.finished = Some(match r {
+                            Ok(msg) => TaskEnd::Done(msg),
+                            Err(e) => TaskEnd::Failed(e),
+                        });
                     }
                     state.busy = false;
-                    state.task_abort = None;
+                    state.task_handle = None;
                     if let Some(path) = state.paths.get(state.active).cloned() {
                         state.quality_sel[state.active] = quality::selected(std::path::Path::new(&path));
                     }
@@ -1557,7 +1704,7 @@ fn auto_detect_games() -> Vec<String> {
     deduped
 }
 
-fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) -> tokio::task::AbortHandle {
+fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) -> tokio::task::JoinHandle<()> {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1624,7 +1771,6 @@ fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str) -> tok
         .await;
         let _ = tx.send(UiEvent::TaskDone(result)).await;
     })
-    .abort_handle()
 }
 
 fn spawn_install(
@@ -1633,7 +1779,7 @@ fn spawn_install(
     game: Game,
     server: Server,
     body: BodyChoice,
-) -> tokio::task::AbortHandle {
+) -> tokio::task::JoinHandle<()> {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1658,7 +1804,6 @@ fn spawn_install(
         };
         let _ = tx.send(UiEvent::TaskDone(result)).await;
     })
-    .abort_handle()
 }
 
 enum TaskKind {
@@ -1671,7 +1816,7 @@ enum TaskKind {
     RemovePack(Quality),
 }
 
-fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskKind) -> tokio::task::AbortHandle {
+fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskKind) -> tokio::task::JoinHandle<()> {
     let tx = tx.clone();
     let path = path.to_string();
     tokio::spawn(async move {
@@ -1778,7 +1923,6 @@ fn spawn_simple(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, kind: TaskK
         .await;
         let _ = tx.send(UiEvent::TaskDone(result)).await;
     })
-    .abort_handle()
 }
 
 fn ui(f: &mut Frame, state: &UiState) {
@@ -2047,35 +2191,37 @@ fn task_lines(state: &UiState) -> Vec<Line<'_>> {
     match &state.task {
         None => vec![Line::raw("idle")],
         Some(t) => {
-            let mut v = vec![
-                Line::raw(format!("task: {}", t.kind)),
-                Line::raw(format!("files done: {}   queued: {}", t.done, t.queued)),
-            ];
-            if t.total_bytes > 0 {
-                // Include in-flight bytes: `done_bytes` only moves on GroupDone
-                // (a whole file), so the overall bar used to sit still for the
-                // entire duration of one file and jump when it landed.
-                let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
-                let shown = (t.done_bytes + in_flight).min(t.total_bytes);
-                v.push(Line::raw(bar_line("overall", shown, t.total_bytes, 34)));
-            }
-            for f in t.files.iter().take(8) {
-                let name = shorten(&f.name, 42);
-                v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
+            let stopped = matches!(t.finished, Some(TaskEnd::Stopped));
+            let mut v = vec![Line::raw(format!("task: {}", t.kind))];
+            // A stopped task has no progress to show; its bar and in-flight
+            // rows are stale and would read as a paused 0%.
+            if !stopped {
+                v.push(Line::raw(format!("files done: {}   queued: {}", t.done, t.queued)));
+                if t.total_bytes > 0 {
+                    // Include in-flight bytes: `done_bytes` only moves on GroupDone
+                    // (a whole file), so the overall bar used to sit still for the
+                    // entire duration of one file and jump when it landed.
+                    let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
+                    let shown = (t.done_bytes + in_flight).min(t.total_bytes);
+                    v.push(Line::raw(bar_line("overall", shown, t.total_bytes, 34)));
+                }
+                for f in t.files.iter().take(8) {
+                    let name = shorten(&f.name, 42);
+                    v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
+                }
             }
             if let Some(f) = &t.finished {
-                v.push(Line::styled(
-                    match f {
-                        Ok(m) => format!("✔ {m}"),
-                        Err(e) => format!("✘ {}", friendly_error(e)),
-                    },
-                    Style::default().fg(match f {
-                        Ok(_) => Color::Green,
-                        Err(_) => Color::Red,
-                    }),
-                ));
+                let (text, color) = match f {
+                    TaskEnd::Done(m) => (format!("✔ {m}"), Color::Green),
+                    TaskEnd::Failed(e) => (format!("✘ {}", friendly_error(e)), Color::Red),
+                    TaskEnd::Stopped => (
+                        "■ stopped — partial files are kept for the next run".to_string(),
+                        Color::Yellow,
+                    ),
+                };
+                v.push(Line::styled(text, Style::default().fg(color)));
             }
-            if state.busy && state.task_abort.is_some() {
+            if state.busy && state.task_handle.is_some() {
                 v.push(Line::styled(
                     "Esc / Ctrl+C stops this task",
                     Style::default().fg(Color::DarkGray),
@@ -2152,7 +2298,7 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
             "   [busy]",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
-        if state.screen == Screen::Games && state.task_abort.is_some() {
+        if state.screen == Screen::Games && state.task_handle.is_some() {
             spans.push(Span::styled(
                 "  Esc stop",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -2400,10 +2546,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, debug_log, default_folder, init_debug, parse_quality_arg, split_play_args, ui, InstallDraft,
-        QualityDraft, Screen, UiState,
+        body_choice, cli_bar, debug_log, default_folder, init_debug, parse_quality_arg, split_play_args, ui,
+        CliProgress, InstallDraft, QualityDraft, Screen, UiState,
     };
-    use kuro_core::{quality, BodyChoice, Game, GameStatus, Quality, Server};
+    use kuro_core::{quality, BodyChoice, Game, GameStatus, ProgressEvent, Quality, Server};
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -2653,6 +2799,59 @@ mod tests {
         let out = render_to_string(&state, 100, 30);
         assert!(out.contains("activity"), "activity panel missing:\n{out}");
         assert!(out.contains("task: predownload"), "task line missing:\n{out}");
+    }
+
+    #[test]
+    fn a_stopped_task_is_not_shown_as_a_failure() {
+        let mut state = two_games();
+        state.task = Some(super::TaskUi {
+            kind: "sync".into(),
+            finished: Some(super::TaskEnd::Stopped),
+            ..Default::default()
+        });
+        let out = render_to_string(&state, 100, 30);
+        assert!(out.contains("stopped"), "stopped state missing:\n{out}");
+        assert!(!out.contains('✘'), "stopped task rendered as failed:\n{out}");
+    }
+
+    /// The CLI bar is one running total, not a per-file row. Verify fills it
+    /// first, then the download phase replaces it with byte progress.
+    #[test]
+    fn cli_progress_tracks_verify_then_download() {
+        let mut p = CliProgress::new();
+        p.tty = false;
+        p.apply(ProgressEvent::FileProgress {
+            name: "verify".into(),
+            bytes: 512,
+            total: 1024,
+        });
+        assert_eq!((p.verify_done, p.verify_total), (512, 1024));
+
+        p.apply(ProgressEvent::SetTotal { bytes: 1000 });
+        p.apply(ProgressEvent::FileProgress {
+            name: "a".into(),
+            bytes: 250,
+            total: 500,
+        });
+        p.apply(ProgressEvent::FileProgress {
+            name: "b".into(),
+            bytes: 100,
+            total: 500,
+        });
+        assert_eq!(p.total_bytes, 1000);
+        assert_eq!(p.in_flight.values().sum::<u64>(), 350);
+
+        p.apply(ProgressEvent::GroupDone {
+            name: "a".into(),
+            bytes: 500,
+        });
+        p.apply(ProgressEvent::GroupDone {
+            name: "b".into(),
+            bytes: 500,
+        });
+        assert_eq!(p.done_bytes, 1000);
+        assert!(p.in_flight.is_empty());
+        assert_eq!(cli_bar(1, 2, 10), "[█████░░░░░]  50.0%");
     }
 
     #[test]

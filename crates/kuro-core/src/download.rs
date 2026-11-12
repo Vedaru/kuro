@@ -7,7 +7,7 @@
 //! stalled edge aborts an entire run (the failure that motivated this).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -348,26 +348,24 @@ pub async fn download_chunked(
     // Bytes written per chunk, index-stable so each task owns one slot and a
     // retry can reset its own without racing the others.
     let written: Arc<Vec<AtomicU64>> = Arc::new((0..chunks.len()).map(|_| AtomicU64::new(0)).collect());
-    let finished = Arc::new(AtomicBool::new(false));
 
     // Body bytes arrive continuously but a chunk only reaches the old
     // completion counter when its whole range lands, so the bar advanced in
     // whole-chunk jumps and stood still between them. A single ticker reports
     // the sum of per-chunk written counters instead — smooth, and no event
     // per streamed piece (which would backpressure the download).
-    let reporter = progress.map(|tx| {
+    // It lives in a JoinSet so dropping this future (a cancelled task) aborts
+    // it together with the chunk tasks, instead of leaving it ticking.
+    let mut reporter = tokio::task::JoinSet::new();
+    if let Some(tx) = progress {
         let tx = tx.clone();
         let written = written.clone();
-        let finished = finished.clone();
         let name = name.to_string();
-        tokio::spawn(async move {
+        reporter.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(150));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                if finished.load(Ordering::Relaxed) {
-                    break;
-                }
                 let done: u64 = written.iter().map(|b| b.load(Ordering::Relaxed)).sum();
                 let _ = tx
                     .send(ProgressEvent::FileProgress {
@@ -377,10 +375,10 @@ pub async fn download_chunked(
                     })
                     .await;
             }
-        })
-    });
+        });
+    }
 
-    let mut handles = Vec::with_capacity(chunks.len());
+    let mut handles = tokio::task::JoinSet::new();
     for (idx, chunk) in chunks.iter().enumerate() {
         let client = client.clone();
         let urls = urls.clone();
@@ -389,7 +387,7 @@ pub async fn download_chunked(
         let sem = sem.clone();
         let written = written.clone();
         let budget = budget.clone();
-        handles.push(tokio::spawn(async move {
+        handles.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let range = format!("bytes={}-{}", chunk.start, chunk.end);
             retry::retry_across(&urls, |url, _| {
@@ -445,15 +443,13 @@ pub async fn download_chunked(
                 })
             })
             .await
-        }));
+        });
     }
 
     let mut failed: Option<Error> = None;
-    for h in handles {
-        // Keep the first error, but drain every handle so the reporter is
-        // stopped on the failure path too (an abandoned ticker would keep
-        // emitting stale progress into the UI).
-        match h.await {
+    while let Some(joined) = handles.join_next().await {
+        // Keep the first error, but drain every handle.
+        match joined {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 if failed.is_none() {
@@ -467,10 +463,10 @@ pub async fn download_chunked(
             }
         }
     }
-    finished.store(true, Ordering::Relaxed);
-    if let Some(r) = reporter {
-        let _ = r.await;
-    }
+    // Stop the ticker before closing the file's bar so a late tick cannot
+    // overwrite 100% with a slightly smaller number.
+    reporter.abort_all();
+    while reporter.join_next().await.is_some() {}
     if let Some(e) = failed {
         return Err(e);
     }

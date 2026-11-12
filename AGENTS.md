@@ -90,11 +90,16 @@ edits.
   `predownload` block is used only when the formal packs are current. A
   missing source-version delta is a refusal, never a full-body or other-tier
   fallback.
-- **Only cancellable tasks get an abort handle.** The TUI stores one for
-  predownload, sync, install, pack install, and tier removal. Apply and
-  checkout do not, because interrupting a swap leaves a half-applied tree.
+- **Only cancellable tasks get a task handle.** The TUI stores the
+  `JoinHandle` for predownload, sync, install, pack install, and tier removal,
+  aborts it, and *awaits it* before reporting `stopped`. Apply and checkout do
+  not get one, because interrupting a swap leaves a half-applied tree.
   `remove_pack` deletes the tier directory and both launcher records, and
   leaves the versioned `Client/Saved/Resources` payloads alone.
+- **A cancelled download must abort its chunk tasks.** `download_chunked` owns
+  byte-range tasks and its progress ticker in `JoinSet`s; dropping the future
+  aborts them. Detached `tokio::spawn` tasks here survive the parent and keep
+  streaming after the UI says the task stopped.
 - **The tier body is matched as spelled, not case-folded.** The game reads
   `Client/Content/HD`; on a case-sensitive host a manifest spelling
   `client/content/hd` would write files the game never reads. Leading slashes
