@@ -2110,6 +2110,27 @@ fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
     Block::bordered().border_type(BorderType::Rounded).title(title)
 }
 
+/// Content highlights: dim labels, strong values, cyan accents. One place so
+/// the panels read the same and a theme change is three lines.
+fn dim(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(Color::DarkGray))
+}
+fn strong(text: impl Into<String>) -> Span<'static> {
+    Span::styled(
+        text.into(),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )
+}
+fn accent(text: impl Into<String>) -> Span<'static> {
+    Span::styled(
+        text.into(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )
+}
+fn kv(label: &'static str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![dim(label), strong(value)])
+}
+
 /// The root screen: one row per installed game, one game per row. The detail
 /// view is a separate screen, so two games are never compared side by side.
 fn ui_games(f: &mut Frame, state: &UiState) {
@@ -2225,25 +2246,25 @@ fn ui_games(f: &mut Frame, state: &UiState) {
             };
             let cells: Vec<Cell> = if wide {
                 vec![
-                    Cell::from(name),
+                    Cell::from(strong(name)),
                     Cell::from(server),
                     Cell::from(local),
                     Cell::from(remote),
                     Cell::from(quality),
-                    Cell::from(Span::styled(state_text, state_style)),
+                    Cell::from(Span::styled(state_text, state_style.add_modifier(Modifier::BOLD))),
                 ]
             } else if medium {
                 vec![
-                    Cell::from(name),
+                    Cell::from(strong(name)),
                     Cell::from(server),
                     Cell::from(version),
-                    Cell::from(Span::styled(state_text, state_style)),
+                    Cell::from(Span::styled(state_text, state_style.add_modifier(Modifier::BOLD))),
                 ]
             } else {
                 vec![
-                    Cell::from(name),
+                    Cell::from(strong(name)),
                     Cell::from(version),
-                    Cell::from(Span::styled(state_text, state_style)),
+                    Cell::from(Span::styled(state_text, state_style.add_modifier(Modifier::BOLD))),
                 ]
             };
             Row::new(cells)
@@ -2253,7 +2274,7 @@ fn ui_games(f: &mut Frame, state: &UiState) {
     let table = Table::new(rows, widths)
         .header(header)
         .block(panel(format!("kuro · games ({})", state.paths.len())))
-        .row_highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(Color::Indexed(236)).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     let visible = chunks[0].height.saturating_sub(3) as usize;
     let offset = state.active.saturating_sub(visible.saturating_sub(1));
@@ -2349,21 +2370,30 @@ fn task_lines(state: &UiState) -> Vec<Line<'_>> {
         None => vec![Line::raw("idle")],
         Some(t) => {
             let stopped = matches!(t.finished, Some(TaskEnd::Stopped));
-            let mut v = vec![Line::raw(format!("task: {}", t.kind))];
+            let mut v = vec![Line::from(vec![dim("task: "), accent(t.kind.clone())])];
             if let Some(target) = &t.target {
-                v.push(Line::raw(format!("at: {target}")));
+                v.push(Line::from(vec![dim("at:   "), Span::raw(target.clone())]));
             }
             // A stopped task has no progress to show; its bar and in-flight
             // rows are stale and would read as a paused 0%.
             if !stopped {
-                v.push(Line::raw(format!("files done: {}   queued: {}", t.done, t.queued)));
+                v.push(Line::from(vec![
+                    dim("files: "),
+                    strong(t.done.to_string()),
+                    dim(" done · "),
+                    strong(t.queued.to_string()),
+                    dim(" queued"),
+                ]));
                 if t.total_bytes > 0 {
                     // Include in-flight bytes: `done_bytes` only moves on GroupDone
                     // (a whole file), so the overall bar used to sit still for the
                     // entire duration of one file and jump when it landed.
                     let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
                     let shown = (t.done_bytes + in_flight).min(t.total_bytes);
-                    v.push(Line::raw(bar_line("overall", shown, t.total_bytes, 34)));
+                    v.push(Line::styled(
+                        bar_line("overall", shown, t.total_bytes, 34),
+                        Style::default().fg(Color::Cyan),
+                    ));
                 }
                 for f in t.files.iter().take(8) {
                     let name = shorten(&f.name, 42);
@@ -2379,7 +2409,10 @@ fn task_lines(state: &UiState) -> Vec<Line<'_>> {
                         Color::Yellow,
                     ),
                 };
-                v.push(Line::styled(text, Style::default().fg(color)));
+                v.push(Line::styled(
+                    text,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
             }
             if state.busy && state.task_handle.is_some() {
                 v.push(Line::styled(
@@ -2549,42 +2582,51 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
         );
     } else if let Some(draft) = state.install.as_ref() {
         let mut modal_lines: Vec<Line> = vec![
-            Line::raw(if draft.edit_target {
-                "Where should the game be installed?"
-            } else {
-                "Install a new game"
-            }),
+            Line::styled(
+                if draft.edit_target {
+                    "Where should the game be installed?"
+                } else {
+                    "Install a new game"
+                },
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Line::raw(""),
-            Line::raw(format!(
-                "  game    [w] wuwa  [p] pgr                → {}",
-                if matches!(draft.game, Game::WuWa) {
+            Line::from(vec![
+                Span::raw("  game    [w] wuwa  [p] pgr                → "),
+                accent(if matches!(draft.game, Game::WuWa) {
                     "wuwa"
                 } else {
                     "pgr"
-                }
-            )),
-            Line::raw(format!(
-                "  server  [c] cn  [b] bilibili  [g] global  → {}",
-                draft.server
-            )),
-            Line::raw(if draft.game.uses_quality_tiers() {
-                format!(
-                    "  pack    [f] all / sd / hd / uhd          → {}",
-                    body_label(draft.body)
-                )
+                }),
+            ]),
+            Line::from(vec![
+                Span::raw("  server  [c] cn  [b] bilibili  [g] global  → "),
+                accent(draft.server.to_string()),
+            ]),
+            if draft.game.uses_quality_tiers() {
+                Line::from(vec![
+                    Span::raw("  pack    [f] all / sd / hd / uhd          → "),
+                    accent(body_label(draft.body)),
+                ])
             } else {
-                format!("  pack    n/a — {} has no quality packs", pretty_game(draft.game))
-            }),
-            Line::raw("  folder"),
-            Line::raw(if draft.edit_target {
+                Line::from(vec![dim(format!(
+                    "  pack    n/a — {} has no quality packs",
+                    pretty_game(draft.game)
+                ))])
+            },
+            Line::styled("  folder", Style::default().fg(Color::DarkGray)),
+            if draft.edit_target {
                 if draft.target.is_empty() {
-                    format!("    {}  (suggested)", draft.suggested)
+                    Line::from(vec![
+                        Span::raw("    "),
+                        dim(format!("{}  (suggested)", draft.suggested)),
+                    ])
                 } else {
-                    format!("    {}_", draft.target)
+                    Line::from(vec![Span::raw("    "), strong(format!("{}_", draft.target))])
                 }
             } else {
-                format!("    {}", draft.target)
-            }),
+                Line::from(vec![Span::raw("    "), strong(draft.target.clone())])
+            },
             Line::styled(
                 if draft.edit_target {
                     "    type a path · Enter continue · Esc stop typing"
@@ -2632,31 +2674,45 @@ fn status_box_lines(s: Option<&Result<GameStatus, String>>, busy: bool, quality:
     match s {
         Some(Ok(s)) => {
             let mut lines = vec![
-                Line::raw(format!("game:    {}", s.game)),
-                Line::raw(format!("server:  {}", s.server)),
-                Line::raw(format!("local:   {}", s.local_version.as_deref().unwrap_or("none"))),
-                Line::raw(format!("remote:  {}", s.remote_version)),
+                kv("game:    ", s.game.to_string()),
+                Line::from(vec![dim("server:  "), accent(s.server.to_string())]),
+                kv("local:   ", s.local_version.as_deref().unwrap_or("none")),
+                kv("remote:  ", s.remote_version.clone()),
             ];
             // PGR (Unity) takes no `-krqlv=` tier, so it gets no quality line.
             if s.game.uses_quality_tiers() {
-                lines.push(Line::raw(format!(
-                    "quality: {}",
-                    quality
-                        .map(|q| format!("{} ({})", q.as_arg(), q.label()))
-                        .unwrap_or_else(|| "not set".to_string())
-                )));
+                lines.push(Line::from(vec![
+                    dim("quality: "),
+                    strong(
+                        quality
+                            .map(|q| format!("{} ({})", q.as_arg(), q.label()))
+                            .unwrap_or_else(|| "not set".to_string()),
+                    ),
+                ]));
             }
             lines.push(if busy {
-                Line::styled("updating…", Style::default().fg(Color::Yellow))
+                Line::styled(
+                    "updating…",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )
             } else if s.update_available {
-                Line::styled("UPDATE AVAILABLE", Style::default().fg(Color::Yellow))
+                Line::styled(
+                    "UPDATE AVAILABLE",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )
             } else {
-                Line::styled("up to date", Style::default().fg(Color::Green))
+                Line::styled(
+                    "up to date",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                )
             });
             lines
         }
-        Some(Err(e)) => vec![Line::styled(format!("error: {e}"), Style::default().fg(Color::Red))],
-        None => vec![Line::raw("loading...")],
+        Some(Err(e)) => vec![Line::styled(
+            format!("error: {e}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )],
+        None => vec![Line::styled("loading…", Style::default().fg(Color::DarkGray))],
     }
 }
 
