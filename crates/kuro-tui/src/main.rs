@@ -69,18 +69,28 @@ fn debug_log(msg: impl AsRef<str>) {
 /// correct on the machine it was written on, and this is the path every bare
 /// `kuro play` / `kuro sync` falls back to.
 fn default_folder() -> String {
-    let steam = detect_steam();
-    match &steam {
-        Some(info) => default_game_dir(info, Game::WuWa).to_string_lossy().into_owned(),
-        None => std::env::var("HOME")
-            .map(|home| {
-                PathBuf::from(home)
-                    .join("Games/Wuthering Waves")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_default(),
+    default_folder_for(Game::WuWa)
+}
+
+/// The default install folder for either title. Used for the blank games list,
+/// which offers both games instead of one unexplained error row.
+fn default_folder_for(game: Game) -> String {
+    if let Some(info) = detect_steam() {
+        return default_game_dir(&info, game).to_string_lossy().into_owned();
     }
+    let name = match game {
+        Game::WuWa => "Wuthering Waves",
+        Game::Pgr => "Punishing Gray Raven",
+    };
+    std::env::var("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join("Games")
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default()
 }
 
 enum UiEvent {
@@ -265,12 +275,44 @@ async fn stop_task(state: &mut UiState) {
 /// The folder a new install should default to: the blank row the TUI opened
 /// with, or the standard game folder when the cursor is on a real install.
 fn install_target_for(state: &UiState) -> String {
+    if let Some(path) = state.paths.get(state.active) {
+        if !std::path::Path::new(path).join("launcherDownloadConfig.json").is_file() {
+            return path.clone();
+        }
+    }
+    default_folder_for(active_game(state))
+}
+
+/// A row with no launcher config is an install slot, not a broken game.
+fn is_blank_install(state: &UiState, idx: usize) -> bool {
     state
         .paths
-        .get(state.active)
-        .filter(|p| !std::path::Path::new(p).join("launcherDownloadConfig.json").is_file())
-        .cloned()
-        .unwrap_or_else(default_folder)
+        .get(idx)
+        .is_some_and(|p| !std::path::Path::new(p).join("launcherDownloadConfig.json").is_file())
+}
+
+/// A blank PGR slot should open the install dialog on PGR (Global, as the
+/// previous install used), not silently offer WuWa.
+fn draft_for_active(state: &UiState) -> InstallDraft {
+    let mut draft = InstallDraft::new(install_target_for(state));
+    let path = state.paths.get(state.active).map(String::as_str).unwrap_or("");
+    let lower = path.to_ascii_lowercase();
+    let pgr = if is_blank_install(state, state.active) {
+        lower.contains("punishing") || lower.contains("gray raven") || lower.contains("pgr")
+    } else {
+        active_game(state) == Game::Pgr
+    };
+    if pgr {
+        draft.game = Game::Pgr;
+        draft.server = Server::Global;
+        draft.body = BodyChoice::All;
+    }
+    draft
+}
+
+/// `open` fails with this when the folder has no launcher config yet.
+fn is_not_installed(err: &str) -> bool {
+    err.contains("launcher config not found") || err.contains("NoLocalConfig")
 }
 
 /// Add an install to the games list, returning its index. Reinstalling into
@@ -383,7 +425,8 @@ async fn main() -> std::io::Result<()> {
         paths = auto_detect_games();
     }
     if paths.is_empty() {
-        paths.push(default_folder());
+        paths.push(default_folder_for(Game::WuWa));
+        paths.push(default_folder_for(Game::Pgr));
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UiEvent>(64);
@@ -1380,7 +1423,9 @@ async fn run(
                             state.active = (state.active + 1).min(state.paths.len().saturating_sub(1));
                         }
                         KeyCode::Enter => {
-                            if let Some(path) = state.paths.get(state.active).cloned() {
+                            if is_blank_install(&state, state.active) {
+                                state.install = Some(draft_for_active(&state));
+                            } else if let Some(path) = state.paths.get(state.active).cloned() {
                                 state.screen = Screen::Detail;
                                 if state.statuses.get(state.active).and_then(|s| s.as_ref()).is_none() {
                                     spawn_status(&tx, &path, state.active);
@@ -1389,7 +1434,7 @@ async fn run(
                         }
                         KeyCode::Char('i') => {
                             if !state.busy {
-                                state.install = Some(InstallDraft::new(install_target_for(&state)));
+                                state.install = Some(draft_for_active(&state));
                             }
                         }
                         KeyCode::Char('r') => {
@@ -1433,7 +1478,7 @@ async fn run(
                     }
                     KeyCode::Char('i') => {
                         if !state.busy {
-                            state.install = Some(InstallDraft::new(install_target_for(&state)));
+                            state.install = Some(draft_for_active(&state));
                         }
                     }
                     KeyCode::Tab => {
@@ -1541,7 +1586,9 @@ async fn run(
                         }
                         Err(e) => format!("status error: {}", friendly_error(e)),
                     };
-                    if s.is_err() {
+                    if matches!(&s, Err(e) if is_not_installed(e)) {
+                        debug_log("status: not installed");
+                    } else if s.is_err() {
                         notify(&mut state, line);
                     } else {
                         debug_log(&line);
@@ -2144,6 +2191,13 @@ fn ui_games(f: &mut Frame, state: &UiState) {
                         Style::default().fg(Color::Green)
                     },
                 ),
+                Some(Err(e)) if is_not_installed(e) => (
+                    "—".into(),
+                    "—".into(),
+                    "—".into(),
+                    "not installed",
+                    Style::default().fg(Color::Yellow),
+                ),
                 Some(Err(_)) => (
                     "?".into(),
                     "?".into(),
@@ -2671,9 +2725,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        body_choice, checkout_possible, cli_bar, debug_log, default_folder, init_debug, install_target_for,
-        parse_quality_arg, remember_install_path, split_play_args, ui, CliProgress, InstallDraft, QualityDraft, Screen,
-        UiState,
+        body_choice, checkout_possible, cli_bar, debug_log, default_folder, draft_for_active, init_debug,
+        install_target_for, parse_quality_arg, remember_install_path, split_play_args, ui, CliProgress, InstallDraft,
+        QualityDraft, Screen, UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, ProgressEvent, Quality, Server};
 
@@ -3000,6 +3054,34 @@ mod tests {
         assert!(!checkout_possible(Game::WuWa, Some(Server::Global)));
         assert!(!checkout_possible(Game::Pgr, Some(Server::Cn)));
         assert!(!checkout_possible(Game::Pgr, None));
+    }
+
+    #[test]
+    fn blank_rows_render_as_not_installed() {
+        let err = "local launcher config not found at /tmp/x; run with --path or set up the game first";
+        let state = UiState {
+            paths: vec!["/tmp/blank-wuwa".into(), "/tmp/blank-pgr".into()],
+            statuses: vec![Some(Err(err.into())), Some(Err(err.into()))],
+            quality_sel: vec![None, None],
+            ..Default::default()
+        };
+        let out = render_to_string(&state, 100, 30);
+        assert_eq!(out.matches("not installed").count(), 2, "{out}");
+        assert!(!out.contains("status error"), "{out}");
+    }
+
+    #[test]
+    fn a_pgr_blank_row_opens_a_pgr_install() {
+        let state = UiState {
+            paths: vec!["/tmp/Punishing Gray Raven".into()],
+            statuses: vec![None],
+            quality_sel: vec![None],
+            ..Default::default()
+        };
+        let draft = draft_for_active(&state);
+        assert_eq!(draft.game, Game::Pgr);
+        assert_eq!(draft.server, Server::Global);
+        assert_eq!(draft.suggested, "/tmp/Punishing Gray Raven");
     }
 
     /// The CLI bar is one running total, not a per-file row. Verify fills it

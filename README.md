@@ -141,6 +141,10 @@ index is the current base version (3.7.1 today), so follow a fresh install with
 `kuro update` to reach 3.8.0. In the TUI, `i` defaults its target to the blank
 row kuro opened with; the finished install becomes that row.
 
+With nothing installed, the TUI lists both Wuthering Waves and Punishing: Gray
+Raven as `not installed`; `Enter` or `i` on either row opens the install prompt
+for that game (PGR defaults to the Global server).
+
 A pack manifest has exactly one path rule: a tier owns
 `Client/Content/<TIER>/`, and any pack may write the target version's
 `Client/Saved/Resources/<version>/`. That is the official rule, and the version
