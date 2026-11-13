@@ -69,7 +69,7 @@ pub struct PatchConfig {
 }
 
 /// The patch manifest for one source version (krpdiff groups + fallbacks).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchIndex {
     /// Full-file fallbacks; entries whose `dest` ends in `.krpdiff` are the

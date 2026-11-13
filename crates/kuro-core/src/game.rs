@@ -1260,30 +1260,17 @@ impl GameManager {
         let config = self.pack_config().await?;
         let tier = match self.body {
             BodyChoice::Only(q) | BodyChoice::Prefer(q) => q,
-            BodyChoice::All => quality::selected(&self.game_folder)
-                .or_else(|| quality::info(&self.game_folder).installed().first().copied())
-                .unwrap_or(Quality::Hd),
+            BodyChoice::All => Quality::Hd,
         };
-        let bundle = config
-            .bundles
-            .get(tier.as_arg())
-            .ok_or_else(|| Error::Patch(format!("the pack document has no {} bundle", tier.as_arg())))?;
         let bases: Vec<String> = ApiClient::pack_cdn_candidates(&config)?
             .iter()
             .map(|n| n.url.clone())
             .collect();
         let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
-        if base_refs.is_empty() {
-            return Err(Error::NoCdnNode);
-        }
 
-        let mut full = PatchIndex {
-            resource: Vec::new(),
-            delete_files: Vec::new(),
-            group_infos: Vec::new(),
-            apply_types: Vec::new(),
-        };
-        for name in &bundle.resource_packs {
+        let tier_key = tier.pack_key();
+        let mut full = PatchIndex::default();
+        for name in ["common", tier_key.as_str()] {
             let entry = config
                 .resource_packs
                 .get(name)
@@ -1303,8 +1290,10 @@ impl GameManager {
             .resource_packs
             .get("common")
             .map(|e| e.version.clone())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| Error::Patch("the pack document has no common version".to_string()))?;
+            .unwrap_or_default();
+        if version.is_empty() {
+            return Err(Error::Patch("the pack document has no common version".to_string()));
+        }
 
         let report = self
             .sync_inner_with_progress(Arc::new(full), &base_refs, "", tx)
