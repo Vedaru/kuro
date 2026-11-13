@@ -110,8 +110,11 @@ struct TaskUi {
     finished: Option<TaskEnd>,
     total_bytes: u64,
     done_bytes: u64,
-    /// In-flight files (parallel downloads), each with its own bar.
+    /// Every file this task has reported, each with its own bar.
     files: Vec<FileState>,
+    file_pos: std::collections::HashMap<String, usize>,
+    /// First file row shown in the files section.
+    scroll: usize,
     /// Present only for tasks that are safe to stop.
     handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -129,6 +132,7 @@ struct FileState {
     name: String,
     done: u64,
     total: u64,
+    finished: bool,
 }
 
 #[derive(Default)]
@@ -265,6 +269,22 @@ fn any_running(state: &UiState) -> bool {
         .tasks
         .iter()
         .any(|t| t.as_ref().is_some_and(|t| t.finished.is_none()))
+}
+
+fn scroll_files(state: &mut UiState, delta: isize) {
+    let Some(t) = state.tasks.get_mut(state.active).and_then(Option::as_mut) else {
+        return;
+    };
+    let last = t.files.len().saturating_sub(1);
+    t.scroll = if delta <= -1000 {
+        0
+    } else if delta >= 1000 {
+        last
+    } else if delta < 0 {
+        t.scroll.saturating_sub(delta.unsigned_abs())
+    } else {
+        (t.scroll + delta as usize).min(last)
+    };
 }
 
 fn start_task(
@@ -1466,6 +1486,10 @@ async fn run(
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
+                    KeyCode::PageUp => scroll_files(&mut state, -10),
+                    KeyCode::PageDown => scroll_files(&mut state, 10),
+                    KeyCode::Home => scroll_files(&mut state, isize::MIN),
+                    KeyCode::End => scroll_files(&mut state, isize::MAX),
                     KeyCode::Up | KeyCode::Char('k') => {
                         state.active = state.active.saturating_sub(1);
                     }
@@ -1614,24 +1638,45 @@ async fn run(
                         ProgressEvent::SetTotal { bytes } => {
                             t.total_bytes = bytes;
                             t.files.clear(); // repair phase starts; drop the verify bar
+                            t.file_pos.clear();
+                            t.scroll = 0;
                         }
                         ProgressEvent::SetQueued { count } => t.queued = count,
                         ProgressEvent::GroupStart { name: _ } => t.queued += 1,
-                        ProgressEvent::FileProgress { name, bytes, total } => {
-                            match t.files.iter_mut().find(|f| f.name == name) {
-                                Some(f) => {
-                                    f.done = bytes;
-                                    f.total = total;
-                                }
-                                None => t.files.push(FileState {
+                        ProgressEvent::FileProgress { name, bytes, total } => match t.file_pos.get(&name).copied() {
+                            Some(i) => {
+                                let f = &mut t.files[i];
+                                f.done = bytes;
+                                f.total = total;
+                            }
+                            None => {
+                                t.file_pos.insert(name.clone(), t.files.len());
+                                t.files.push(FileState {
                                     name,
                                     done: bytes,
                                     total,
-                                }),
+                                    finished: false,
+                                });
                             }
-                        }
+                        },
                         ProgressEvent::GroupDone { name, bytes } => {
-                            t.files.retain(|f| f.name != name);
+                            match t.file_pos.get(&name).copied() {
+                                Some(i) => {
+                                    let f = &mut t.files[i];
+                                    f.done = bytes;
+                                    f.total = bytes;
+                                    f.finished = true;
+                                }
+                                None => {
+                                    t.file_pos.insert(name.clone(), t.files.len());
+                                    t.files.push(FileState {
+                                        name,
+                                        done: bytes,
+                                        total: bytes,
+                                        finished: true,
+                                    });
+                                }
+                            }
                             t.done += 1;
                             t.done_bytes += bytes;
                             t.queued = t.queued.saturating_sub(1);
@@ -2155,8 +2200,9 @@ fn ui_games(f: &mut Frame, state: &UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5), // games table
-            Constraint::Length(if active { 6 } else { 0 }),
+            Constraint::Length(5),                          // games
+            Constraint::Length(if active { 6 } else { 0 }), // activity
+            Constraint::Min(if active { 3 } else { 0 }),    // every file
             Constraint::Length(notice_h),
             Constraint::Length(1), // footer
         ])
@@ -2320,13 +2366,13 @@ fn ui_games(f: &mut Frame, state: &UiState) {
     f.render_stateful_widget(table, chunks[0], &mut ts);
 
     if active {
-        let stoppable = task.is_some_and(|t| t.handle.is_some());
-        render_task(f, task, stoppable, chunks[1], false);
+        render_task(f, task, chunks[1]);
+        render_files(f, task, chunks[2]);
     }
     if notice_h > 0 {
-        render_notice(f, state, chunks[2]);
+        render_notice(f, state, chunks[3]);
     }
-    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[3]);
+    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[4]);
 }
 
 fn folder_name(path: &str) -> String {
@@ -2351,7 +2397,7 @@ fn short_game_name(game: Game) -> &'static str {
     }
 }
 
-fn task_lines(task: Option<&TaskUi>, stoppable: bool) -> Vec<Line<'_>> {
+fn task_lines(task: Option<&TaskUi>) -> Vec<Line<'_>> {
     let Some(t) = task else {
         return vec![Line::raw("idle")];
     };
@@ -2390,21 +2436,11 @@ fn task_lines(task: Option<&TaskUi>, stoppable: bool) -> Vec<Line<'_>> {
         // Include in-flight bytes: `done_bytes` only moves on GroupDone
         // (a whole file), so the overall bar used to sit still for the
         // entire duration of one file and jump when it landed.
-        let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
+        let in_flight: u64 = t.files.iter().filter(|f| !f.finished).map(|f| f.done).sum();
         let shown = (t.done_bytes + in_flight).min(t.total_bytes);
         v.push(Line::styled(
             bar_line("overall", shown, t.total_bytes, 34),
             Style::default().fg(Color::Cyan),
-        ));
-    }
-    for f in t.files.iter().take(8) {
-        let name = shorten(&f.name, 42);
-        v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
-    }
-    if stoppable && t.finished.is_none() {
-        v.push(Line::styled(
-            "Ctrl+C stops this task",
-            Style::default().fg(Color::DarkGray),
         ));
     }
     v
@@ -2412,7 +2448,7 @@ fn task_lines(task: Option<&TaskUi>, stoppable: bool) -> Vec<Line<'_>> {
 
 fn task_percent(t: &TaskUi) -> String {
     if t.total_bytes > 0 {
-        let inflight: u64 = t.files.iter().map(|f| f.done).sum();
+        let inflight: u64 = t.files.iter().filter(|f| !f.finished).map(|f| f.done).sum();
         let shown = (t.done_bytes + inflight).min(t.total_bytes);
         format!("{:.0}%", shown as f64 * 100.0 / t.total_bytes as f64)
     } else if t.done + t.queued > 0 {
@@ -2422,15 +2458,37 @@ fn task_percent(t: &TaskUi) -> String {
     }
 }
 
-fn render_task(f: &mut Frame, task: Option<&TaskUi>, stoppable: bool, area: ratatui::layout::Rect, focused: bool) {
+fn render_task(f: &mut Frame, task: Option<&TaskUi>, area: ratatui::layout::Rect) {
     f.render_widget(
-        Paragraph::new(task_lines(task, stoppable))
+        Paragraph::new(task_lines(task))
             .wrap(Wrap { trim: true })
-            .block(panel("activity").border_style(Style::default().fg(if focused {
-                Color::Cyan
-            } else {
-                Color::DarkGray
-            }))),
+            .block(panel("activity")),
+        area,
+    );
+}
+
+fn render_files(f: &mut Frame, task: Option<&TaskUi>, area: ratatui::layout::Rect) {
+    let Some(t) = task else {
+        return;
+    };
+    let visible = area.height.saturating_sub(2) as usize;
+    let offset = t.scroll.min(t.files.len().saturating_sub(visible));
+    let width = area.width.saturating_sub(8).clamp(24, 80) as usize;
+    let lines: Vec<Line> = t
+        .files
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .map(|f| {
+            let mark = if f.finished { "✔ " } else { "  " };
+            let name = shorten(&f.name, width.saturating_sub(24).max(16));
+            Line::raw(format!("{mark}{}", bar_line(&name, f.done, f.total, 24)))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(panel(format!("files ({})", t.files.len())))
+            .scroll((offset as u16, 0)),
         area,
     );
 }
@@ -2503,6 +2561,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
             help_line("Games", "↑↓ select · Enter play · i install"),
             help_line("Task", "s sync · d download · a apply · K kill"),
             help_line("Other", "Q quality · c server · r refresh"),
+            help_line("Files", "PgUp/PgDn scroll · Home/End"),
             help_line("Install", "↑↓ select · ←→ change · Enter"),
             help_line("Stop", "Ctrl+C task · q quit"),
             help_line("Shell", "update · pack · sync · --debug"),
@@ -2889,6 +2948,29 @@ mod tests {
         let out = render_to_string(&state, 100, 30);
         assert!(out.contains("activity"), "activity panel missing:\n{out}");
         assert!(out.contains("task: predownload"), "task line missing:\n{out}");
+    }
+
+    #[test]
+    fn files_section_lists_every_reported_file() {
+        let mut state = two_games();
+        state.tasks = vec![
+            Some(super::TaskUi {
+                kind: "install".into(),
+                files: (0..12)
+                    .map(|i| super::FileState {
+                        name: format!("file-{i}.pak"),
+                        done: 1,
+                        total: 2,
+                        finished: false,
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            None,
+        ];
+        let out = render_to_string(&state, 100, 40);
+        assert!(out.contains("files (12)"), "file count missing:\n{out}");
+        assert!(out.contains("file-11.pak"), "last file row missing:\n{out}");
     }
 
     #[test]
