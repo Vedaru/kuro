@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 use crate::game::ProgressEvent;
 use kuro_api::retry;
@@ -34,10 +34,9 @@ use kuro_api::{ChunkInfo, Error, Result};
 pub const CONCURRENCY: usize = 8;
 
 /// Ranges a single chunked file may have outstanding at once. Actual
-/// connections are capped by [`CONCURRENCY`]. Keeping one file to half the
-/// budget means it cannot take every slot before other files have queued;
-/// the fair budget then rotates any remaining contention.
-pub const CHUNK_CONCURRENCY: usize = CONCURRENCY / 2;
+/// connections are capped by [`CONCURRENCY`]; a file always holds one reserved
+/// slot and borrows spare slots for the rest, so more files do not sit at zero.
+pub const CHUNK_CONCURRENCY: usize = CONCURRENCY;
 
 /// Files the download loops keep in flight. The `JoinSet` still spawns a task
 /// per file, but a semaphore of this size gates how many run at once — enough
@@ -170,6 +169,64 @@ impl Budget {
             return None;
         }
         Some(Permit { fair })
+    }
+
+    fn try_acquire(&self) -> Option<Permit> {
+        let fair = self.0.clone()?;
+        let granted = {
+            let mut st = fair.state.lock().unwrap();
+            if st.available == 0 || !st.roster.is_empty() {
+                false
+            } else {
+                st.available -= 1;
+                true
+            }
+        };
+        granted.then_some(Permit { fair })
+    }
+
+    fn is_unlimited(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+/// A file's reserved slot. Extra ranges borrow spare budget permits; when none
+/// are free, chunks share this one so every active file keeps downloading.
+struct ConnGuard {
+    permit: Option<Permit>,
+    base: Option<Arc<Mutex<Option<Permit>>>>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        if let (Some(permit), Some(base)) = (self.permit.take(), self.base.as_ref()) {
+            *base.lock().unwrap() = Some(permit);
+            self.notify.notify_one();
+        }
+    }
+}
+
+async fn file_conn(budget: &Budget, base: &Arc<Mutex<Option<Permit>>>, notify: &Arc<Notify>) -> Option<ConnGuard> {
+    if let Some(permit) = budget.try_acquire() {
+        return Some(ConnGuard {
+            permit: Some(permit),
+            base: None,
+            notify: notify.clone(),
+        });
+    }
+    if budget.is_unlimited() {
+        return None;
+    }
+    loop {
+        if let Some(permit) = base.lock().unwrap().take() {
+            return Some(ConnGuard {
+                permit: Some(permit),
+                base: Some(base.clone()),
+                notify: notify.clone(),
+            });
+        }
+        notify.notified().await;
     }
 }
 
@@ -404,6 +461,8 @@ pub async fn download_chunked(
     }
     let last_end = chunks.iter().map(|c| c.end).max().unwrap_or(0);
     let total = last_end + 1;
+    let base = Arc::new(Mutex::new(budget.acquire(name).await));
+    let notify = Arc::new(Notify::new());
 
     if let Some(tx) = progress {
         let _ = tx
@@ -424,7 +483,6 @@ pub async fn download_chunked(
 
     let urls = Arc::new(urls.to_vec());
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
-    let key = budget_key(name);
     // Bytes written per chunk, index-stable so each task owns one slot and a
     // retry can reset its own without racing the others.
     let written: Arc<Vec<AtomicU64>> = Arc::new((0..chunks.len()).map(|_| AtomicU64::new(0)).collect());
@@ -467,6 +525,8 @@ pub async fn download_chunked(
         let sem = sem.clone();
         let written = written.clone();
         let budget = budget.clone();
+        let base = base.clone();
+        let notify = notify.clone();
         handles.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let range = format!("bytes={}-{}", chunk.start, chunk.end);
@@ -479,6 +539,8 @@ pub async fn download_chunked(
                 let client = client.clone();
                 let dest = dest.clone();
                 let budget = budget.clone();
+                let base = base.clone();
+                let notify = notify.clone();
                 let counter = &written[idx];
                 Box::pin(async move {
                     // Re-fetch overwrites the same region, so count from zero
@@ -487,7 +549,7 @@ pub async fn download_chunked(
                     // One slot per in-flight range, from the shared pool: a
                     // file's ranges compete with every other file's rather than
                     // each file reserving its own.
-                    let _permit = budget.acquire_key(key).await;
+                    let _conn = file_conn(&budget, &base, &notify).await;
                     let resp = client
                         .get(&url)
                         .header(reqwest::header::RANGE, range)
