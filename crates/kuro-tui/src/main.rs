@@ -276,15 +276,7 @@ fn scroll_files(state: &mut UiState, delta: isize) {
         return;
     };
     let last = t.files.len().saturating_sub(1);
-    t.scroll = if delta <= -1000 {
-        0
-    } else if delta >= 1000 {
-        last
-    } else if delta < 0 {
-        t.scroll.saturating_sub(delta.unsigned_abs())
-    } else {
-        (t.scroll + delta as usize).min(last)
-    };
+    t.scroll = t.scroll.saturating_add_signed(delta).min(last);
 }
 
 fn start_task(
