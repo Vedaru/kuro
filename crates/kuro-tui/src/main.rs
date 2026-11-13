@@ -8,10 +8,10 @@ use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
@@ -138,7 +138,7 @@ struct FileState {
 #[derive(Default)]
 struct UiState {
     /// Last user-facing message, shown in the task panel when it is idle.
-    notice: Option<String>,
+    notice: Option<Notice>,
     /// One task slot per game, so WuWa and PGR can install at the same time.
     tasks: Vec<Option<TaskUi>>,
     /// Game folders in the manager; ←/→ switches between them.
@@ -154,6 +154,11 @@ struct UiState {
     quality_sel: Vec<Option<Quality>>,
     /// Open quality-preset modal.
     quality_modal: Option<QualityDraft>,
+}
+
+struct Notice {
+    text: String,
+    at: Instant,
 }
 
 /// In-progress quality selection: what to write, plus the install's packs.
@@ -253,7 +258,10 @@ fn body_label(body: BodyChoice) -> String {
 fn notify(state: &mut UiState, msg: impl Into<String>) {
     let msg = msg.into();
     debug_log(&msg);
-    state.notice = Some(msg);
+    state.notice = Some(Notice {
+        text: msg,
+        at: Instant::now(),
+    });
 }
 
 fn game_task(state: &UiState, idx: usize) -> Option<&TaskUi> {
@@ -2126,6 +2134,7 @@ fn ui(f: &mut Frame, state: &UiState) {
     }
     ui_games(f, state);
     render_overlays(f, state);
+    render_notice(f, state);
 }
 
 /// The designed floor. Below this, name the dimensions instead of drawing a
@@ -2188,7 +2197,6 @@ fn help_line(label: &'static str, text: &'static str) -> Line<'static> {
 fn ui_games(f: &mut Frame, state: &UiState) {
     let task = game_task(state, state.active);
     let active = task.is_some();
-    let notice_h = u16::from(!active && state.notice.is_some());
     let footer_line = footer(state, f.area().width);
     let footer_h = (footer_line.width() as u16).div_ceil(f.area().width).clamp(1, 3);
     let chunks = Layout::default()
@@ -2197,7 +2205,6 @@ fn ui_games(f: &mut Frame, state: &UiState) {
             Constraint::Length(5),                          // games
             Constraint::Length(if active { 6 } else { 0 }), // activity
             Constraint::Min(if active { 3 } else { 0 }),    // every file
-            Constraint::Length(notice_h),
             Constraint::Length(footer_h),
         ])
         .split(f.area());
@@ -2363,10 +2370,7 @@ fn ui_games(f: &mut Frame, state: &UiState) {
         render_task(f, task, chunks[1]);
         render_files(f, task, chunks[2]);
     }
-    if notice_h > 0 {
-        render_notice(f, state, chunks[3]);
-    }
-    f.render_widget(Paragraph::new(footer_line).wrap(Wrap { trim: true }), chunks[4]);
+    f.render_widget(Paragraph::new(footer_line).wrap(Wrap { trim: true }), chunks[3]);
 }
 
 fn folder_name(path: &str) -> String {
@@ -2487,13 +2491,32 @@ fn render_files(f: &mut Frame, task: Option<&TaskUi>, area: ratatui::layout::Rec
     );
 }
 
-fn render_notice(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect) {
-    if let Some(msg) = &state.notice {
-        f.render_widget(
-            Paragraph::new(Line::styled(format!(" {msg}"), Style::default().fg(Color::DarkGray))),
-            area,
-        );
+fn render_notice(f: &mut Frame, state: &UiState) {
+    let Some(note) = &state.notice else {
+        return;
+    };
+    if note.at.elapsed() >= Duration::from_secs(4) {
+        return;
     }
+    let text_w = f.area().width.saturating_sub(6).clamp(20, 64);
+    let rows = (note.text.chars().count() as u16)
+        .div_ceil(text_w)
+        .saturating_add(3)
+        .clamp(3, 8);
+    let area = Rect {
+        x: f.area().width.saturating_sub(text_w + 4),
+        y: 1,
+        width: text_w + 2,
+        height: rows,
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(note.text.clone())
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Gray))
+            .block(panel("notice")),
+        area,
+    );
 }
 
 fn footer(state: &UiState, width: u16) -> Line<'static> {
@@ -2788,7 +2811,10 @@ mod tests {
         let info = quality::info(dir.path());
         let mut state = UiState {
             paths: vec![dir.path().display().to_string()],
-            notice: Some("status: Wuthering Waves (cn) — up to date".into()),
+            notice: Some(super::Notice {
+                text: "status: Wuthering Waves (cn) — up to date".into(),
+                at: std::time::Instant::now(),
+            }),
             statuses: vec![None],
             quality_modal: Some(QualityDraft {
                 game: Game::WuWa,
