@@ -765,7 +765,15 @@ impl GameManager {
 
         // ---- migration phase: verify everything is staged, then swap ----
         let mut staged_outputs: Vec<(String, PathBuf)> = Vec::new();
+        let skipped: HashSet<&str> = outcomes
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, GroupOutcome::Skipped))
+            .map(|(name, _)| name.as_str())
+            .collect();
         for group in &patch_index.group_infos {
+            if skipped.contains(group.dest.as_str()) {
+                continue; // already at target; merge intentionally wrote nothing
+            }
             for dst in &group.dst_files {
                 if complete_dests.contains(&dst.dest) {
                     continue; // handled in the complete-files pass
