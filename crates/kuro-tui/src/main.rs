@@ -1,7 +1,6 @@
 //! `kuro` — ratatui terminal UI.
 //!
-//! Two screens: a games list, then a per-game detail view. `Esc` backs up one
-//! level, so exactly one game is ever on screen. Keys on the detail screen:
+//! One page: the games list, the selected game's task, and the footer. Keys:
 //! `r` refresh · `p` play · `d` update · `a` apply · `s` sync · `c` checkout
 //! CN<->bilibili · `Q` quality preset · `q` quit.
 
@@ -132,27 +131,8 @@ struct FileState {
     total: u64,
 }
 
-/// Which section the Tab-focus is on. The focused panel gets the accent border.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    #[default]
-    Status,
-    Task,
-}
-
-/// The drill-down stack: the games list is the root, a game detail is one
-/// level deep. `Esc` pops, so the other games are never rendered beside the
-/// active one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum Screen {
-    #[default]
-    Games,
-    Detail,
-}
-
 #[derive(Default)]
 struct UiState {
-    screen: Screen,
     /// Last user-facing message, shown in the task panel when it is idle.
     notice: Option<String>,
     /// One task slot per game, so WuWa and PGR can install at the same time.
@@ -160,8 +140,6 @@ struct UiState {
     /// Game folders in the manager; ←/→ switches between them.
     paths: Vec<String>,
     active: usize,
-    /// Focused section (Tab cycles).
-    focus: Focus,
     /// Open install modal (game + server selection).
     install: Option<InstallDraft>,
     /// Help overlay open.
@@ -1362,7 +1340,6 @@ async fn run(
                         if running(&state, state.active) {
                             notify(&mut state, "this game already has a task");
                         } else {
-                            state.focus = Focus::Task;
                             notify(
                                 &mut state,
                                 format!("installing {} paks — the game must be closed", tier.as_arg()),
@@ -1382,7 +1359,6 @@ async fn run(
                         if running(&state, state.active) {
                             notify(&mut state, "this game already has a task");
                         } else {
-                            state.focus = Focus::Task;
                             notify(
                                 &mut state,
                                 format!(
@@ -1487,59 +1463,32 @@ async fn run(
                     continue;
                 }
 
-                if state.screen == Screen::Games {
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            state.active = state.active.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            state.active = (state.active + 1).min(state.paths.len().saturating_sub(1));
-                        }
-                        KeyCode::Enter => {
-                            if is_blank_install(&state, state.active) {
-                                if running(&state, state.active) {
-                                    notify(&mut state, "this game already has a task");
-                                } else {
-                                    state.install = Some(draft_for_active(&state));
-                                }
-                            } else if let Some(path) = state.paths.get(state.active).cloned() {
-                                state.screen = Screen::Detail;
-                                if state.statuses.get(state.active).and_then(|s| s.as_ref()).is_none() {
-                                    spawn_status(&tx, &path, state.active);
-                                }
-                            }
-                        }
-                        KeyCode::Char('i') => {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.active = state.active.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.active = (state.active + 1).min(state.paths.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        if is_blank_install(&state, state.active) {
                             if running(&state, state.active) {
                                 notify(&mut state, "this game already has a task");
                             } else {
                                 state.install = Some(draft_for_active(&state));
                             }
+                        } else if !running(&state, state.active) {
+                            play(&mut state, &path);
                         }
-                        KeyCode::Char('r') => {
-                            for i in 0..state.paths.len() {
-                                spawn_status(&tx, &state.paths[i], i);
-                            }
-                            notify(&mut state, "refreshing all games…");
-                        }
-                        KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
-                        KeyCode::Esc if any_running(&state) => {}
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        _ => {}
                     }
-                    continue;
-                }
-
-                match key.code {
-                    KeyCode::Esc => state.screen = Screen::Games,
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('h') | KeyCode::Char('?') => state.show_help = true,
                     KeyCode::Char('p') => {
                         if !running(&state, state.active) {
                             play(&mut state, &path);
                         }
                     }
-                    KeyCode::Char('k') => kill_game(&mut state, &path),
+                    KeyCode::Char('K') => kill_game(&mut state, &path),
                     KeyCode::Char('Q') => {
                         if !running(&state, state.active) {
                             let game = active_game(&state);
@@ -1560,20 +1509,16 @@ async fn run(
                             state.install = Some(draft_for_active(&state));
                         }
                     }
-                    KeyCode::Tab => {
-                        state.focus = match state.focus {
-                            Focus::Status => Focus::Task,
-                            Focus::Task => Focus::Status,
-                        };
-                    }
                     KeyCode::Char('r') => {
-                        spawn_status(&tx, &path, state.active);
+                        for i in 0..state.paths.len() {
+                            spawn_status(&tx, &state.paths[i], i);
+                        }
+                        notify(&mut state, "refreshing all games…");
                     }
                     KeyCode::Char('d') => {
                         if running(&state, state.active) {
                             notify(&mut state, "this game already has a task");
                         } else {
-                            state.focus = Focus::Task;
                             let idx = state.active;
                             let handle = spawn_predownload(&tx, &path, idx);
                             start_task(&mut state, idx, "predownload", Some(path.clone()), Some(handle));
@@ -1583,7 +1528,6 @@ async fn run(
                         if running(&state, state.active) {
                             notify(&mut state, "this game already has a task");
                         } else {
-                            state.focus = Focus::Task;
                             let idx = state.active;
                             drop(spawn_simple(&tx, &path, TaskKind::Apply, idx));
                             start_task(&mut state, idx, "apply", Some(path.clone()), None);
@@ -1593,7 +1537,6 @@ async fn run(
                         if running(&state, state.active) {
                             notify(&mut state, "this game already has a task");
                         } else {
-                            state.focus = Focus::Task;
                             let idx = state.active;
                             let handle = spawn_simple(&tx, &path, TaskKind::Sync, idx);
                             start_task(&mut state, idx, "sync", Some(path.clone()), Some(handle));
@@ -1616,13 +1559,13 @@ async fn run(
                                     "no server to switch to — checkout is Wuthering Waves CN ↔ Bilibili only",
                                 );
                             } else {
-                                state.focus = Focus::Task;
                                 let idx = state.active;
                                 drop(spawn_simple(&tx, &path, TaskKind::Checkout, idx));
                                 start_task(&mut state, idx, "checkout (in place)", Some(path.clone()), None);
                             }
                         }
                     }
+                    KeyCode::Esc => {}
                     _ => {}
                 }
             }
@@ -1740,9 +1683,6 @@ async fn run(
                     // the notice and the refreshed row, then return to idle.
                     if let Some(slot) = state.tasks.get_mut(idx) {
                         *slot = None;
-                    }
-                    if state.focus == Focus::Task {
-                        state.focus = Focus::Status;
                     }
                 }
             }
@@ -2147,10 +2087,7 @@ fn ui(f: &mut Frame, state: &UiState) {
         draw_too_small(f);
         return;
     }
-    match state.screen {
-        Screen::Games => ui_games(f, state),
-        Screen::Detail => ui_detail(f, state),
-    }
+    ui_games(f, state);
     render_overlays(f, state);
 }
 
@@ -2194,10 +2131,6 @@ fn accent(text: impl Into<String>) -> Span<'static> {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )
 }
-fn kv(label: &'static str, value: impl Into<String>) -> Line<'static> {
-    Line::from(vec![dim(label), strong(value)])
-}
-
 /// One install-form row: arrow marker, dim label, highlighted value.
 fn form_row(active: bool, label: &'static str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
@@ -2214,8 +2147,7 @@ fn help_line(label: &'static str, text: &'static str) -> Line<'static> {
     ])
 }
 
-/// The root screen: one row per installed game, one game per row. The detail
-/// view is a separate screen, so two games are never compared side by side.
+/// The only screen: one row per game, the selected row's activity below it.
 fn ui_games(f: &mut Frame, state: &UiState) {
     let task = game_task(state, state.active);
     let active = task.is_some();
@@ -2419,71 +2351,6 @@ fn short_game_name(game: Game) -> &'static str {
     }
 }
 
-fn ui_detail(f: &mut Frame, state: &UiState) {
-    let task = game_task(state, state.active);
-    let active = task.is_some();
-    let running = task.is_some_and(|t| t.finished.is_none());
-    let notice_h = u16::from(!active && state.notice.is_some());
-    let folder = state.paths.get(state.active).map(String::as_str).unwrap_or("");
-    let status = state.statuses.get(state.active).and_then(|s| s.as_ref());
-    let game_name = status
-        .and_then(|s| s.as_ref().ok())
-        .map(|s| pretty_game(s.game).to_string())
-        .unwrap_or_else(|| folder_name(folder));
-    let server = status
-        .and_then(|s| s.as_ref().ok())
-        .map(|s| format!(" › {}", s.server))
-        .unwrap_or_default();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),                       // breadcrumb: kuro › games › <game> › <server>
-            Constraint::Length(9),                       // status: the open game only
-            Constraint::Min(if active { 3 } else { 0 }), // activity while a task runs
-            Constraint::Length(notice_h),
-            Constraint::Length(1), // footer
-        ])
-        .split(f.area());
-
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("kuro", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(" › games › ", Style::default().fg(Color::DarkGray)),
-            Span::styled(game_name, Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(server, Style::default().fg(Color::DarkGray)),
-            Span::styled("    Esc back", Style::default().fg(Color::DarkGray)),
-        ])),
-        chunks[0],
-    );
-
-    f.render_widget(
-        Paragraph::new(status_box_lines(
-            status,
-            running,
-            state.quality_sel.get(state.active).copied().flatten(),
-        ))
-        .wrap(Wrap { trim: true })
-        .block(
-            panel("status").border_style(Style::default().fg(if state.focus == Focus::Status {
-                Color::Cyan
-            } else {
-                Color::DarkGray
-            })),
-        ),
-        chunks[1],
-    );
-
-    if active {
-        let stoppable = task.is_some_and(|t| t.handle.is_some());
-        render_task(f, task, stoppable, chunks[2], state.focus == Focus::Task);
-    }
-    if notice_h > 0 {
-        render_notice(f, state, chunks[3]);
-    }
-    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[4]);
-}
-
 fn task_lines(task: Option<&TaskUi>, stoppable: bool) -> Vec<Line<'_>> {
     let Some(t) = task else {
         return vec![Line::raw("idle")];
@@ -2579,36 +2446,28 @@ fn render_notice(f: &mut Frame, state: &UiState, area: ratatui::layout::Rect) {
 
 fn footer(state: &UiState, width: u16) -> Line<'static> {
     let mut spans = Vec::new();
-    let keys: &[(&str, &str)] = match (state.screen, width < 84) {
-        (Screen::Games, false) => &[
+    let keys: &[(&str, &str)] = if width < 84 {
+        &[
             ("↑↓", "select"),
-            ("Enter", "open"),
+            ("Enter", "play"),
             ("i", "install"),
-            ("r", "refresh"),
+            ("s", "sync"),
             ("?", "help"),
             ("q", "quit"),
-        ],
-        (Screen::Games, true) => &[("↑↓", "select"), ("Enter", "open"), ("i", "install"), ("q", "quit")],
-        (Screen::Detail, false) => &[
-            ("Esc", "back"),
-            ("p", "play"),
-            ("d", "predownload"),
-            ("a", "apply"),
-            ("s", "sync"),
+        ]
+    } else {
+        &[
+            ("↑↓", "select"),
+            ("Enter", "play"),
             ("i", "install"),
+            ("s", "sync"),
+            ("d", "download"),
+            ("a", "apply"),
             ("Q", "quality"),
             ("r", "refresh"),
             ("?", "help"),
             ("q", "quit"),
-        ],
-        (Screen::Detail, true) => &[
-            ("Esc", "back"),
-            ("p", "play"),
-            ("d", "predownload"),
-            ("a", "apply"),
-            ("s", "sync"),
-            ("q", "quit"),
-        ],
+        ]
     };
     for (i, (key, label)) in keys.iter().enumerate() {
         if i > 0 {
@@ -2641,11 +2500,11 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
     if state.show_help {
         let help_lines: Vec<Line> = vec![
             Line::from(vec![accent("kuro"), dim(" — Kuro Games launcher")]),
-            help_line("Games", "↑↓ select · Enter open · i install"),
-            help_line("Game", "p play · d download · a apply · s sync"),
-            help_line("Other", "Q quality · c server · k kill · Tab focus"),
+            help_line("Games", "↑↓ select · Enter play · i install"),
+            help_line("Task", "s sync · d download · a apply · K kill"),
+            help_line("Other", "Q quality · c server · r refresh"),
             help_line("Install", "↑↓ select · ←→ change · Enter"),
-            help_line("Stop", "Ctrl+C task · Esc back"),
+            help_line("Stop", "Ctrl+C task · q quit"),
             help_line("Shell", "update · pack · sync · --debug"),
             Line::styled("h / ? / Esc to close", Style::default().fg(Color::DarkGray)),
         ];
@@ -2764,54 +2623,6 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
     }
 }
 
-/// Lines for a per-game status box. `busy` marks the active game's box while
-/// a task is running, so "up to date" never lies about in-flight work.
-fn status_box_lines(s: Option<&Result<GameStatus, String>>, busy: bool, quality: Option<Quality>) -> Vec<Line<'_>> {
-    match s {
-        Some(Ok(s)) => {
-            let mut lines = vec![
-                kv("game:    ", s.game.to_string()),
-                Line::from(vec![dim("server:  "), accent(s.server.to_string())]),
-                kv("local:   ", s.local_version.as_deref().unwrap_or("none")),
-                kv("remote:  ", s.remote_version.clone()),
-            ];
-            // PGR (Unity) takes no `-krqlv=` tier, so it gets no quality line.
-            if s.game.uses_quality_tiers() {
-                lines.push(Line::from(vec![
-                    dim("quality: "),
-                    strong(
-                        quality
-                            .map(|q| format!("{} ({})", q.as_arg(), q.label()))
-                            .unwrap_or_else(|| "not set".to_string()),
-                    ),
-                ]));
-            }
-            lines.push(if busy {
-                Line::styled(
-                    "updating…",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                )
-            } else if s.update_available {
-                Line::styled(
-                    "UPDATE AVAILABLE",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Line::styled(
-                    "up to date",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                )
-            });
-            lines
-        }
-        Some(Err(e)) => vec![Line::styled(
-            format!("error: {}", friendly_error(e)),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )],
-        None => vec![Line::styled("loading…", Style::default().fg(Color::DarkGray))],
-    }
-}
-
 /// A text progress bar line with a label.
 fn bar_line(label: &str, done: u64, total: u64, bar_w: usize) -> String {
     if total == 0 {
@@ -2879,7 +2690,7 @@ mod tests {
     use super::{
         body_choice, checkout_possible, cli_bar, debug_log, default_folder, draft_for_active, init_debug,
         install_target_for, parse_quality_arg, remember_install_path, split_play_args, ui, CliProgress, InstallDraft,
-        InstallRow, QualityDraft, Screen, UiState,
+        InstallRow, QualityDraft, UiState,
     };
     use kuro_core::{quality, BodyChoice, Game, GameStatus, ProgressEvent, Quality, Server};
 
@@ -2943,10 +2754,6 @@ mod tests {
         state.show_help = false;
         state.install = Some(InstallDraft::new("/tmp/kuro-demo".into()));
         println!("=== INSTALL PANEL ===\n{}", render_to_string(&state, 100, 34));
-
-        state.install = None;
-        state.screen = Screen::Detail;
-        println!("=== DETAIL ===\n{}", render_to_string(&state, 100, 34));
     }
 
     /// The help overlay is the densest panel; assert it fits (nothing clipped)
@@ -3020,33 +2827,6 @@ mod tests {
         );
     }
 
-    /// PGR takes no `-krqlv=` tier, so its box shows no quality line; WuWa's
-    /// still does. (PGR used to render a meaningless "quality: not set".)
-    #[test]
-    fn status_quality_line_is_wuwa_only() {
-        let state = |game, server| UiState {
-            screen: Screen::Detail,
-            paths: vec!["/games/x".into()],
-            statuses: vec![Some(Ok(GameStatus {
-                game,
-                server,
-                local_version: Some("1.0.0".into()),
-                remote_version: "1.0.0".into(),
-                update_available: false,
-            }))],
-            ..UiState::default()
-        };
-
-        let pgr = render_to_string(&state(Game::Pgr, Server::Global), 80, 30);
-        assert!(!pgr.contains("quality:"), "PGR box shows a quality line:\n{pgr}");
-
-        let wuwa = render_to_string(&state(Game::WuWa, Server::Cn), 80, 30);
-        assert!(
-            wuwa.contains("quality: not set"),
-            "WuWa box lost its quality line:\n{wuwa}"
-        );
-    }
-
     fn two_games() -> UiState {
         let status = |game, server, local: &str, remote: &str| {
             Some(Ok(GameStatus {
@@ -3085,38 +2865,14 @@ mod tests {
         assert!(!out.contains("log ("), "the log panel is still rendered:\n{out}");
     }
 
-    /// The detail screen renders exactly one game. The other game must not be
-    /// anywhere in the frame, which is the user's explicit requirement.
-    #[test]
-    fn detail_screen_shows_only_the_open_game() {
-        let mut state = two_games();
-        state.screen = Screen::Detail;
-        state.active = 0;
-        let out = render_to_string(&state, 100, 30);
-        assert!(out.contains("Wuthering Waves"), "open game missing:\n{out}");
-        assert!(
-            !out.contains("Punishing: Gray Raven"),
-            "another game is on the detail page:\n{out}"
-        );
-        assert!(out.contains("Esc back"), "detail page lost the back hint:\n{out}");
-        assert!(!out.contains("log ("), "the log panel is still rendered:\n{out}");
-    }
-
     /// The activity panel is a task view, not a permanent dashboard widget.
     #[test]
-    fn idle_screens_have_no_activity_panel() {
+    fn idle_page_has_no_activity_panel() {
         let state = two_games();
         let games = render_to_string(&state, 100, 30);
         assert!(
             !games.contains("activity"),
-            "idle games screen shows the activity panel:\n{games}"
-        );
-        let mut detail = two_games();
-        detail.screen = Screen::Detail;
-        let detail_out = render_to_string(&detail, 100, 30);
-        assert!(
-            !detail_out.contains("activity"),
-            "idle detail screen shows the activity panel:\n{detail_out}"
+            "idle page shows the activity panel:\n{games}"
         );
     }
 
