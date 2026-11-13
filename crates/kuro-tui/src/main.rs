@@ -2196,7 +2196,7 @@ fn ui_games(f: &mut Frame, state: &UiState) {
             Constraint::Length(if active { 6 } else { 0 }), // activity
             Constraint::Min(if active { 3 } else { 0 }),    // every file
             Constraint::Length(notice_h),
-            Constraint::Length(1), // footer
+            Constraint::Length(2), // footer, wraps when the keys do not fit
         ])
         .split(f.area());
 
@@ -2364,7 +2364,10 @@ fn ui_games(f: &mut Frame, state: &UiState) {
     if notice_h > 0 {
         render_notice(f, state, chunks[3]);
     }
-    f.render_widget(Paragraph::new(footer(state, f.area().width)), chunks[4]);
+    f.render_widget(
+        Paragraph::new(footer(state, f.area().width)).wrap(Wrap { trim: true }),
+        chunks[4],
+    );
 }
 
 fn folder_name(path: &str) -> String {
@@ -2963,6 +2966,16 @@ mod tests {
         let out = render_to_string(&state, 100, 40);
         assert!(out.contains("files (12)"), "file count missing:\n{out}");
         assert!(out.contains("file-11.pak"), "last file row missing:\n{out}");
+    }
+
+    #[test]
+    fn footer_wraps_instead_of_clipping() {
+        let out = render_to_string(&two_games(), 105, 20);
+        let footer: Vec<&str> = out.lines().rev().take(2).collect();
+        assert!(
+            footer.iter().any(|line| line.contains("quit")),
+            "footer lost its last key:\n{out}"
+        );
     }
 
     #[test]
