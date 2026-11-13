@@ -818,13 +818,6 @@ impl GameManager {
                 .filter(|r| !is_krpdiff(&r.dest))
                 .filter(|r| inc.join("resources").join(r.dest.trim_start_matches('/')).exists())
                 .count();
-        if let Some(tx) = &tx {
-            let _ = tx
-                .send(ProgressEvent::SetTotal {
-                    bytes: swap_total as u64,
-                })
-                .await;
-        }
         let mut swapped = 0usize;
         for (dest, staged) in &staged_outputs {
             let game_path = self.game_folder.join(normalise(dest));
@@ -870,15 +863,6 @@ impl GameManager {
                     .await;
             }
         }
-        if let Some(tx) = &tx {
-            let _ = tx
-                .send(ProgressEvent::GroupDone {
-                    name: "swap".into(),
-                    bytes: swap_total as u64,
-                })
-                .await;
-        }
-
         // ---- delete phase ----
         for f in &patch_index.delete_files {
             let game_path = self.game_folder.join(normalise(f));
@@ -1832,7 +1816,7 @@ pub(crate) fn part_already_target(game_folder: &Path, index: &PatchIndex) -> boo
             .resource
             .iter()
             .filter(|r| !is_krpdiff(&r.dest))
-            .all(|r| std::fs::metadata(game_folder.join(normalise(&r.dest))).is_ok_and(|m| m.len() == r.size))
+            .all(|r| file_matches(&game_folder.join(normalise(&r.dest)), r.size, &r.md5))
 }
 
 /// Walk `game_folder` and remove stale build artefacts — files the manifest

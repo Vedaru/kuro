@@ -238,13 +238,10 @@ pub fn plan_ready(game_folder: &Path) -> bool {
     std::fs::read_to_string(pack_plan_path(game_folder))
         .ok()
         .and_then(|data| serde_json::from_str::<PackPlanFile>(&data).ok())
-        .is_some_and(|plan| plan.parts.iter().all(|part| part_ready(game_folder, part)))
+        .is_some_and(|plan| plan.ready && plan.parts.iter().all(|part| part_ready(game_folder, part)))
 }
 
 fn part_ready(game_folder: &Path, part: &PackPlanPart) -> bool {
-    if part_already_target(game_folder, &part.index) {
-        return true;
-    }
     let stage = pack_staging_dir(game_folder, &part.name);
     part.index
         .resource
