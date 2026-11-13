@@ -233,6 +233,14 @@ fn pack_plan_path(game_folder: &Path) -> PathBuf {
     state::incremental_dir(game_folder).join("packs").join(PACK_PLAN_FILE)
 }
 
+/// True when a completed predownload is waiting to be applied.
+pub fn plan_ready(game_folder: &Path) -> bool {
+    std::fs::read_to_string(pack_plan_path(game_folder))
+        .ok()
+        .and_then(|data| serde_json::from_str::<PackPlanFile>(&data).ok())
+        .is_some_and(|plan| plan.ready)
+}
+
 fn tree_totals(root: &Path) -> (usize, u64) {
     let mut files = 0usize;
     let mut bytes = 0u64;

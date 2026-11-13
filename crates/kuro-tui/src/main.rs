@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, 
 use ratatui::{init, restore, Frame, Terminal};
 
 use kuro_core::{
-    default_game_dir, detect_game, detect_steam, launch, quality, BodyChoice, Game, GameManager, GameStatus,
+    default_game_dir, detect_game, detect_steam, launch, pack, quality, BodyChoice, Game, GameManager, GameStatus,
     ProgressEvent, Quality, QualityInfo, Server,
 };
 
@@ -151,6 +151,8 @@ struct UiState {
     show_help: bool,
     /// Cached status per game path.
     statuses: Vec<Option<Result<GameStatus, String>>>,
+    /// A completed pack download is staged for this path.
+    synced: Vec<bool>,
     /// Saved quality preset per game path (mirrors `.kuro_cache/quality.json`).
     quality_sel: Vec<Option<Quality>>,
     /// Open quality-preset modal.
@@ -325,6 +327,11 @@ async fn stop_task(state: &mut UiState, idx: usize) {
         task.finished = Some(TaskEnd::Stopped);
         task.files.clear();
     }
+    if let Some(path) = state.paths.get(idx) {
+        if let Some(synced) = state.synced.get_mut(idx) {
+            *synced = pack::plan_ready(std::path::Path::new(path));
+        }
+    }
     notify(
         state,
         "stopped — partial files are kept; the next run continues from them",
@@ -393,6 +400,7 @@ fn remember_install_path(state: &mut UiState, target: &str) -> usize {
     }
     state.paths.push(target.to_string());
     state.statuses.push(None);
+    state.synced.push(false);
     state.tasks.push(None);
     state.quality_sel.push(None);
     state.paths.len() - 1
@@ -1275,6 +1283,11 @@ async fn run(
         ..Default::default()
     };
     state.statuses = vec![None; state.paths.len()];
+    state.synced = state
+        .paths
+        .iter()
+        .map(|p| pack::plan_ready(std::path::Path::new(p)))
+        .collect();
     state.tasks = (0..state.paths.len()).map(|_| None).collect();
     state.quality_sel = state
         .paths
@@ -1625,6 +1638,11 @@ async fn run(
                     }
                     if idx < state.statuses.len() {
                         state.statuses[idx] = Some(s);
+                        if let Some(path) = state.paths.get(idx) {
+                            if let Some(synced) = state.synced.get_mut(idx) {
+                                *synced = pack::plan_ready(std::path::Path::new(path));
+                            }
+                        }
                     }
                 }
                 UiEvent::Progress(idx, p) => {
@@ -1725,6 +1743,9 @@ async fn run(
                     };
                     if let Some((i, path)) = refresh {
                         state.quality_sel[i] = quality::selected(std::path::Path::new(&path));
+                        if let Some(synced) = state.synced.get_mut(i) {
+                            *synced = pack::plan_ready(std::path::Path::new(&path));
+                        }
                         spawn_status(&tx, &path, i);
                     }
                     // A finished task is not an activity panel forever. Keep
@@ -2326,6 +2347,8 @@ fn ui_games(f: &mut Frame, state: &UiState) {
                     &t.kind
                 };
                 (format!("{label} {}", task_percent(t)), Style::default().fg(Color::Cyan))
+            } else if state.synced.get(i).copied().unwrap_or(false) {
+                ("synced — ready to apply".to_string(), Style::default().fg(Color::Cyan))
             } else {
                 (state_text.to_string(), state_style)
             };
