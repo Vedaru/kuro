@@ -1179,8 +1179,8 @@ impl GameManager {
         self.sync_base_with_progress(tx).await
     }
 
-    /// The pack-document sync: download `common` + the active tier's deltas
-    /// and leave them staged. Apply is a separate, explicit step.
+    /// The pack-document sync: download `common` + the active tier and leave
+    /// them staged. Apply is explicit.
     async fn sync_pack_document(&self, tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>) -> Result<SyncReport> {
         let tier = match self.body {
             BodyChoice::Only(q) | BodyChoice::Prefer(q) => q,
@@ -1199,7 +1199,7 @@ impl GameManager {
                 format!("up to date at {}", update.version)
             } else {
                 format!(
-                    "downloaded {} file(s), {:.1} GiB — press a to apply",
+                    "downloaded {} file(s), {:.1} GiB — apply with a",
                     report.downloaded,
                     report.downloaded_bytes as f64 / (1 << 30) as f64
                 )

@@ -419,7 +419,7 @@ fn friendly_error(raw: &str) -> String {
     if raw.contains("patchConfig entry") {
         "already on the latest version — nothing to do".to_string()
     } else if raw.contains("run predownload first") || raw.contains("incremental_download") {
-        "no downloaded update found — press 'd' first to download it".to_string()
+        "no downloaded update found — run sync first".to_string()
     } else if is_not_installed(raw) {
         "not a game folder yet — press i to install here".to_string()
     } else if raw.contains("global fast-switch") {
@@ -1553,13 +1553,13 @@ async fn run(
                         }
                         notify(&mut state, "refreshing all games…");
                     }
-                    KeyCode::Char('d') => {
+                    KeyCode::Char('s') => {
                         if running(&state, state.active) {
                             notify(&mut state, "this game already has a task");
                         } else {
                             let idx = state.active;
-                            let handle = spawn_predownload(&tx, &path, idx);
-                            start_task(&mut state, idx, "predownload", Some(path.clone()), Some(handle));
+                            let handle = spawn_simple(&tx, &path, TaskKind::Sync, idx);
+                            start_task(&mut state, idx, "sync", Some(path.clone()), Some(handle));
                         }
                     }
                     KeyCode::Char('a') => {
@@ -1569,15 +1569,6 @@ async fn run(
                             let idx = state.active;
                             drop(spawn_simple(&tx, &path, TaskKind::Apply, idx));
                             start_task(&mut state, idx, "apply", Some(path.clone()), None);
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        if running(&state, state.active) {
-                            notify(&mut state, "this game already has a task");
-                        } else {
-                            let idx = state.active;
-                            let handle = spawn_simple(&tx, &path, TaskKind::Sync, idx);
-                            start_task(&mut state, idx, "sync", Some(path.clone()), Some(handle));
                         }
                     }
                     KeyCode::Char('c') => {
@@ -1908,75 +1899,6 @@ fn auto_detect_games() -> Vec<String> {
         (rank, p.clone())
     });
     deduped
-}
-
-fn spawn_predownload(tx: &tokio::sync::mpsc::Sender<UiEvent>, path: &str, idx: usize) -> tokio::task::JoinHandle<()> {
-    let tx = tx.clone();
-    let path = path.to_string();
-    tokio::spawn(async move {
-        let result = async {
-            let mgr = GameManager::open(PathBuf::from(&path))
-                .await
-                .map_err(|e| e.to_string())?;
-            if mgr.game.uses_quality_tiers() && !mgr.server_entry().pack_config_urls.is_empty() {
-                let folder = PathBuf::from(&path);
-                let tier = quality::selected(&folder)
-                    .or_else(|| quality::info(&folder).installed().first().copied())
-                    .unwrap_or(Quality::Hd);
-                let (ptx, mut prx) = tokio::sync::mpsc::channel(256);
-                let tx2 = tx.clone();
-                tokio::spawn(async move {
-                    while let Some(ev) = prx.recv().await {
-                        let _ = tx2.send(UiEvent::Progress(idx, ev)).await;
-                    }
-                });
-                let report = mgr.pack_download(tier, Some(ptx)).await.map_err(|e| e.to_string())?;
-                return Ok::<_, String>(if report.parts.is_empty() {
-                    format!("up to date at {}", report.version)
-                } else {
-                    let files: usize = report.parts.iter().map(|p| p.files).sum();
-                    let bytes: u64 = report.parts.iter().map(|p| p.bytes).sum();
-                    format!(
-                        "{} complete — {files} file(s), {:.1} GiB staged — press a to apply",
-                        if report.predownload {
-                            "preinstall download"
-                        } else {
-                            "predownload"
-                        },
-                        bytes as f64 / (1u64 << 30) as f64
-                    )
-                });
-            }
-            let plan = mgr.plan_predownload().await.map_err(|e| e.to_string())?;
-            let (ptx, mut prx) = tokio::sync::mpsc::channel(256);
-            let tx2 = tx.clone();
-            tokio::spawn(async move {
-                while let Some(ev) = prx.recv().await {
-                    let _ = tx2.send(UiEvent::Progress(idx, ev)).await;
-                }
-            });
-            let _ = ptx
-                .send(ProgressEvent::SetTotal {
-                    bytes: plan.total_bytes,
-                })
-                .await;
-            mgr.predownload(&plan, ptx).await.map_err(|e| e.to_string())?;
-            if plan.total_bytes == 0 {
-                Ok::<_, String>("already up to date — nothing to download".to_string())
-            } else {
-                Ok::<_, String>(format!(
-                    "predownload complete — {} → {} staged ({} groups, {} files, {:.1} GiB)",
-                    plan.from_version,
-                    plan.to_version,
-                    plan.patch_groups.len(),
-                    plan.full_files.len(),
-                    plan.total_bytes as f64 / (1 << 30) as f64
-                ))
-            }
-        }
-        .await;
-        let _ = tx.send(UiEvent::TaskDone(idx, result)).await;
-    })
 }
 
 fn spawn_install(
@@ -2593,7 +2515,6 @@ fn footer(state: &UiState, width: u16) -> Line<'static> {
             ("Enter", "play"),
             ("i", "install"),
             ("s", "sync"),
-            ("d", "download"),
             ("a", "apply"),
             ("Q", "quality"),
             ("r", "refresh"),
@@ -2633,7 +2554,7 @@ fn render_overlays(f: &mut Frame, state: &UiState) {
         let help_lines: Vec<Line> = vec![
             Line::from(vec![accent("kuro"), dim(" — Kuro Games launcher")]),
             help_line("Games", "↑↓ select · Enter play · i install"),
-            help_line("Task", "s sync · d download · a apply · K kill"),
+            help_line("Task", "s sync · a apply · K kill"),
             help_line("Other", "Q quality · c server · r refresh"),
             help_line("Files", "PgUp/PgDn scroll · Home/End"),
             help_line("Install", "↑↓ select · ←→ change · Enter"),
