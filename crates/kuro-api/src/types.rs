@@ -16,13 +16,54 @@ use serde::{Deserialize, Serialize};
 
 /// Top level of the launcher API entry point (e.g.
 /// `.../launcher/game/G152/10003_<token>/index.json`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LauncherIndex {
+    /// The pre-3.8 schema has this section. Since 3.8 the channel index puts
+    /// `cdnList` and `resourcePacks` at the top level instead, so this stays
+    /// empty until [`Self::normalize_new_schema`] fills it from `common`.
+    #[serde(default)]
     pub default: DefaultSection,
+    #[serde(default)]
+    pub cdn_list: Vec<CdnNode>,
+    #[serde(default)]
+    pub resource_packs: std::collections::BTreeMap<String, PackEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl LauncherIndex {
+    /// The 3.8 launcher index has no `default` section: the base client is
+    /// `resourcePacks.common`, and `cdnList` is top-level. Normalize that one
+    /// shape back into the fields status and checkout already use. The old
+    /// shape is left untouched.
+    pub(crate) fn normalize_new_schema(&mut self) {
+        if !self.default.config.index_file.is_empty() {
+            return;
+        }
+        let Some(common) = self.resource_packs.get("common").cloned() else {
+            return;
+        };
+        self.default = DefaultSection {
+            cdn_list: self.cdn_list.clone(),
+            version: common.version.clone(),
+            config: LauncherConfig {
+                version: common.version,
+                index_file: common.index_file,
+                base_url: common.base_url,
+                patch_config: common
+                    .patch_config
+                    .iter()
+                    .map(|p| PatchConfig {
+                        version: p.version.clone(),
+                        index_file: p.index_file.clone(),
+                        base_url: p.base_url.clone(),
+                    })
+                    .collect(),
+            },
+        };
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DefaultSection {
     /// Weighted CDN nodes (`P` = weight, `url` = base).
@@ -279,5 +320,65 @@ impl LocalConfig {
             group: "default".to_string(),
             extra: self.extra.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_channel_index_normalizes_from_common() {
+        let mut index: LauncherIndex = serde_json::from_str(
+            r#"{
+                "cdnList": [{"P": 7, "url": "https://cdn/"}],
+                "resourcePacks": {
+                    "common": {
+                        "version": "3.8.0",
+                        "indexFile": "common.json",
+                        "baseUrl": "zip/",
+                        "patchConfig": [{
+                            "version": "3.7.1",
+                            "indexFile": "patch.json",
+                            "baseUrl": "patch/"
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        index.normalize_new_schema();
+
+        assert_eq!(index.default.version, "3.8.0");
+        assert_eq!(index.default.config.version, "3.8.0");
+        assert_eq!(index.default.config.index_file, "common.json");
+        assert_eq!(index.default.config.base_url, "zip/");
+        assert_eq!(index.default.config.patch_config[0].index_file, "patch.json");
+        assert_eq!(index.default.cdn_list[0].url, "https://cdn/");
+    }
+
+    #[test]
+    fn old_channel_index_is_left_alone() {
+        let mut index: LauncherIndex = serde_json::from_str(
+            r#"{
+                "default": {
+                    "version": "3.7.1",
+                    "cdnList": [{"P": 1, "url": "https://old/"}],
+                    "config": {
+                        "version": "3.7.1",
+                        "indexFile": "old.json",
+                        "baseUrl": "old/"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        index.normalize_new_schema();
+
+        assert_eq!(index.default.version, "3.7.1");
+        assert_eq!(index.default.config.index_file, "old.json");
+        assert_eq!(index.default.cdn_list[0].url, "https://old/");
     }
 }

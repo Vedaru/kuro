@@ -65,7 +65,9 @@ impl ApiClient {
             })
         })
         .await?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let mut index: LauncherIndex = serde_json::from_slice(&bytes)?;
+        index.normalize_new_schema();
+        Ok(index)
     }
 
     /// Pick a CDN node from `cdnList`, weighted by `P` (0 = excluded).

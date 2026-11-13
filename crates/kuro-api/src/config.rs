@@ -78,10 +78,10 @@ pub struct ServerEntry {
     /// launcher's own pack document lists those files, so a tier can only be
     /// installed from here.
     ///
-    /// CN and Bilibili share the CN document (verified 2026-10: the same
-    /// `resourcePacks`/`bundles`, and the tier manifests are byte-identical
-    /// across both channels — the channel-specific files all live in `common`,
-    /// which is the base client, not a tier). Global serves no such document
+    /// Each WuWa channel publishes its own document since 3.8. The old
+    /// `G152/1000x_<token>` indexes still answer, but are frozen at 3.7.1.
+    /// In particular `common` is channel-specific and must come from this
+    /// document, not from the other channel's. Global serves no such document
     /// yet: no path under `G153/50004_<token>/` answers, so it is empty rather
     /// than a guess that would fail at runtime with a 404.
     pub pack_config_urls: &'static [&'static str],
@@ -100,13 +100,23 @@ pub const WUWA_PACK_CONFIG_URLS: &[&str] = &[
     "https://prod-tencentcdn-gamestarter.kurogame.com/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
 ];
 
+/// Where the Bilibili launcher publishes its own pack document.
+///
+/// Bilibili has a different appKey and a different `common` manifest from CN.
+/// The two confirmed hosts mirror the channel index; tencent is not used here
+/// until it is verified to serve the Bilibili path.
+const WUWA_BILIBILI_PACK_CONFIG_URLS: &[&str] = &[
+    "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json",
+    "https://prod-volcdn-gamestarter.kurogame.xyz/launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json",
+];
+
 pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
     match game {
         Game::WuWa => &[
             (
                 "cn",
                 ServerEntry {
-                    api_url: "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/index.json",
+                    api_url: "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
                     app_id: "10003",
                     pack_config_urls: WUWA_PACK_CONFIG_URLS,
                 },
@@ -114,9 +124,9 @@ pub fn servers(game: Game) -> &'static [(&'static str, ServerEntry)] {
             (
                 "bilibili",
                 ServerEntry {
-                    api_url: "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10004_j5GWFuUFlb8N31Wi2uS3ZAVHcb7ZGN7y/index.json",
+                    api_url: "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json",
                     app_id: "10004",
-                    pack_config_urls: WUWA_PACK_CONFIG_URLS,
+                    pack_config_urls: WUWA_BILIBILI_PACK_CONFIG_URLS,
                 },
             ),
             (
@@ -285,4 +295,20 @@ pub fn game_server_by_app_id(app_id: &str) -> Option<(Game, Server)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bilibili_uses_its_own_channel_document() {
+        let cn = server_entry(Game::WuWa, Server::Cn).unwrap();
+        let bili = server_entry(Game::WuWa, Server::Bilibili).unwrap();
+
+        assert_eq!(cn.api_url, cn.pack_config_urls[0]);
+        assert_eq!(bili.api_url, bili.pack_config_urls[0]);
+        assert!(bili.pack_config_urls.iter().all(|url| url.contains("/bilibili/")));
+        assert_ne!(cn.pack_config_urls[0], bili.pack_config_urls[0]);
+    }
 }

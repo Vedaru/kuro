@@ -136,10 +136,10 @@ output gets no bar, only the final summary.
 
 `kuro install` also works on an empty folder: it writes
 `launcherDownloadConfig.json` only after the whole sync verifies, then records
-the installed quality tier with the launcher. For WuWa CN/Bilibili the channel
-index is the current base version (3.7.1 today), so follow a fresh install with
-`kuro update` to reach 3.8.0. In the TUI, `i` defaults its target to the blank
-row kuro opened with; the finished install becomes that row.
+the installed quality tier with the launcher. For WuWa CN/Bilibili the pack
+document publishes the current base version, so a fresh install lands on that
+version directly; no follow-up update is required. In the TUI, `i` defaults its
+target to the blank row kuro opened with; the finished install becomes that row.
 
 With nothing installed, the TUI lists both Wuthering Waves and Punishing: Gray
 Raven as `not installed`; `Enter` or `i` on either row opens the install prompt
