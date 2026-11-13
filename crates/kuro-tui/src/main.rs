@@ -1641,7 +1641,17 @@ async fn run(
                             t.scroll = 0;
                         }
                         ProgressEvent::SetQueued { count } => t.queued = count,
-                        ProgressEvent::GroupStart { name: _ } => t.queued += 1,
+                        ProgressEvent::GroupStart { name } => {
+                            t.queued += 1;
+                            if !t.file_pos.contains_key(&name) {
+                                t.file_pos.insert(name.clone(), t.files.len());
+                                t.files.push(FileState {
+                                    name,
+                                    done: 0,
+                                    total: 0,
+                                });
+                            }
+                        }
                         ProgressEvent::FileProgress { name, bytes, total } => match t.file_pos.get(&name).copied() {
                             Some(i) => {
                                 let f = &mut t.files[i];
