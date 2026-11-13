@@ -103,7 +103,7 @@ use kuro_api::{ApiClient, Error, PackConfig, PackEntry, PatchIndex, Result, Serv
 
 use crate::atomic::safe_replace;
 use crate::download::{download_file, FILE_CONCURRENCY};
-use crate::game::is_krpdiff;
+use crate::game::{is_krpdiff, part_already_target};
 use crate::md5_cache::Md5Cache;
 use crate::path::{key as path_key, normalise, tmp_sibling};
 use crate::quality::{self, Quality};
@@ -238,13 +238,18 @@ pub fn plan_ready(game_folder: &Path) -> bool {
     std::fs::read_to_string(pack_plan_path(game_folder))
         .ok()
         .and_then(|data| serde_json::from_str::<PackPlanFile>(&data).ok())
-        .is_some_and(|plan| {
-            plan.ready
-                && plan
-                    .parts
-                    .iter()
-                    .all(|part| pack_staging_dir(game_folder, &part.name).is_dir())
-        })
+        .is_some_and(|plan| plan.parts.iter().all(|part| part_ready(game_folder, part)))
+}
+
+fn part_ready(game_folder: &Path, part: &PackPlanPart) -> bool {
+    if part_already_target(game_folder, &part.index) {
+        return true;
+    }
+    let stage = pack_staging_dir(game_folder, &part.name);
+    part.index
+        .resource
+        .iter()
+        .all(|r| std::fs::metadata(stage.join(r.dest.trim_start_matches('/'))).is_ok_and(|m| m.len() == r.size))
 }
 
 fn tree_totals(root: &Path) -> (usize, u64) {
@@ -1047,11 +1052,6 @@ impl crate::GameManager {
         if plan.schema != 1 {
             return Err(Error::Patch("unsupported pack update plan".into()));
         }
-        if !plan.ready {
-            return Err(Error::Patch(
-                "the pack predownload did not finish — run it again".into(),
-            ));
-        }
         if plan.predownload {
             if let Some(tx) = &tx {
                 let _ = tx
@@ -1086,7 +1086,7 @@ impl crate::GameManager {
         };
         for part in &plan.parts {
             let current = if part.name == "common" { &local } else { &current_tier };
-            if current == &part.to {
+            if current == &part.to || part_already_target(&self.game_folder, &part.index) {
                 continue; // already applied, finish the records below
             }
             let stage = pack_staging_dir(&self.game_folder, &part.name);

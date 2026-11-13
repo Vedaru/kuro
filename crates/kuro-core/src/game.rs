@@ -327,7 +327,8 @@ impl GameManager {
             // CN update (3.6.0 -> 3.6.1: 173 files, 1.49 GiB, *no* fromFolder
             // on any entry) ended up planning zero bytes instead.
             let staged = inc.join("resources").join(item.dest.trim_start_matches('/'));
-            let ready = file_matches(&staged, item.size, &item.md5);
+            let target = self.game_folder.join(normalise(&item.dest));
+            let ready = file_matches(&staged, item.size, &item.md5) || file_matches(&target, item.size, &item.md5);
             if !ready {
                 total += item.size;
             }
@@ -1734,6 +1735,15 @@ fn group_already_target(game_folder: &Path, group: &GroupInfo) -> bool {
             let p = game_folder.join(d.dest.trim_start_matches('/'));
             std::fs::metadata(p).map(|m| m.len() == d.size).unwrap_or(false)
         })
+}
+
+pub(crate) fn part_already_target(game_folder: &Path, index: &PatchIndex) -> bool {
+    index.group_infos.iter().all(|g| group_already_target(game_folder, g))
+        && index
+            .resource
+            .iter()
+            .filter(|r| !is_krpdiff(&r.dest))
+            .all(|r| file_matches(&game_folder.join(normalise(&r.dest)), r.size, &r.md5))
 }
 
 /// Walk `game_folder` and remove stale build artefacts — files the manifest
