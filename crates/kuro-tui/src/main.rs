@@ -2189,6 +2189,8 @@ fn ui_games(f: &mut Frame, state: &UiState) {
     let task = game_task(state, state.active);
     let active = task.is_some();
     let notice_h = u16::from(!active && state.notice.is_some());
+    let footer_line = footer(state, f.area().width);
+    let footer_h = (footer_line.width() as u16).div_ceil(f.area().width).clamp(1, 3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2196,7 +2198,7 @@ fn ui_games(f: &mut Frame, state: &UiState) {
             Constraint::Length(if active { 6 } else { 0 }), // activity
             Constraint::Min(if active { 3 } else { 0 }),    // every file
             Constraint::Length(notice_h),
-            Constraint::Length(2), // footer, wraps when the keys do not fit
+            Constraint::Length(footer_h),
         ])
         .split(f.area());
 
@@ -2364,10 +2366,7 @@ fn ui_games(f: &mut Frame, state: &UiState) {
     if notice_h > 0 {
         render_notice(f, state, chunks[3]);
     }
-    f.render_widget(
-        Paragraph::new(footer(state, f.area().width)).wrap(Wrap { trim: true }),
-        chunks[4],
-    );
+    f.render_widget(Paragraph::new(footer_line).wrap(Wrap { trim: true }), chunks[4]);
 }
 
 fn folder_name(path: &str) -> String {
