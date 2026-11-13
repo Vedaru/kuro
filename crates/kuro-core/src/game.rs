@@ -811,6 +811,21 @@ impl GameManager {
                 .await;
         }
 
+        let swap_total = staged_outputs.len()
+            + patch_index
+                .resource
+                .iter()
+                .filter(|r| !is_krpdiff(&r.dest))
+                .filter(|r| inc.join("resources").join(r.dest.trim_start_matches('/')).exists())
+                .count();
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(ProgressEvent::SetTotal {
+                    bytes: swap_total as u64,
+                })
+                .await;
+        }
+        let mut swapped = 0usize;
         for (dest, staged) in &staged_outputs {
             let game_path = self.game_folder.join(normalise(dest));
             // `safe_replace` creates the parent directory, so a group that adds
@@ -818,6 +833,16 @@ impl GameManager {
             recover_backup(&game_path)?;
             safe_replace(staged, &game_path)?;
             report.swapped += 1;
+            swapped += 1;
+            if let Some(tx) = &tx {
+                let _ = tx
+                    .send(ProgressEvent::FileProgress {
+                        name: "swap".into(),
+                        bytes: swapped as u64,
+                        total: swap_total as u64,
+                    })
+                    .await;
+            }
         }
 
         // complete-file fallbacks (the big ones, e.g. the main exe)
@@ -834,6 +859,24 @@ impl GameManager {
             recover_backup(&game_path)?;
             safe_replace(&staged, &game_path)?;
             report.swapped += 1;
+            swapped += 1;
+            if let Some(tx) = &tx {
+                let _ = tx
+                    .send(ProgressEvent::FileProgress {
+                        name: "swap".into(),
+                        bytes: swapped as u64,
+                        total: swap_total as u64,
+                    })
+                    .await;
+            }
+        }
+        if let Some(tx) = &tx {
+            let _ = tx
+                .send(ProgressEvent::GroupDone {
+                    name: "swap".into(),
+                    bytes: swap_total as u64,
+                })
+                .await;
         }
 
         // ---- delete phase ----
@@ -856,7 +899,7 @@ impl GameManager {
                 continue;
             }
             let game_path = self.game_folder.join(normalise(&item.dest));
-            if !file_matches(&game_path, item.size, &item.md5) {
+            if !std::fs::metadata(&game_path).is_ok_and(|m| m.len() == item.size) {
                 not_installed.push(item.dest.clone());
             }
         }
@@ -866,7 +909,7 @@ impl GameManager {
                     continue;
                 }
                 let game_path = self.game_folder.join(normalise(&dst.dest));
-                if !file_matches(&game_path, dst.size, &dst.md5) {
+                if !std::fs::metadata(&game_path).is_ok_and(|m| m.len() == dst.size) {
                     not_installed.push(dst.dest.clone());
                 }
             }
