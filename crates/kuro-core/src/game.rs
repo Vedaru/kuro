@@ -1789,7 +1789,7 @@ pub(crate) fn part_already_target(game_folder: &Path, index: &PatchIndex) -> boo
             .resource
             .iter()
             .filter(|r| !is_krpdiff(&r.dest))
-            .all(|r| file_matches(&game_folder.join(normalise(&r.dest)), r.size, &r.md5))
+            .all(|r| std::fs::metadata(game_folder.join(normalise(&r.dest))).is_ok_and(|m| m.len() == r.size))
 }
 
 /// Walk `game_folder` and remove stale build artefacts — files the manifest
