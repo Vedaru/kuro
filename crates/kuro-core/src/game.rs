@@ -1179,8 +1179,7 @@ impl GameManager {
         self.sync_base_with_progress(tx).await
     }
 
-    /// The pack-document sync: download `common` + the active tier and leave
-    /// them staged. Apply is explicit.
+    /// The pack-document sync: download and apply `common` + the active tier.
     async fn sync_pack_document(&self, tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>) -> Result<SyncReport> {
         let tier = match self.body {
             BodyChoice::Only(q) | BodyChoice::Prefer(q) => q,
@@ -1188,21 +1187,19 @@ impl GameManager {
                 .or_else(|| quality::info(&self.game_folder).installed().first().copied())
                 .unwrap_or(Quality::Hd),
         };
-        let update = self.pack_download(tier, tx.clone()).await?;
+        let update = self.pack_update(tier, tx.clone()).await?;
         let mut report = SyncReport::default();
         for part in &update.parts {
-            report.downloaded += part.files;
-            report.downloaded_bytes += part.bytes;
+            let applied = &part.report;
+            report.checked += applied.merged + applied.skipped + applied.swapped;
+            report.repaired += applied.swapped;
+            report.ok += applied.skipped;
         }
         if let Some(tx) = &tx {
             let msg = if update.parts.is_empty() {
                 format!("up to date at {}", update.version)
             } else {
-                format!(
-                    "downloaded {} file(s), {:.1} GiB — apply with a",
-                    report.downloaded,
-                    report.downloaded_bytes as f64 / (1 << 30) as f64
-                )
+                format!("pack update applied → {}", update.version)
             };
             let _ = tx.send(ProgressEvent::Log(msg)).await;
             let _ = tx.send(ProgressEvent::Done).await;

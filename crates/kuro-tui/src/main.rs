@@ -1556,6 +1556,8 @@ async fn run(
                     KeyCode::Char('s') => {
                         if running(&state, state.active) {
                             notify(&mut state, "this game already has a task");
+                        } else if is_blank_install(&state, state.active) {
+                            state.install = Some(draft_for_active(&state));
                         } else {
                             let idx = state.active;
                             let handle = spawn_simple(&tx, &path, TaskKind::Sync, idx);
