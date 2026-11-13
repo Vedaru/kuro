@@ -6,14 +6,16 @@
 //! transport failures, then failed over to the next edge; without that, one
 //! stalled edge aborts an entire run (the failure that motivated this).
 
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::oneshot;
 
 use crate::game::ProgressEvent;
 use kuro_api::retry;
@@ -32,9 +34,9 @@ use kuro_api::{ChunkInfo, Error, Result};
 pub const CONCURRENCY: usize = 8;
 
 /// Ranges a single chunked file may have outstanding at once. Actual
-/// connections are capped by [`CONCURRENCY`]; leaving half the budget free
-/// keeps one large pak from starving every file queued behind its ranges.
-pub const CHUNK_CONCURRENCY: usize = CONCURRENCY / 2;
+/// connections are capped by [`CONCURRENCY`]; the fair budget makes one file's
+/// fan-out yield the next freed slot to a file that is waiting.
+pub const CHUNK_CONCURRENCY: usize = CONCURRENCY;
 
 /// Files the download loops keep in flight. The `JoinSet` still spawns a task
 /// per file, but a semaphore of this size gates how many run at once — enough
@@ -67,12 +69,71 @@ const WRITE_BATCH: usize = 1 << 20;
 /// while the next file waits its turn. Sized by [`CONCURRENCY`], whose docs
 /// carry the measurements behind the number.
 #[derive(Clone, Default)]
-pub struct Budget(Option<Arc<Semaphore>>);
+pub struct Budget(Option<Arc<Fair>>);
+
+/// One waiter per file in the roster, with extra ranges for the same file
+/// queued behind it. Granting round-robin keeps a large pak's range fan-out
+/// from starving a file that starts later.
+struct Fair {
+    state: Mutex<FairState>,
+}
+
+#[derive(Default)]
+struct FairState {
+    available: usize,
+    roster: VecDeque<u64>,
+    queues: HashMap<u64, VecDeque<oneshot::Sender<()>>>,
+}
+
+impl Fair {
+    fn new(permits: usize) -> Self {
+        Self {
+            state: Mutex::new(FairState {
+                available: permits.max(1),
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+struct Permit {
+    fair: Arc<Fair>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut st = self.fair.state.lock().unwrap();
+        loop {
+            let Some(key) = st.roster.pop_front() else {
+                st.available += 1;
+                return;
+            };
+            let (tx, empty) = match st.queues.get_mut(&key) {
+                Some(q) => (q.pop_front(), q.is_empty()),
+                None => (None, true),
+            };
+            if empty {
+                st.queues.remove(&key);
+            } else {
+                st.roster.push_back(key);
+            }
+            if tx.is_some_and(|tx| tx.send(()).is_ok()) {
+                return;
+            }
+        }
+    }
+}
+
+fn budget_key(name: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    name.hash(&mut h);
+    h.finish()
+}
 
 impl Budget {
     /// A budget of `permits` concurrent requests.
     pub fn new(permits: usize) -> Self {
-        Self(Some(Arc::new(Semaphore::new(permits.max(1)))))
+        Self(Some(Arc::new(Fair::new(permits))))
     }
 
     /// No ceiling — used by tests and callers that manage their own.
@@ -81,16 +142,33 @@ impl Budget {
     }
 
     /// Take one slot, held until the returned permit is dropped.
-    async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
-        match &self.0 {
-            Some(sem) => Some(
-                sem.clone()
-                    .acquire_owned()
-                    .await
-                    .expect("download budget semaphore is never closed"),
-            ),
-            None => None,
+    async fn acquire(&self, name: &str) -> Option<Permit> {
+        self.acquire_key(budget_key(name)).await
+    }
+
+    async fn acquire_key(&self, key: u64) -> Option<Permit> {
+        let fair = self.0.clone()?;
+        let rx = {
+            let mut st = fair.state.lock().unwrap();
+            if st.available > 0 && st.roster.is_empty() {
+                st.available -= 1;
+                None
+            } else {
+                let (tx, rx) = oneshot::channel();
+                st.queues.entry(key).or_default().push_back(tx);
+                if !st.roster.contains(&key) {
+                    st.roster.push_back(key);
+                }
+                Some(rx)
+            }
+        };
+        let Some(rx) = rx else {
+            return Some(Permit { fair });
+        };
+        if rx.await.is_err() {
+            return None;
         }
+        Some(Permit { fair })
     }
 }
 
@@ -216,7 +294,7 @@ async fn download_single_once(
     budget: &Budget,
 ) -> Result<()> {
     // Held for the whole streamed body, released before a retry backs off.
-    let _permit = budget.acquire().await;
+    let _permit = budget.acquire(name).await;
     let resp = client.get(url).send().await?.error_for_status()?;
     let total = expected_size.or_else(|| resp.content_length()).unwrap_or(0);
     if let Some(tx) = progress {
@@ -345,6 +423,7 @@ pub async fn download_chunked(
 
     let urls = Arc::new(urls.to_vec());
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let key = budget_key(name);
     // Bytes written per chunk, index-stable so each task owns one slot and a
     // retry can reset its own without racing the others.
     let written: Arc<Vec<AtomicU64>> = Arc::new((0..chunks.len()).map(|_| AtomicU64::new(0)).collect());
@@ -407,7 +486,7 @@ pub async fn download_chunked(
                     // One slot per in-flight range, from the shared pool: a
                     // file's ranges compete with every other file's rather than
                     // each file reserving its own.
-                    let _permit = budget.acquire().await;
+                    let _permit = budget.acquire_key(key).await;
                     let resp = client
                         .get(&url)
                         .header(reqwest::header::RANGE, range)
@@ -552,6 +631,26 @@ mod tests {
             verify_streamed(&p, 4, Some(h), Some(4), Some("e2fc714c4727ee9395f324cd2e7f331f")),
             Err(Error::ChecksumMismatch { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn the_next_file_gets_the_next_permit() {
+        let budget = Budget::new(1);
+        let held = budget.acquire("a").await.unwrap();
+        let b = budget.clone();
+        let b = tokio::spawn(async move { b.acquire("b").await });
+        let c = budget.clone();
+        let c = tokio::spawn(async move { c.acquire("c").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(b.is_finished(), "the waiting file did not get the freed permit");
+        assert!(!c.is_finished(), "the second waiting file jumped the queue");
+
+        drop(b.await.unwrap());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(c.is_finished(), "the second waiting file did not get the next permit");
     }
 
     #[tokio::test]
