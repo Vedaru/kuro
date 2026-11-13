@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use kuro_api::config::ServerEntry;
 use kuro_api::{
@@ -675,18 +676,17 @@ impl GameManager {
             if let Some(tx) = &tx {
                 let _ = tx.send(ProgressEvent::GroupStart { name: name.clone() }).await;
             }
-            group_bytes.push((
-                name,
-                group
-                    .dst_files
-                    .iter()
-                    .filter(|d| !complete_dests.contains(&d.dest))
-                    .map(|d| d.size)
-                    .sum(),
-            ));
+            let bytes: u64 = group
+                .dst_files
+                .iter()
+                .filter(|d| !complete_dests.contains(&d.dest))
+                .map(|d| d.size)
+                .sum();
+            group_bytes.push((name.clone(), bytes));
+            let tx = tx.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                merge_one_group(&game_folder, &inc, &group, idx).await
+                merge_one_group(&game_folder, &inc, &group, idx, tx).await
             }));
         }
 
@@ -1508,6 +1508,29 @@ enum GroupOutcome {
     Fallback(Vec<FileRef>),
 }
 
+fn written_bytes(root: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    fn recurse(root: &Path) -> u64 {
+        let Ok(rd) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        let mut total = 0;
+        for entry in rd.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                total += recurse(&entry.path());
+            } else if kind.is_file() {
+                total += entry.metadata().map(|m| m.blocks() * 512).unwrap_or(0);
+            }
+        }
+        total
+    }
+    recurse(root)
+}
+
 /// Merge one krpdiff group into staged outputs (or decide a fallback is
 /// needed). Reads only; the game folder is not modified.
 async fn merge_one_group(
@@ -1515,6 +1538,7 @@ async fn merge_one_group(
     inc: &Path,
     group: &GroupInfo,
     idx: usize,
+    tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
 ) -> Result<(String, GroupOutcome)> {
     let name = group.dest.clone();
 
@@ -1546,6 +1570,26 @@ async fn merge_one_group(
     if out_dir.exists() {
         std::fs::remove_dir_all(&out_dir)?;
     }
+    let total: u64 = group.dst_files.iter().map(|d| d.size).sum();
+    let mut reporter = tokio::task::JoinSet::new();
+    if let Some(tx) = tx {
+        let out_dir = out_dir.clone();
+        let name = name.clone();
+        reporter.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(150));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let _ = tx
+                    .send(ProgressEvent::FileProgress {
+                        name: name.clone(),
+                        bytes: written_bytes(&out_dir).min(total),
+                        total,
+                    })
+                    .await;
+            }
+        });
+    }
     let merge_res = tokio::task::spawn_blocking({
         let game_folder = game_folder.to_path_buf();
         let krpdiff_path = krpdiff_path.clone();
@@ -1554,6 +1598,8 @@ async fn merge_one_group(
     })
     .await
     .map_err(|e| Error::Patch(format!("merge task join: {e}")))?;
+    reporter.abort_all();
+    while reporter.join_next().await.is_some() {}
 
     if let Err(_e) = merge_res {
         let _ = std::fs::remove_dir_all(&out_dir);
