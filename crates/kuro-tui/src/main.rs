@@ -110,7 +110,7 @@ struct TaskUi {
     finished: Option<TaskEnd>,
     total_bytes: u64,
     done_bytes: u64,
-    /// Every file this task has reported, each with its own bar.
+    /// Files currently being downloaded, each with its own bar.
     files: Vec<FileState>,
     file_pos: std::collections::HashMap<String, usize>,
     /// First file row shown in the files section.
@@ -132,7 +132,6 @@ struct FileState {
     name: String,
     done: u64,
     total: u64,
-    finished: bool,
 }
 
 #[derive(Default)]
@@ -1655,26 +1654,15 @@ async fn run(
                                     name,
                                     done: bytes,
                                     total,
-                                    finished: false,
                                 });
                             }
                         },
                         ProgressEvent::GroupDone { name, bytes } => {
-                            match t.file_pos.get(&name).copied() {
-                                Some(i) => {
-                                    let f = &mut t.files[i];
-                                    f.done = bytes;
-                                    f.total = bytes;
-                                    f.finished = true;
-                                }
-                                None => {
-                                    t.file_pos.insert(name.clone(), t.files.len());
-                                    t.files.push(FileState {
-                                        name,
-                                        done: bytes,
-                                        total: bytes,
-                                        finished: true,
-                                    });
+                            if let Some(i) = t.file_pos.remove(&name) {
+                                let last = t.files.len() - 1;
+                                t.files.swap_remove(i);
+                                if i != last {
+                                    t.file_pos.insert(t.files[i].name.clone(), i);
                                 }
                             }
                             t.done += 1;
@@ -2434,7 +2422,7 @@ fn task_lines(task: Option<&TaskUi>) -> Vec<Line<'_>> {
         // Include in-flight bytes: `done_bytes` only moves on GroupDone
         // (a whole file), so the overall bar used to sit still for the
         // entire duration of one file and jump when it landed.
-        let in_flight: u64 = t.files.iter().filter(|f| !f.finished).map(|f| f.done).sum();
+        let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
         let shown = (t.done_bytes + in_flight).min(t.total_bytes);
         v.push(Line::styled(
             bar_line("overall", shown, t.total_bytes, 34),
@@ -2446,7 +2434,7 @@ fn task_lines(task: Option<&TaskUi>) -> Vec<Line<'_>> {
 
 fn task_percent(t: &TaskUi) -> String {
     if t.total_bytes > 0 {
-        let inflight: u64 = t.files.iter().filter(|f| !f.finished).map(|f| f.done).sum();
+        let inflight: u64 = t.files.iter().map(|f| f.done).sum();
         let shown = (t.done_bytes + inflight).min(t.total_bytes);
         format!("{:.0}%", shown as f64 * 100.0 / t.total_bytes as f64)
     } else if t.done + t.queued > 0 {
@@ -2478,9 +2466,8 @@ fn render_files(f: &mut Frame, task: Option<&TaskUi>, area: ratatui::layout::Rec
         .skip(offset)
         .take(visible)
         .map(|f| {
-            let mark = if f.finished { "✔ " } else { "  " };
             let name = shorten(&f.name, width.saturating_sub(24).max(16));
-            Line::raw(format!("{mark}{}", bar_line(&name, f.done, f.total, 24)))
+            Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24)))
         })
         .collect();
     f.render_widget(
@@ -2971,7 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn files_section_lists_every_reported_file() {
+    fn files_section_lists_in_flight_files() {
         let mut state = two_games();
         state.tasks = vec![
             Some(super::TaskUi {
@@ -2981,7 +2968,6 @@ mod tests {
                         name: format!("file-{i}.pak"),
                         done: 1,
                         total: 2,
-                        finished: false,
                     })
                     .collect(),
                 ..Default::default()
