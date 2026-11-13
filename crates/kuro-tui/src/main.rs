@@ -532,7 +532,10 @@ async fn main() -> std::io::Result<()> {
     let terminal = init();
     let res = run(terminal, &mut rx, tx, paths).await;
     restore();
-    res
+    if let Err(e) = &res {
+        eprintln!("kuro: {e}");
+    }
+    std::process::exit(if res.is_ok() { 0 } else { 1 });
 }
 
 fn print_usage() {
