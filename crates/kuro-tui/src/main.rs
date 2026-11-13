@@ -104,6 +104,8 @@ struct TaskUi {
     kind: String,
     /// Folder this task writes to; `None` for tasks that do not touch a tree.
     target: Option<String>,
+    /// Last phase message the task reported.
+    phase: Option<String>,
     done: usize,
     /// Items announced but not yet finished (GroupStart - GroupDone).
     queued: usize,
@@ -1633,7 +1635,10 @@ async fn run(
                         continue;
                     }
                     match p {
-                        ProgressEvent::Log(m) => debug_log(m),
+                        ProgressEvent::Log(m) => {
+                            debug_log(&m);
+                            t.phase = Some(m);
+                        }
                         ProgressEvent::SetTotal { bytes } => {
                             t.total_bytes = bytes;
                             t.files.clear(); // repair phase starts; drop the verify bar
@@ -2195,14 +2200,23 @@ fn help_line(label: &'static str, text: &'static str) -> Line<'static> {
 fn ui_games(f: &mut Frame, state: &UiState) {
     let task = game_task(state, state.active);
     let active = task.is_some();
+    let activity_h = if active {
+        if task.is_some_and(|t| t.phase.is_some()) {
+            7
+        } else {
+            6
+        }
+    } else {
+        0
+    };
     let footer_line = footer(state, f.area().width);
     let footer_h = (footer_line.width() as u16).div_ceil(f.area().width).clamp(1, 3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),                          // games
-            Constraint::Length(if active { 6 } else { 0 }), // activity
-            Constraint::Min(if active { 3 } else { 0 }),    // every file
+            Constraint::Length(5), // games
+            Constraint::Length(activity_h),
+            Constraint::Min(if active { 3 } else { 0 }), // every file
             Constraint::Length(footer_h),
         ])
         .split(f.area());
@@ -2400,6 +2414,9 @@ fn task_lines(task: Option<&TaskUi>) -> Vec<Line<'_>> {
     let mut v = vec![Line::from(vec![dim("task: "), accent(t.kind.clone())])];
     if let Some(target) = &t.target {
         v.push(Line::from(vec![dim("at:   "), Span::raw(target.clone())]));
+    }
+    if let Some(phase) = &t.phase {
+        v.push(Line::from(vec![dim("phase: "), Span::raw(shorten(phase, 72))]));
     }
     // A finished task keeps its result, not the progress it reached. The
     // activity panel is only four rows tall, so rendering the bar first hid
