@@ -1649,6 +1649,9 @@ async fn run(
                                 f.total = total;
                             }
                             None => {
+                                if bytes == 0 {
+                                    continue;
+                                }
                                 t.file_pos.insert(name.clone(), t.files.len());
                                 t.files.push(FileState {
                                     name,
