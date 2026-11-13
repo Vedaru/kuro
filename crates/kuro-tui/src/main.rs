@@ -1659,22 +1659,15 @@ async fn run(
                         }
                         ProgressEvent::SetTotal { bytes } => {
                             t.total_bytes = bytes;
+                            t.done = 0;
+                            t.queued = 0;
+                            t.done_bytes = 0;
                             t.files.clear(); // repair phase starts; drop the verify bar
                             t.file_pos.clear();
                             t.scroll = 0;
                         }
                         ProgressEvent::SetQueued { count } => t.queued = count,
-                        ProgressEvent::GroupStart { name } => {
-                            t.queued += 1;
-                            if !t.file_pos.contains_key(&name) {
-                                t.file_pos.insert(name.clone(), t.files.len());
-                                t.files.push(FileState {
-                                    name,
-                                    done: 0,
-                                    total: 0,
-                                });
-                            }
-                        }
+                        ProgressEvent::GroupStart { name: _ } => t.queued += 1,
                         ProgressEvent::FileProgress { name, bytes, total } => match t.file_pos.get(&name).copied() {
                             Some(i) => {
                                 let f = &mut t.files[i];
@@ -2470,7 +2463,11 @@ fn task_lines(task: Option<&TaskUi>) -> Vec<Line<'_>> {
     // A stopped task has no progress to show; its bar and in-flight
     // rows are stale and would read as a paused 0%.
     v.push(Line::from(vec![
-        dim("files: "),
+        dim(if t.files.is_empty() && t.queued > 0 {
+            "groups: "
+        } else {
+            "files: "
+        }),
         strong(t.done.to_string()),
         dim(" done · "),
         strong(t.queued.to_string()),
@@ -2515,6 +2512,21 @@ fn render_files(f: &mut Frame, task: Option<&TaskUi>, area: ratatui::layout::Rec
     let Some(t) = task else {
         return;
     };
+    if t.files.is_empty() {
+        let total = t.done + t.queued;
+        if total == 0 {
+            return;
+        }
+        f.render_widget(
+            Paragraph::new(Line::raw(format!(
+                "  {}",
+                bar_line("groups", t.done as u64, total as u64, 34)
+            )))
+            .block(panel("groups")),
+            area,
+        );
+        return;
+    }
     let visible = area.height.saturating_sub(2) as usize;
     let offset = t.scroll.min(t.files.len().saturating_sub(visible));
     let width = area.width.saturating_sub(8).clamp(24, 80) as usize;
