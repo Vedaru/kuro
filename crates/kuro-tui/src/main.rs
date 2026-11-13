@@ -2076,18 +2076,26 @@ fn spawn_simple(
                 }
                 TaskKind::Sync => {
                     let report = mgr.sync_with_progress(ptx.take()).await.map_err(|e| e.to_string())?;
-                    let failed = if report.failed.is_empty() {
-                        String::new()
+                    if report.downloaded > 0 {
+                        Ok(format!(
+                            "downloaded {} file(s), {:.1} GiB — press a to apply",
+                            report.downloaded,
+                            report.downloaded_bytes as f64 / (1 << 30) as f64
+                        ))
                     } else {
-                        format!(", {} failed", report.failed.len())
-                    };
-                    Ok(format!(
-                        "sync complete — {} repaired ({:.1} GiB), {} ok, {} stale removed{failed}",
-                        report.repaired,
-                        report.repaired_bytes as f64 / (1 << 30) as f64,
-                        report.ok,
-                        report.orphans_removed
-                    ))
+                        let failed = if report.failed.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {} failed", report.failed.len())
+                        };
+                        Ok(format!(
+                            "sync complete — {} repaired ({:.1} GiB), {} ok, {} stale removed{failed}",
+                            report.repaired,
+                            report.repaired_bytes as f64 / (1 << 30) as f64,
+                            report.ok,
+                            report.orphans_removed
+                        ))
+                    }
                 }
                 TaskKind::Pack(tier) => {
                     let report = mgr.sync_pack(tier, true, ptx.take()).await.map_err(|e| e.to_string())?;
