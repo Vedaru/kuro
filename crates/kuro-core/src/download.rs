@@ -34,9 +34,10 @@ use kuro_api::{ChunkInfo, Error, Result};
 pub const CONCURRENCY: usize = 8;
 
 /// Ranges a single chunked file may have outstanding at once. Actual
-/// connections are capped by [`CONCURRENCY`]; the fair budget makes one file's
-/// fan-out yield the next freed slot to a file that is waiting.
-pub const CHUNK_CONCURRENCY: usize = CONCURRENCY;
+/// connections are capped by [`CONCURRENCY`]. Keeping one file to half the
+/// budget means it cannot take every slot before other files have queued;
+/// the fair budget then rotates any remaining contention.
+pub const CHUNK_CONCURRENCY: usize = CONCURRENCY / 2;
 
 /// Files the download loops keep in flight. The `JoinSet` still spawns a task
 /// per file, but a semaphore of this size gates how many run at once — enough
