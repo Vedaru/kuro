@@ -491,10 +491,20 @@ async fn main() -> std::io::Result<()> {
     let mut paths = args;
     if paths.is_empty() {
         paths = auto_detect_games();
-    }
-    if paths.is_empty() {
-        paths.push(default_folder_for(Game::WuWa));
-        paths.push(default_folder_for(Game::Pgr));
+        // Keep one row per known game even when only one of them is installed:
+        // a partial PGR install has no launcher config, so detection drops it
+        // and the row the user needs to resume would otherwise disappear.
+        let has_wuwa = paths.iter().any(|p| p.to_ascii_lowercase().contains("wuthering"));
+        let has_pgr = paths.iter().any(|p| {
+            let p = p.to_ascii_lowercase();
+            p.contains("punishing") || p.contains("gray raven") || p.contains("pgr")
+        });
+        if !has_wuwa {
+            paths.insert(0, default_folder_for(Game::WuWa));
+        }
+        if !has_pgr {
+            paths.push(default_folder_for(Game::Pgr));
+        }
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UiEvent>(64);
@@ -1725,6 +1735,14 @@ async fn run(
                     if let Some((i, path)) = refresh {
                         state.quality_sel[i] = quality::selected(std::path::Path::new(&path));
                         spawn_status(&tx, &path, i);
+                    }
+                    // A finished task is not an activity panel forever. Keep
+                    // the notice and the refreshed row, then return to idle.
+                    if let Some(slot) = state.tasks.get_mut(idx) {
+                        *slot = None;
+                    }
+                    if state.focus == Focus::Task {
+                        state.focus = Focus::Status;
                     }
                 }
             }
