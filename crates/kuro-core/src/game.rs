@@ -922,18 +922,16 @@ impl GameManager {
         std::fs::create_dir_all(&game_folder)?;
         let mut mgr = Self::manage(game, server, game_folder.clone())?;
         mgr.set_body(body);
-        let sync = mgr.sync_base_with_progress(tx.clone()).await?;
+        let sync = if game.uses_quality_tiers() && !mgr.server_entry().pack_config_urls.is_empty() {
+            mgr.sync_fresh_pack_with_progress(tx).await?
+        } else {
+            mgr.sync_base_with_progress(tx).await?
+        };
         if !sync.failed.is_empty() {
             return Err(Error::Patch(format!(
                 "{} file(s) failed to download — the install is incomplete; rerun it to resume",
                 sync.failed.len()
             )));
-        }
-        // The channel index can lag the launcher's current pack version. The
-        // base sync above installs what the index names; finish at the pack
-        // document's version so a fresh install is not immediately stale.
-        if game.uses_quality_tiers() && !mgr.server_entry().pack_config_urls.is_empty() {
-            mgr.sync_with_progress(tx).await?;
         }
         // The successful sync just wrote the channel version; no second
         // index fetch is needed to name the tier records.
@@ -1247,6 +1245,81 @@ impl GameManager {
     pub async fn sync_inner(&self, full_index: &PatchIndex, cdn_nodes: &[&str], base: &str) -> Result<SyncReport> {
         self.sync_inner_with_progress(Arc::new(full_index.clone()), cdn_nodes, base, None)
             .await
+    }
+
+    /// A from-scratch WuWa install against the pack document's full manifests.
+    ///
+    /// The channel index can lag the launcher's pack version. The pack
+    /// document publishes `common` + the chosen tier at the current version,
+    /// so a blank folder can download 3.8.0 directly instead of installing
+    /// 3.7.1 and then patching it.
+    async fn sync_fresh_pack_with_progress(
+        &self,
+        tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
+    ) -> Result<SyncReport> {
+        let config = self.pack_config().await?;
+        let tier = match self.body {
+            BodyChoice::Only(q) | BodyChoice::Prefer(q) => q,
+            BodyChoice::All => quality::selected(&self.game_folder)
+                .or_else(|| quality::info(&self.game_folder).installed().first().copied())
+                .unwrap_or(Quality::Hd),
+        };
+        let bundle = config
+            .bundles
+            .get(tier.as_arg())
+            .ok_or_else(|| Error::Patch(format!("the pack document has no {} bundle", tier.as_arg())))?;
+        let bases: Vec<String> = ApiClient::pack_cdn_candidates(&config)?
+            .iter()
+            .map(|n| n.url.clone())
+            .collect();
+        let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
+        if base_refs.is_empty() {
+            return Err(Error::NoCdnNode);
+        }
+
+        let mut full = PatchIndex {
+            resource: Vec::new(),
+            delete_files: Vec::new(),
+            group_infos: Vec::new(),
+            apply_types: Vec::new(),
+        };
+        for name in &bundle.resource_packs {
+            let entry = config
+                .resource_packs
+                .get(name)
+                .ok_or_else(|| Error::Patch(format!("the pack document has no `{name}` pack")))?;
+            let mut index = self
+                .api
+                .fetch_manifest_verified(&base_refs, &entry.index_file, &entry.index_file_md5)
+                .await?;
+            for item in &mut index.resource {
+                if item.from_folder.as_deref().unwrap_or("").is_empty() {
+                    item.from_folder = Some(entry.base_url.clone());
+                }
+            }
+            full.resource.extend(index.resource);
+        }
+        let version = config
+            .resource_packs
+            .get("common")
+            .map(|e| e.version.clone())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| Error::Patch("the pack document has no common version".to_string()))?;
+
+        let report = self
+            .sync_inner_with_progress(Arc::new(full), &base_refs, "", tx)
+            .await?;
+        if !report.failed.is_empty() {
+            return Err(Error::Patch(format!(
+                "{} file(s) failed to download — the install is incomplete; rerun it to resume",
+                report.failed.len()
+            )));
+        }
+        state::write_local_config(
+            &self.game_folder,
+            &LocalConfig::new(version, self.server_entry().app_id),
+        )?;
+        Ok(report)
     }
 
     /// Sync core with progress events.
