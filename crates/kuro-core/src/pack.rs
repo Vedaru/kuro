@@ -238,7 +238,13 @@ pub fn plan_ready(game_folder: &Path) -> bool {
     std::fs::read_to_string(pack_plan_path(game_folder))
         .ok()
         .and_then(|data| serde_json::from_str::<PackPlanFile>(&data).ok())
-        .is_some_and(|plan| plan.ready)
+        .is_some_and(|plan| {
+            plan.ready
+                && plan
+                    .parts
+                    .iter()
+                    .all(|part| pack_staging_dir(game_folder, &part.name).is_dir())
+        })
 }
 
 fn tree_totals(root: &Path) -> (usize, u64) {
@@ -1098,7 +1104,7 @@ impl crate::GameManager {
                     .await;
             }
             let applied = self
-                .apply_pack_index(&part.index, &base_refs, &patch_cfg, &part.to, &stage, true, tx.clone())
+                .apply_pack_index(&part.index, &base_refs, &patch_cfg, &part.to, &stage, false, tx.clone())
                 .await?;
             report.parts.push(PackUpdatePart {
                 name: part.name.clone(),
