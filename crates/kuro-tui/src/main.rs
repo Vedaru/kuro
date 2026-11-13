@@ -2470,37 +2470,13 @@ fn task_lines(task: Option<&TaskUi>, stoppable: bool) -> Vec<Line<'_>> {
     let Some(t) = task else {
         return vec![Line::raw("idle")];
     };
-    let stopped = matches!(t.finished, Some(TaskEnd::Stopped));
     let mut v = vec![Line::from(vec![dim("task: "), accent(t.kind.clone())])];
     if let Some(target) = &t.target {
         v.push(Line::from(vec![dim("at:   "), Span::raw(target.clone())]));
     }
-    // A stopped task has no progress to show; its bar and in-flight
-    // rows are stale and would read as a paused 0%.
-    if !stopped {
-        v.push(Line::from(vec![
-            dim("files: "),
-            strong(t.done.to_string()),
-            dim(" done · "),
-            strong(t.queued.to_string()),
-            dim(" queued"),
-        ]));
-        if t.total_bytes > 0 {
-            // Include in-flight bytes: `done_bytes` only moves on GroupDone
-            // (a whole file), so the overall bar used to sit still for the
-            // entire duration of one file and jump when it landed.
-            let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
-            let shown = (t.done_bytes + in_flight).min(t.total_bytes);
-            v.push(Line::styled(
-                bar_line("overall", shown, t.total_bytes, 34),
-                Style::default().fg(Color::Cyan),
-            ));
-        }
-        for f in t.files.iter().take(8) {
-            let name = shorten(&f.name, 42);
-            v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
-        }
-    }
+    // A finished task keeps its result, not the progress it reached. The
+    // activity panel is only four rows tall, so rendering the bar first hid
+    // the check mark and made a completed install look stuck at 100%.
     if let Some(f) = &t.finished {
         let (text, color) = match f {
             TaskEnd::Done(m) => (format!("✔ {m}"), Color::Green),
@@ -2514,6 +2490,31 @@ fn task_lines(task: Option<&TaskUi>, stoppable: bool) -> Vec<Line<'_>> {
             text,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
+        return v;
+    }
+    // A stopped task has no progress to show; its bar and in-flight
+    // rows are stale and would read as a paused 0%.
+    v.push(Line::from(vec![
+        dim("files: "),
+        strong(t.done.to_string()),
+        dim(" done · "),
+        strong(t.queued.to_string()),
+        dim(" queued"),
+    ]));
+    if t.total_bytes > 0 {
+        // Include in-flight bytes: `done_bytes` only moves on GroupDone
+        // (a whole file), so the overall bar used to sit still for the
+        // entire duration of one file and jump when it landed.
+        let in_flight: u64 = t.files.iter().map(|f| f.done).sum();
+        let shown = (t.done_bytes + in_flight).min(t.total_bytes);
+        v.push(Line::styled(
+            bar_line("overall", shown, t.total_bytes, 34),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    for f in t.files.iter().take(8) {
+        let name = shorten(&f.name, 42);
+        v.push(Line::raw(format!("  {}", bar_line(&name, f.done, f.total, 24))));
     }
     if stoppable && t.finished.is_none() {
         v.push(Line::styled(

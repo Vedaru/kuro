@@ -922,12 +922,18 @@ impl GameManager {
         std::fs::create_dir_all(&game_folder)?;
         let mut mgr = Self::manage(game, server, game_folder.clone())?;
         mgr.set_body(body);
-        let sync = mgr.sync_base_with_progress(tx).await?;
+        let sync = mgr.sync_base_with_progress(tx.clone()).await?;
         if !sync.failed.is_empty() {
             return Err(Error::Patch(format!(
                 "{} file(s) failed to download — the install is incomplete; rerun it to resume",
                 sync.failed.len()
             )));
+        }
+        // The channel index can lag the launcher's current pack version. The
+        // base sync above installs what the index names; finish at the pack
+        // document's version so a fresh install is not immediately stale.
+        if game.uses_quality_tiers() && !mgr.server_entry().pack_config_urls.is_empty() {
+            mgr.sync_with_progress(tx).await?;
         }
         // The successful sync just wrote the channel version; no second
         // index fetch is needed to name the tier records.
